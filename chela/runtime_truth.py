@@ -123,9 +123,11 @@ class Finding:
     title: str
     detail: str = ""
     fact: str = ""
+    required: bool = True
 
     def render(self) -> str:
-        line = f"{_SYMBOL.get(self.level, '·')} {self.title}"
+        optional = "" if self.required or self.level == OK else "(optional) "
+        line = f"{_SYMBOL.get(self.level, '·')} {optional}{self.title}"
         return f"{line}\n    {self.detail}" if self.detail else line
 
 
@@ -177,6 +179,9 @@ class Fact:
         machine rather than a broken fleet, and say why at the entry.
     :param applies: skip a fact that is not a fact of THIS install (the test suites are
         not a fact of an installed wheel).
+    :param required: ``False`` for an integration a first run does not need (Telegram,
+        Linear). Its findings still print, but an ERROR among them does not fail
+        ``chela doctor`` (CMX-92).
     """
 
     name: str
@@ -187,6 +192,7 @@ class Fact:
     report: Callable[[Any, Observation], list[Finding]]
     unverifiable_level: str = ERROR
     applies: Callable[[], bool] = lambda: True
+    required: bool = True
 
 
 # --- the engine: the same three steps for every fact, forever -----------------------
@@ -248,7 +254,7 @@ def audit_all() -> list[Finding]:
 
 
 def _stamp(fact: Fact, finding: Finding) -> Finding:
-    return replace(finding, fact=fact.name)
+    return replace(finding, fact=fact.name, required=fact.required)
 
 
 def fact(name: str) -> Fact:
@@ -575,6 +581,29 @@ def _process_node_ipc_env_report(_declared: None, obs: Observation) -> list[Find
         "base branch — confirm on a checkout you did not create (a fresh worktree, or "
         "`env -u NODE_CHANNEL_FD -u NODE_CHANNEL_SERIALIZATION_MODE`) before writing that "
         "claim.",
+    )]
+
+
+# 🧹 CMX-191: pm2 exports a process's whole app config (`args`, `exec_mode`, `name`, …) into
+# its env, and a `pm2` command run from a shell that inherited them reads them OVER the
+# ecosystem file — on 2026-10-17 an inherited empty `args=` started every chela service bare.
+# A WARN, not an ERROR: nothing is broken until someone runs pm2 from here. Not a fact of a
+# pm2-managed service itself, whose own env legitimately IS its pm2_env (CMX-313's gate).
+def _process_pm2_app_env_read() -> Observation:
+    return observed(envutil.pm2_app_keys())
+
+
+def _process_pm2_app_env_report(_declared: None, obs: Observation) -> list[Finding]:
+    names: list[str] = obs.value
+    if not names:
+        return [Finding(OK, "this shell carries none of pm2's app-config env keys")]
+    return [Finding(
+        WARN,
+        f"this shell inherited pm2's app config ({', '.join(names)}) — a `pm2 start` "
+        "from here reads it over the ecosystem file",
+        "CMX-191: pm2 exports each process's pm2_env into its children, and an inherited "
+        "empty `args=` started every chela service with no subcommand on 2026-10-17. Run "
+        "pm2 from a clean shell: `env -i HOME=\"$HOME\" PATH=\"$PATH\" pm2 …`.",
     )]
 
 
@@ -1493,10 +1522,45 @@ def _ring_bound_note(records: list[dict]) -> str:
     return f"last {len(records)} event(s) in the ring (seq {first}-{last})"
 
 
+def _live_sessions() -> dict[str, str] | None:
+    """``{session_id: label}`` for every session the native feed (`claude agents --json`)
+    lists as live RIGHT NOW — CMX-203. ``label`` names it the way an operator acts on it:
+    ``@16 openmmo-claude``, or ``window ? openmmo-claude`` when no chela window resolves to
+    it (a window whose root process is claude itself, CMX-198).
+
+    ``None`` when the feed could not be read — unknown, never "nothing is live". Reuses the
+    status cache within its TTL (``agents.native_status_feed`` has usually just refreshed
+    it this same `chela doctor` run), so it does not pay for a second cold call."""
+    if shutil.which("claude") is None:
+        return None
+    status_map = agent_manager.session_status_map()
+    if not agent_manager.native_status_health()["ok"]:
+        return None
+    wid_by_sid: dict[str, str] = {}
+    try:
+        pane_map = sessions.panes()
+    except Exception:
+        pane_map = {}                   # no window table: the sessions are still named
+    for wid, pane in pane_map.items():
+        entry = agent_manager.session_entry(pane.claude_pid, status_map)
+        if entry and entry["session_id"]:
+            wid_by_sid[entry["session_id"]] = wid
+    names = status_map.get("name_by_pid") or {}
+    live: dict[str, str] = {}
+    for pid, sid in (status_map.get("session_by_pid") or {}).items():
+        name = names.get(pid) or f"pid {pid}"
+        live[sid] = f"{wid_by_sid.get(sid, 'window ?')} {name}"
+    return live
+
+
 def _hooks_unattributed_read() -> Observation:
     """Every ``hook.*`` record in the ring that landed with no window but still names a
     session — the copy :func:`chela.hooks.ingest` actually wrote, read back exactly as a
-    ``--wid`` filter would see it (or rather, would fail to)."""
+    ``--wid`` filter would see it (or rather, would fail to).
+
+    CMX-203: only a session that is still LIVE is worth a warning — a closed one (this
+    morning's judges, a finished agent) can no longer be fixed, and 16 of the 17 the line
+    once named were exactly that. The feed is asked only when there is an orphan to judge."""
     records = event_log.ring()
     orphans: dict[str, int] = {}
     for rec in records:
@@ -1505,37 +1569,48 @@ def _hooks_unattributed_read() -> Observation:
             sid = rec.get("session_id")
             if sid:
                 orphans[sid] = orphans.get(sid, 0) + 1
-    return observed({"orphans": orphans, "bound": _ring_bound_note(records)})
+    live = _live_sessions() if orphans else {}
+    return observed({"orphans": orphans, "live": live, "bound": _ring_bound_note(records)})
 
 
 def _hooks_unattributed_report(_declared: None, obs: Observation) -> list[Finding]:
     orphans: dict[str, int] = obs.value["orphans"]
+    live: dict[str, str] | None = obs.value["live"]
     bound = obs.value["bound"]
-    if not orphans:
-        return [Finding(OK, f"no hook-blind sessions in the {bound} — every hook.* "
-                            "record in that window either resolved a window or carries "
-                            "no session to attribute")]
-    total = sum(orphans.values())
-    named = ", ".join(sorted(orphans))
+    if live is None:
+        return [Finding(
+            WARN,
+            f"UNKNOWN whether {len(orphans)} hook-blind session(s) in the {bound} are "
+            "still live — `claude agents --json` could not be read",
+            "Hook events landed with no window for these sessions, but without the native "
+            "session feed chela cannot tell a live hook-blind agent (worth fixing) from a "
+            "session that has since closed (nothing to do). Run `claude agents --json` by "
+            f"hand. Sessions: {', '.join(sorted(orphans))}",
+        )]
+    blind = {sid: n for sid, n in orphans.items() if sid in live}
+    closed = len(orphans) - len(blind)
+    ignored = f" ({closed} closed session(s) ignored)" if closed else ""
+    if not blind:
+        return [Finding(OK, f"no live hook-blind sessions in the {bound}{ignored} — no "
+                            "session the native feed lists as live has an unattributed "
+                            "hook.* record there")]
+    total = sum(blind.values())
+    named = ", ".join(f"{live[sid]} ({sid[:8]})" for sid in sorted(blind))
     return [Finding(
         WARN,
-        f"{total} hook.* event(s) unattributable — {len(orphans)} hook-blind session(s) "
-        f"in the {bound}: {named}",
-        "chela.hooks.wid_for_session could not resolve a live window for these sessions. "
-        "Measured (CMX-227): most of the time this session never ran in a chela-tracked "
-        "window at all — a headless/non-interactive claude process (e.g. a cron job) that "
-        "chela did not launch, same as an unset $CHELA_WID being a non-fault. Check "
-        "`chela.sessionids.entries()` for the session_id first: absent there across the "
-        "session's whole lifetime means it was never chela's window to attribute. Only if "
-        "it DOES appear there is this the rarer real gap — two agents launched in one cwd "
-        "(CMX-190) or the window closing right as the POST landed (most often a dispatched "
-        "agent's own `chela task-finished` killing its window on its way out). The events "
-        "were NOT dropped either way: session_id is kept on the record, but "
-        "`chela events --wid @N` can never reach them because there is no wid to filter "
-        "on. Correlate by session_id against `~/.claude/projects/*/<session_id>.jsonl`, or "
-        "`chela events --type <type>` and grep the JSON for these ids. This scan is "
-        "bounded to the ring above — an older or quieter hook-blind session may already "
-        "have scrolled out; it is not ruled out by this being clean.",
+        f"{total} hook.* event(s) unattributable — {len(blind)} LIVE hook-blind session(s) "
+        f"in the {bound}: {named}{ignored}",
+        "chela.hooks.wid_for_session could not resolve a window for these sessions, and "
+        "the native feed lists each one as still running. `window ?` means no chela window "
+        "resolves to the session at all — most often a window whose root process is "
+        "claude itself rather than a shell (CMX-198), or a headless claude chela did not "
+        "launch (CMX-227). A named window that still lands hook events with no wid is the "
+        "rarer real gap: two agents launched in one cwd (CMX-190). The events were NOT "
+        "dropped: session_id is kept on the record, but `chela events --wid @N` can never "
+        "reach them. Correlate by session_id against "
+        "`~/.claude/projects/*/<session_id>.jsonl`. This scan is bounded to the ring above "
+        "— an older or quieter hook-blind session may already have scrolled out. "
+        f"Sessions: {', '.join(sorted(blind))}",
     )]
 
 
@@ -2269,6 +2344,8 @@ def _linear_issue_cap_read() -> Observation:
 def _linear_issue_cap_report(declared: dict[str, str], obs: Observation) -> list[Finding]:
     from chela.sources import linear
 
+    if not declared:
+        return [Finding(OK, "Linear tracker: not configured (optional)")]
     out: list[Finding] = []
     counts = obs.value or {}
     for team, wf_name in sorted(declared.items()):
@@ -2773,7 +2850,7 @@ def _windows_resolvable_applies() -> bool:
 #
 # CMX-156/CMX-159's whole point: JetBrains Mono, Symbols Nerd Font and every font-picker
 # option all lack `⏺ ❌ ✅ ✦ ✷ ✨ ⚙` — the web terminal's tool-marker and spinner glyphs — so
-# both the dashboard (`chela/dashboard/app.py` `_TERM_FONTS`) and the telegram
+# both the dashboard (`chela/dashboard/term_fonts.py` `TERM_FONTS`, as `Symbola-Subset.woff2`) and the telegram
 # `/screenshot` PNG renderer (`chela/telegram/screenshot.py`) fall back to one bundled
 # Symbola subset for exactly those codepoints. `tests/test_term_symbol_fallback.py`
 # already proves the REPO's copy has them; this fact proves the copy on THIS INSTALL still
@@ -3229,6 +3306,44 @@ def _closed_run_stalls_report(_declared: None, obs: Observation) -> list[Finding
     return out
 
 
+# --- fact: who may drive the agents from Telegram (CMX-185) ---------------------------
+#
+# With no sender allowlist the bridge keeps its old chat-only gate: every member of the
+# bound group can type into every agent and answer its permission prompts. That is a
+# deliberate upgrade default (nobody is locked out), so doctor is where it must be loud.
+
+def _telegram_senders_read() -> Observation:
+    from chela.telegram.senders import ALLOWED_USERS_VAR, bridge_env, parse_allowed_users
+    env = bridge_env()                             # the bridge's own resolution
+    if not (env.get("TELEGRAM_BOT_TOKEN") or "").strip():
+        return observed(None)                      # no bridge — nobody to let in
+    return observed(parse_allowed_users(env.get(ALLOWED_USERS_VAR)))
+
+
+def _telegram_senders_report(_declared: None, obs: Observation) -> list[Finding]:
+    if obs.value is None:
+        return [Finding(OK, "Telegram bridge: not configured (optional)")]
+    allowed, bad = obs.value
+    out = []
+    if bad:
+        out.append(Finding(
+            WARN, f"CHELA_TELEGRAM_ALLOWED_USERS ignores {len(bad)} non-numeric entr"
+                  f"{'y' if len(bad) == 1 else 'ies'}: {', '.join(bad)}",
+            "Only numeric Telegram user ids are allowed (not @usernames).",
+        ))
+    if not allowed:
+        out.append(Finding(
+            WARN, "Telegram sender allowlist is EMPTY — chat-only mode: any member of the "
+                  "bound chat can drive every bound agent",
+            "Set CHELA_TELEGRAM_ALLOWED_USERS to your numeric Telegram user id(s) in "
+            "chela.env or secrets.env, then restart chela-telegram.",
+        ))
+        return out
+    out.append(Finding(
+        OK, f"Telegram accepts updates from {len(allowed)} allow-listed user(s) only"))
+    return out
+
+
 # --- the registry ---------------------------------------------------------------------
 
 def facts() -> list[Fact]:
@@ -3303,6 +3418,17 @@ def facts() -> list[Fact]:
             # not of a pm2-managed service, which legitimately carries its own live
             # NODE_CHANNEL_FD and never runs `node --test`.
             applies=_process_node_ipc_env_applies,
+        ),
+        Fact(
+            name="process.pm2_app_env",
+            declared_by="nothing — chela never sets these; a shell that runs pm2 requires "
+                        "their absence (CMX-191)",
+            owned_by="THIS process's own environment — what a `pm2` command run from it "
+                     "reads over the ecosystem file",
+            declare=lambda: None,
+            read_back=_process_pm2_app_env_read,
+            report=_process_pm2_app_env_report,
+            applies=lambda: not _pm2_manages_this_process(),
         ),
         Fact(
             name="dashboard.port",
@@ -3424,6 +3550,15 @@ def facts() -> list[Fact]:
             report=_agent_cmd_report,
         ),
         Fact(
+            name="telegram.sender_allowlist",
+            declared_by="CHELA_TELEGRAM_ALLOWED_USERS (chela.env / secrets.env)",
+            owned_by="the env chela-telegram starts with (chela-env.sh's resolution)",
+            declare=lambda: None,
+            read_back=_telegram_senders_read,
+            report=_telegram_senders_report,
+            required=False,
+        ),
+        Fact(
             name="dispatch.gh_auth",
             declared_by="nothing — chela never records this; every dispatched "
                         "WORKFLOW.md's prompt ends with `gh pr create`",
@@ -3463,6 +3598,7 @@ def facts() -> list[Fact]:
             declare=_linear_teams,
             read_back=_linear_issue_cap_read,
             report=_linear_issue_cap_report,
+            required=False,
         ),
         Fact(
             name="dispatch.hold",
@@ -3570,7 +3706,7 @@ def facts() -> list[Fact]:
         Fact(
             name="fonts.glyph_coverage",
             declared_by="the render surfaces that fall back to it for coverage "
-                        "(chela/dashboard/app.py _TERM_FONTS, chela/telegram/"
+                        "(chela/dashboard/term_fonts.py TERM_FONTS, chela/telegram/"
                         "screenshot.py) — both need the TUI marker glyphs and neither "
                         "font they pick before it contains them (CMX-156/159)",
             owned_by="the font file on disk (chela/dashboard/static/fonts/"

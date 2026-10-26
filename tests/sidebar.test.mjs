@@ -36,59 +36,40 @@
 // 'sidebar-collapsed' in terminals.js — which is what used to stand in for it — stays
 // green while the fleet reloads on every toggle. It is measured there, not here.
 //
-// Run: node --test tests/sidebar.test.mjs  (pytest runs it via tests/test_js_suites.py;
+// Run: pnpm exec vitest run tests/sidebar.test.mjs  (pytest runs it via tests/test_js_suites.py;
 // it needs `pnpm install` for jsdom — CHELA_REQUIRE_JS_TESTS makes a missing jsdom a FAILURE.)
-import { before, test } from 'node:test';
+import { beforeAll, test } from 'vitest';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { JSDOM } from 'jsdom';   // needs `pnpm install` — tests/test_js_suites.py enforces it
-import { bootDashboardDom } from './js_helpers/dashboard_dom.mjs';
+import { APP_BODY, ORCHESTRATOR, SIDEBAR, bootDashboardDom, clickIsland, flush, typeInto, AGENTS_STORE, VIEW_STORE, NAV } from './js_helpers/dashboard_dom.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', 'chela', 'dashboard');
 const src = p => readFileSync(join(ROOT, p), 'utf8');
 
-const NAV = src('static/js/nav.js');
-const LAUNCHER = src('static/js/launcher.js');
-const HTML = src('templates/index.html');
+// The shell (CMX-248) and the sidebar's controller: where the sidebar's code lives.
+const SHELL = ['features/shell/lib/nav.ts', 'features/shell/lib/App.tsx', 'features/sidebar/controller.ts']
+    .map(f => src(`frontend/src/${f}`)).join('\n');
+// CMX-219: the launch menu is the launcher island's (frontend/src/features/launcher).
+const LAUNCHER = src('frontend/src/features/launcher/lib/state.ts') + src('frontend/src/features/launcher/lib/LaunchMenu.tsx');
 const CSS = src('static/style.css');
 
-// The sidebar chrome, as index.html emits it (only the ids nav.js reaches for).
-const BODY = `
-<header class="topbar">
-  <button class="icon-btn sidebar-toggle" id="btn-menu" aria-expanded="true"
-          onclick="chela.toggleSidebar()"></button>
-  <button class="icon-btn" id="btn-new" onclick="chela.openNewMenu(event)"></button>
-</header>
-<div class="app">
-  <aside class="sidebar">
-    <section class="side-section">
-      <div class="side-list" id="side-nav"></div>
-    </section>
-    <section class="side-section">
-      <span class="side-count" id="hdr-agents">-/-</span>
-      <div class="side-list" id="sidebar-agents"><div class="side-empty">No agents</div></div>
-    </section>
-  </aside>
-</div>
-<div class="drawer-scrim" id="sidebar-scrim" onclick="chela.closeSidebar()"></div>
-<div class="popover launch-menu" id="new-menu" style="display:none;">
-  <div id="new-menu-launch"></div>
-</div>
-<button class="mobile-menu-fab" id="btn-menu-mobile" aria-expanded="false" onclick="chela.toggleSidebar()"></button>`;
+// The REAL page: the shell renders the sidebar, the ☰ pair, the scrim and the overlays.
+const BODY = APP_BODY;
 
 const SIDEBAR_COLLAPSED_KEY = 'chela_sidebar_collapsed';
 
 // The phone/desktop split is `matchMedia('(max-width: 768px)')`. Make it steerable.
 let PHONE = false;
 
-let nav, util, orchestrator;
+let nav, agentsStore, viewStore, orchestrator, sidebar;
 
-before(async () => {
+beforeAll(async () => {
     // The dashboard's modules are a cycle (nav ↔ main), so evaluation ORDER is the
     // browser's: main.js is the entry and everything else is pulled in behind it.
-    ({ modules: { util, nav, orchestrator } } = await bootDashboardDom({
+    ({ modules: { agents: { agents: agentsStore }, view: { view: viewStore }, nav, orchestrator, sidebar } } = await bootDashboardDom({
         body: BODY,
         // jsdom ships no canvas, and `getContext('2d')` returns null. The tab-signal
         // badge (util.js::_drawFavicon) paints one whenever the "needs you" count goes
@@ -139,7 +120,7 @@ before(async () => {
             }
             return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({}) });
         },
-        extraModules: ['util.js', 'nav.js', 'orchestrator.js'],
+        extraModules: [AGENTS_STORE, VIEW_STORE, NAV, ORCHESTRATOR, SIDEBAR],
     }));
 });
 
@@ -151,7 +132,7 @@ const agent = (name, over = {}) => ({
 const rowFor = name => document.querySelector(`#sidebar-agents .agent-row[data-agent="${name}"]`);
 
 test('CMX-377 round 2: the live agent row renders no .ar-type, .ar-role or .agent-pin — the row face is status mark · title · "state · ctx" · time only', () => {
-    nav.renderSidebarAgents([
+    sidebar.renderSidebarAgents([
         agent('bot', { window_type: 'claude', cwd: '/home/x/proj-a' }),
         agent('sh', { window_type: 'shell', dispatched: true }),
     ]);
@@ -195,27 +176,29 @@ test('CMX-62: a manual name beats Claude\'s title, the title beats the window na
         // no title yet (first exchange hasn't happened) — the window name, NOT the repo
         { name: 'shell-1', window_id: '@4', cwd: '/home/u/projects/nautilus', online: true },
     ];
-    util.setAgentsCache(rows);
-    nav.renderSidebarAgents(rows);
+    agentsStore.set(rows);
+    sidebar.renderSidebarAgents(rows);
 
     assert.equal(nameFor('reviewer'), 'reviewer', 'a manual name must beat Claude\'s title');
     assert.equal(nameFor('billing-fix'), 'Open-MMO game on Windows PC', 'Claude\'s title must beat the window name');
     assert.equal(nameFor('shell-3'), 'porting the wall');
     assert.equal(nameFor('shell-5'), 'Fix the reconcile loop', 'ai_title must outrank the live session name');
     assert.equal(nameFor('shell-1'), 'shell-1', 'no title ⇒ the window name (never rewritten to the repo)');
-    // The short window name stays reachable as the secondary label (hover) when the
-    // title leads — and is absent when the name already IS the label.
+    // The short window name stays reachable as the secondary label when the title
+    // leads — and is absent when the name already IS the label. CMX-331: the name has
+    // no title of its own; the row's tooltip carries the full title, then the key.
     const span = rowFor('billing-fix').querySelector('.agent-row-name');
     assert.equal(span.dataset.key, 'billing-fix');
-    assert.equal(span.title, 'window: billing-fix');
+    assert.equal(span.hasAttribute('title'), false);
+    assert.match(rowFor('billing-fix').title, /^Open-MMO game on Windows PC \(billing-fix\) · @2\n/);
     assert.equal(rowFor('shell-1').querySelector('.agent-row-name').dataset.key, undefined);
     assert.equal(rowFor('reviewer').querySelector('.agent-row-name').dataset.key, undefined);
 });
 
 test('a session name is ESCAPED — it is tmux/user-derived, never trusted into the DOM', () => {
     const rows = [{ name: 'claude', window_id: '@9', session_name: '<img src=x>', online: true }];
-    util.setAgentsCache(rows);
-    nav.renderSidebarAgents(rows);
+    agentsStore.set(rows);
+    sidebar.renderSidebarAgents(rows);
     const span = document.querySelector('#sidebar-agents .agent-row-name');
     assert.equal(span.textContent, '<img src=x>');           // shown as text…
     assert.equal(span.querySelector('img'), null);           // …never parsed as markup
@@ -259,9 +242,8 @@ test('colour is the SECOND channel, and it is colourblind-safe (Okabe-Ito)', () 
 // demoted them into a quieter #side-nav-more group; that group is gone too) —
 // what's left to guard is Wall and Work. This drives the REAL renderNav() into
 // the REAL #side-nav and asserts what RENDERS: each carries a non-empty <svg>
-// and none leaks an old glyph. Revert either view to `icon: '…'` and its <svg>
-// vanishes (red); drop its name from util.js _LUCIDE and its <svg> comes out
-// empty (red).
+// and none leaks an old glyph. Drop either view's icon from the sidebar's NAV_ICON map
+// (features/sidebar Nav.tsx, lucide-react through shared/icons) and its <svg> vanishes (red).
 test('every nav item renders a non-empty lucide SVG — no unicode glyph survives', () => {
     nav.renderNav();
     const OLD_GLYPHS = ['▦', '▤', '◆', '▢', '≡'];
@@ -271,24 +253,10 @@ test('every nav item renders a non-empty lucide SVG — no unicode glyph survive
         const svg = icon.querySelector('svg');
         assert.ok(svg, `the ${id} nav icon is not an SVG — it fell back to a text glyph`);
         assert.ok(svg.children.length > 0,
-            `the ${id} nav icon SVG is empty — its lucide name is not in util.js _LUCIDE`);
+            `the ${id} nav icon SVG is empty`);
         for (const g of OLD_GLYPHS)
             assert.ok(!icon.textContent.includes(g), `the old ${g} glyph is still rendered on ${id}`);
     }
-});
-
-// CMX-302 negative control: the guard above only proves a KNOWN icon name (like
-// 'crown') renders non-empty. It says nothing about what happens when a name is
-// NOT in _LUCIDE — and `${_LUCIDE[name] || ''}` used to answer that with a
-// silently-valid-looking `<svg></svg>` (a real <svg> element, so a bare
-// `querySelector('svg')` truthiness check — as the orchestrator-badge test above
-// does — can't tell it apart from the real icon). A typo'd or renamed lucide name
-// must fail loudly at the call site instead, so the corruption surfaces the moment
-// the row renders rather than as a blank badge nobody notices.
-test('lucideIcon FAILS LOUDLY for an unknown icon name — it never falls back to an empty <svg>', () => {
-    assert.throws(() => util.lucideIcon('not-a-real-lucide-icon'),
-        /unknown icon/,
-        'lucideIcon silently accepted an icon name that is not in _LUCIDE instead of failing');
 });
 
 // --- 1c^b. 🔴 the LABEL is real text on every rendered row --------------------
@@ -317,34 +285,14 @@ test('every nav item renders its REAL label as text — not an icon-only row', (
 // drives the REAL renderNav() + REAL selectView() and reads `.active` back off
 // the REAL rendered rows — a guard that only checked the class STRING existed
 // in source would pass a sweep that never actually ran.
-test('selecting a view lights its own row and clears the other — via the REAL onclick handler', () => {
+test('selecting a view lights its own row and clears the other — via the REAL click', () => {
     nav.renderNav();
 
-    // round 20/21 (judge findings on PR #326, CMX-257): the ONLY thing that
-    // makes a rendered nav row route anywhere is the onclick _navItemHtml
-    // emits — calling window.chela.selectView(...) directly never touches it,
-    // and a substring regex on the attribute cannot tell a live statement from
-    // dead code (`if (false) chela.selectView(...)` still contains the exact
-    // bytes a presence-only regex looks for). So below, the attribute is
-    // EVALUATED as a function body — the same body the browser would run on
-    // click — against a recording stub bound to the row as `this` (matching
-    // _navItemHtml's `this.dataset.view`), and the assertion is that the stub
-    // was actually CALLED.
-    const _invokeOnclick = (row, chelaStub) => {
-        const handler = new Function('chela', row.getAttribute('onclick') || '');
-        handler.call(row, chelaStub);
-    };
-
-    const workRow = document.querySelector('#side-nav .side-item[data-view="work"]');
-    assert.match(workRow.getAttribute('onclick'), /chela\.selectView\(this\.dataset\.view\)/,
-        'the Work row is not wired to chela.selectView(this.dataset.view)');
-    const calls = [];
-    _invokeOnclick(workRow, { selectView: (...args) => calls.push(args) });
-    assert.deepEqual(calls, [['work']],
-        "the Work row's onclick did not actually CALL chela.selectView — dead-coding the handler leaves the " +
-        'attribute text intact but the row unreachable');
-
-    window.chela.selectView('work');
+    // round 20/21 (judge findings on PR #326, CMX-257): what routes a nav row is its click,
+    // not a direct selectView(...) call. CMX-278: the row is React's, so a REAL bubbling
+    // click on it must switch the view (CMX-248: the shell's selectView).
+    clickIsland(document.querySelector('#side-nav .side-item[data-view="work"]'));
+    assert.equal(viewStore.get(), 'work', 'a click on the Work row did not switch to Work: the row is unreachable');
     assert.equal(
         document.querySelector('#side-nav .side-item[data-view="work"]').classList.contains('active'),
         true, 'the Work row never lit after selecting it');
@@ -352,7 +300,7 @@ test('selecting a view lights its own row and clears the other — via the REAL 
         document.querySelectorAll('#side-nav .side-item.active').length, 1,
         'more than one row is lit after selecting Work');
 
-    window.chela.selectView('terminals');
+    clickIsland(document.querySelector('#side-nav .side-item[data-view="terminals"]'));
     assert.equal(
         document.querySelector('#side-nav .side-item[data-view="terminals"]').classList.contains('active'),
         true, 'the Wall row never lit after selecting it');
@@ -368,43 +316,36 @@ test('selecting a view lights its own row and clears the other — via the REAL 
 // pre-CMX-279 shape, where it borrowed the (now-deleted) Agents row as a fake
 // "parent" to keep something lit. nav.js's _syncSidebarActive now maps
 // 'agent-detail' to no data-view at all, so NOTHING in #side-nav should light
-// up while drilled into one. showAgentDetail itself isn't exported (it's
-// reachable only from inline HTML handlers), so this drives the REAL,
-// user-reachable path to it: `chela.selectAgent` — the sidebar agent row's own
-// onclick — falls through to showAgentDetail whenever the wall can't place the
+// up while drilled into one. This drives the REAL, user-reachable path to it:
+// `selectAgent` (the shell's) — the sidebar agent row's own click — falls through to
+// showAgentDetail whenever the wall can't place the
 // agent (unresolved in `_agentsCache`, which is exactly this case: no fleet
 // has been loaded into this jsdom instance for this name).
 //
 // CMX-279 rework round 1 (PR #350, judge finding): this also drives
 // nav.js's `_agentDetailBackView()` — TERMINALS_ENABLED is true for this whole
-// file (see before(), above), so the "← Back" link must route to 'terminals'
+// file (see beforeAll(), above), so the "← Back" link must route to 'terminals'
 // (the Wall), never the deleted 'agents' view. tests/dashboard_default_view.test.mjs
 // covers the OTHER branch (TERMINALS_ENABLED false -> 'work') plus the found-agent
 // call site (nav.js:608); this covers the not-found call site (nav.js:560) on the
 // terminals-on branch, closing all 4 combinations (DEFEAT_SHAPES shape 7: two call
 // sites x two branches).
-test('drilling into an agent lights no nav row — agent-detail has none of its own', () => {
+// CMX-219: the agent detail is the agent-detail island's (frontend/src/features/agentdetail),
+// mounted into this suite's #agent-detail at boot; it draws on React's next turn.
+async function drillInto(name) {
     nav.renderNav();
-
-    // showAgentDetail also fires an unawaited refreshSummary()/checkContext() — real
-    // network calls in production, reaching #hdr-next/#hdr-updated (absent from this
-    // suite's minimal BODY, see its own comment: "only the ids nav.js reaches for")
-    // and expecting an array back from /api/agents/context. Give it both so those
-    // calls resolve quietly instead of throwing into an unhandled rejection AFTER
-    // this test (synchronous) has already returned.
-    if (!document.getElementById('hdr-next')) document.body.appendChild(document.createElement('span')).id = 'hdr-next';
-    if (!document.getElementById('hdr-updated')) document.body.appendChild(document.createElement('span')).id = 'hdr-updated';
-    // renderAgentDetail (nav.js) no-ops without a host to paint into — absent from
-    // this suite's minimal BODY (it only carries "the ids nav.js reaches for" for
-    // the sidebar), so give it one here, same pattern as hdr-next/hdr-updated above.
-    if (!document.getElementById('agent-detail')) document.body.appendChild(document.createElement('div')).id = 'agent-detail';
     const prevFetch = globalThis.fetch;
     globalThis.fetch = () => Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve([]) });
     try {
-        window.chela.selectAgent('cmx279-ghost-agent');
+        nav.selectAgent(name);
+        await flush();
     } finally {
         globalThis.fetch = prevFetch;
     }
+}
+
+test('drilling into an agent lights no nav row — agent-detail has none of its own', async () => {
+    await drillInto('cmx279-ghost-agent');
 
     assert.equal(
         document.querySelectorAll('#side-nav .side-item.active').length, 0,
@@ -412,81 +353,44 @@ test('drilling into an agent lights no nav row — agent-detail has none of its 
         'and no longer borrows a deleted view\'s row, so nothing in #side-nav should be active');
 
     const back = document.querySelector('#agent-detail .detail-back');
-    assert.ok(back, 'no .detail-back node rendered into #agent-detail (not-found branch, nav.js:560)');
-    assert.match(back.getAttribute('onclick'), /chela\.selectView\('terminals'\)/,
-        'the "← Back" link is not wired to chela.selectView(\'terminals\') — with terminals on, it must route ' +
-        'to the Wall, never the deleted \'agents\' view');
+    assert.ok(back, 'no .detail-back node rendered into #agent-detail (not-found branch)');
+    clickIsland(back);
+    assert.equal(viewStore.get(), 'terminals',
+        'the "← Back" control did not route to the Wall: with terminals on, it must, never the deleted \'agents\' view');
 });
 
-// CMX-279 rework round 1 (PR #350, judge finding): the FOUND branch of
-// renderAgentDetail (nav.js:608) is a SEPARATE call site from the not-found one
-// above — DEFEAT_SHAPES shape 7 ("two callers, one guarded"). A resolvable
-// agent with no window_id never enters selectAgent's wall-focus branch even
-// with terminals on, so it always falls through to showAgentDetail's found path.
-test('the agent-detail "← Back" link also routes to the Wall from the FOUND branch (nav.js:608)', () => {
-    nav.renderNav();
-    if (!document.getElementById('hdr-next')) document.body.appendChild(document.createElement('span')).id = 'hdr-next';
-    if (!document.getElementById('hdr-updated')) document.body.appendChild(document.createElement('span')).id = 'hdr-updated';
-    if (!document.getElementById('agent-detail')) document.body.appendChild(document.createElement('div')).id = 'agent-detail';
-    util.setAgentsCache([{ name: 'cmx279-known-agent', online: true }]);   // no window_id -> always showAgentDetail
-    const prevFetch = globalThis.fetch;
-    globalThis.fetch = () => Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve([]) });
-    try {
-        window.chela.selectAgent('cmx279-known-agent');
-    } finally {
-        globalThis.fetch = prevFetch;
-    }
+// CMX-279 rework round 1 (PR #350, judge finding): the FOUND branch is a SEPARATE path from
+// the not-found one above (DEFEAT_SHAPES shape 7, "two callers, one guarded"). A resolvable
+// agent with no window_id never enters selectAgent's wall-focus branch even with terminals on.
+test('the agent-detail "← Back" link also routes to the Wall from the FOUND branch', async () => {
+    agentsStore.set([{ name: 'cmx279-known-agent', online: true }]);   // no window_id -> always showAgentDetail
+    await drillInto('cmx279-known-agent');
 
+    assert.equal(document.querySelector('#agent-detail .detail-title')?.textContent, 'cmx279-known-agent');
     const back = document.querySelector('#agent-detail .detail-back');
-    assert.ok(back, 'no .detail-back node rendered into #agent-detail (found branch, nav.js:608)');
-    assert.match(back.getAttribute('onclick'), /chela\.selectView\('terminals'\)/,
-        'the "← Back" link is not wired to chela.selectView(\'terminals\') on the found branch');
+    assert.ok(back, 'no .detail-back node rendered into #agent-detail (found branch)');
+    clickIsland(back);
+    assert.equal(viewStore.get(), 'terminals', 'the "← Back" control does not route to the Wall on the found branch');
 });
 
-// CMX-300 rework round 1 (PR #374, judge finding 2): renderAgentDetail (nav.js:623)
-// adds a Role row (`['Role', escHtml(_ROLE_LABEL[_agentRole(a)])]`), but nothing in
-// this suite ever asserted the string 'Role' or its VALUE anywhere in #agent-detail
-// — the two "← Back" tests above only ever read `.detail-back`, so blanking the
-// row's value (keeping the label, dropping what it reports) stayed invisible. This
-// reads the row's own `.k`/`.v` pair back off the REAL rendered `.detail-grid`, for
-// both a plain session and a dispatched one (dispatched doesn't require
-// `window_id`, so it's reachable through the same no-window_id FOUND branch the
-// test above already establishes — see nav.js:230).
+// CMX-300 rework round 1 (PR #374, judge finding 2): the Role row reports the resolved role
+// (nav.js's _agentRole, through the island's host), read back off the REAL rendered
+// `.detail-grid`, for a plain session and a dispatched one.
 function _detailRowValue(key) {
     const k = [...document.querySelectorAll('#agent-detail .detail-grid .k')].find(el => el.textContent === key);
     return k ? k.nextElementSibling.textContent : undefined;
 }
 
-test('the agent-detail panel renders a Role row with the resolved role label — plain', () => {
-    nav.renderNav();
-    if (!document.getElementById('hdr-next')) document.body.appendChild(document.createElement('span')).id = 'hdr-next';
-    if (!document.getElementById('hdr-updated')) document.body.appendChild(document.createElement('span')).id = 'hdr-updated';
-    if (!document.getElementById('agent-detail')) document.body.appendChild(document.createElement('div')).id = 'agent-detail';
-    util.setAgentsCache([{ name: 'cmx300-detail-plain', online: true }]);
-    const prevFetch = globalThis.fetch;
-    globalThis.fetch = () => Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve([]) });
-    try {
-        window.chela.selectAgent('cmx300-detail-plain');
-    } finally {
-        globalThis.fetch = prevFetch;
-    }
+test('the agent-detail panel renders a Role row with the resolved role label — plain', async () => {
+    agentsStore.set([{ name: 'cmx300-detail-plain', online: true }]);
+    await drillInto('cmx300-detail-plain');
     assert.equal(_detailRowValue('Role'), 'Plain session',
         'the Role row is missing, or does not report Plain session, for a plain agent-detail panel');
 });
 
-test('the agent-detail panel renders a Role row with the resolved role label — dispatched', () => {
-    nav.renderNav();
-    if (!document.getElementById('hdr-next')) document.body.appendChild(document.createElement('span')).id = 'hdr-next';
-    if (!document.getElementById('hdr-updated')) document.body.appendChild(document.createElement('span')).id = 'hdr-updated';
-    if (!document.getElementById('agent-detail')) document.body.appendChild(document.createElement('div')).id = 'agent-detail';
-    util.setAgentsCache([{ name: 'cmx300-detail-dispatched', online: true, dispatched: true }]);
-    const prevFetch = globalThis.fetch;
-    globalThis.fetch = () => Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve([]) });
-    try {
-        window.chela.selectAgent('cmx300-detail-dispatched');
-    } finally {
-        globalThis.fetch = prevFetch;
-    }
+test('the agent-detail panel renders a Role row with the resolved role label — dispatched', async () => {
+    agentsStore.set([{ name: 'cmx300-detail-dispatched', online: true, dispatched: true }]);
+    await drillInto('cmx300-detail-dispatched');
     assert.equal(_detailRowValue('Role'), 'Dispatched',
         'the Role row is missing, or does not report Dispatched, for a dispatched agent-detail panel');
 });
@@ -531,6 +435,33 @@ test('the expanded status dot is the SAME size as the collapsed rail', () => {
     assert.equal(_prop(exp, 'height'), _prop(col, 'height'), 'the status-dot height differs from the collapsed rail');
 });
 
+// Every element the collapsed rail hides, checked one selector at a time: these share
+// multi-selector `display: none` rules, so dropping or misspelling ONE member of a
+// list leaves the rest of the rule (and any one-member test) green.
+const _RAIL_HIDDEN = [
+    '#resources-strip', '.sidebar-quick',
+    '.side-head', '.side-empty', '.side-badges', '.side-item-label', '.group-head',
+    '.triage-head', '.agent-row .ar-main', '.agent-row.rich .agent-row-name',
+    '.agent-row.rich .ar-meta', '.agent-row .row-unarchive', '.agent-row .recent-resume',
+    '.agent-row .recent-dismiss', '.agent-row .row-more',
+];
+function _displayNoneSelectors(css) {
+    const hidden = new Set();
+    const bare = css.replace(/\/\*[\s\S]*?\*\//g, '');
+    for (const [, sel, body] of bare.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+        if (!/(?:^|;)\s*display\s*:\s*none\s*(?:;|$)/.test(body.trim())) continue;
+        for (const s of sel.split(',')) hidden.add(s.trim().replace(/\s+/g, ' '));
+    }
+    return hidden;
+}
+test('the collapsed rail hides each of its row/section elements', () => {
+    const hidden = _displayNoneSelectors(CSS);
+    for (const s of _RAIL_HIDDEN) {
+        assert.ok(hidden.has(`body.sidebar-collapsed ${s}`),
+            `the collapsed rail no longer hides ${s} (no display:none rule for body.sidebar-collapsed ${s})`);
+    }
+});
+
 // --- 2. 🔴 one control, two behaviours — and the desktop state survives a reload --
 
 test('the desktop rail RESTORES itself from the last session', () => {
@@ -544,12 +475,12 @@ test('the desktop rail RESTORES itself from the last session', () => {
 
 test('on a desktop the control collapses the rail, and persists it', () => {
     PHONE = false;
-    window.chela.toggleSidebar();       // restored collapsed -> expand
+    clickIsland(document.getElementById('btn-menu'));   // restored collapsed -> expand
     assert.equal(document.body.classList.contains('sidebar-collapsed'), false);
     assert.equal(localStorage.getItem(SIDEBAR_COLLAPSED_KEY), '0');
     assert.equal(document.getElementById('btn-menu').getAttribute('aria-expanded'), 'true');
 
-    window.chela.toggleSidebar();       // and back
+    clickIsland(document.getElementById('btn-menu'));   // and back
     assert.ok(document.body.classList.contains('sidebar-collapsed'));
     assert.equal(localStorage.getItem(SIDEBAR_COLLAPSED_KEY), '1',
         'the collapsed state is not written — it would forget itself on reload');
@@ -560,9 +491,9 @@ test('on a desktop the control collapses the rail, and persists it', () => {
 
 test('navigating away closes the phone drawer but NEVER folds the desktop rail', () => {
     PHONE = false;
-    window.chela.toggleSidebar();                  // expand it
+    clickIsland(document.getElementById('btn-menu'));   // expand it
     assert.equal(document.body.classList.contains('sidebar-collapsed'), false);
-    window.chela.closeSidebar();                   // selectView() calls this on EVERY click
+    clickIsland(document.querySelector('#side-nav .side-item[data-view="work"]'));   // a view switch closes the drawer
     assert.equal(document.body.classList.contains('sidebar-collapsed'), false,
         'a sidebar that folds itself away whenever you use it is not a sidebar');
 });
@@ -573,13 +504,13 @@ test('on a phone the SAME control slides the drawer, and leaves the rail class a
     const scrim = document.getElementById('sidebar-scrim');
     const railBefore = document.body.classList.contains('sidebar-collapsed');
 
-    window.chela.toggleSidebar();
+    clickIsland(document.getElementById('btn-menu'));
     assert.ok(sb.classList.contains('open'), 'the drawer did not slide in');
     assert.ok(scrim.classList.contains('open'), 'the drawer has no scrim behind it');
     assert.equal(document.body.classList.contains('sidebar-collapsed'), railBefore,
         'the phone drawer moved the DESKTOP rail state');
 
-    window.chela.closeSidebar();                   // tapping a row dismisses it
+    clickIsland(document.querySelector('#side-nav .side-item[data-view="work"]'));   // tapping a row dismisses it
     assert.equal(sb.classList.contains('open'), false);
     assert.equal(scrim.classList.contains('open'), false);
     PHONE = false;
@@ -597,11 +528,11 @@ test('opening the phone drawer sets body.sidebar-open; closing it clears it', ()
     assert.equal(document.body.classList.contains('sidebar-open'), false,
         'sidebar-open was already set before the drawer opened');
 
-    window.chela.toggleSidebar();
+    clickIsland(document.getElementById('btn-menu-mobile'));
     assert.ok(document.body.classList.contains('sidebar-open'),
         'opening the drawer did not set body.sidebar-open — .mobile-menu-fab would stay visible on top of it');
 
-    window.chela.closeSidebar();
+    clickIsland(document.getElementById('sidebar-scrim'));
     assert.equal(document.body.classList.contains('sidebar-open'), false,
         'closing the drawer left body.sidebar-open set — .mobile-menu-fab would stay hidden with the drawer closed');
     PHONE = false;
@@ -612,7 +543,7 @@ test('opening the phone drawer sets body.sidebar-open; closing it clears it', ()
 // announces it as "collapsed"/"expanded". `fab.setAttribute('aria-expanded',
 // open ? 'true' : 'false')` was mutated to the constant `'false'` and stayed
 // green, because no test in this file drove `#btn-menu-mobile` through a real
-// toggleSidebar() round trip at all — the fixture didn't even mount the
+// toggle round trip at all — the fixture didn't even mount the
 // element. Extends the SAME phone-drawer test above (same open/close round
 // trip) rather than adding a parallel one, so the two facts (body.sidebar-open
 // and the fab's own aria-expanded) can never silently drift apart again.
@@ -621,53 +552,22 @@ test('opening/closing the phone drawer also flips #btn-menu-mobile\'s aria-expan
     const fab = document.getElementById('btn-menu-mobile');
     assert.equal(fab.getAttribute('aria-expanded'), 'false', 'sanity: the fab starts collapsed');
 
-    window.chela.toggleSidebar();
+    clickIsland(fab);
     assert.equal(fab.getAttribute('aria-expanded'), 'true',
         'opening the drawer left #btn-menu-mobile aria-expanded="false" — a screen reader would announce it ' +
         'as still collapsed');
 
-    window.chela.closeSidebar();
+    clickIsland(document.getElementById('sidebar-scrim'));
     assert.equal(fab.getAttribute('aria-expanded'), 'false',
         'closing the drawer left #btn-menu-mobile aria-expanded="true" — a screen reader would announce it as ' +
         'still expanded');
     PHONE = false;
 });
 
-// --- 3. 🟠 the launch menu must not run off the right edge -----------------------
-
-test('the launch menu right-aligns off its MEASURED width — it stays on screen', () => {
-    const m = document.getElementById('new-menu');
-    const anchor = document.getElementById('btn-new');
-    // #btn-new sits near the right edge of the topbar, as it does in the live app.
-    anchor.getBoundingClientRect = () => ({
-        top: 8, bottom: 40, left: 969, right: 1001, width: 32, height: 32,
-    });
-    // jsdom does no layout, so hand it the width the CSS gives the menu.
-    const width = Number(CSS.match(/\.launch-menu\s*{[^}]*min-width:\s*(\d+)px/)[1]);
-    assert.equal(width, 232, 'the launch menu CSS width moved — retune this fixture');
-    Object.defineProperty(m, 'offsetWidth', { value: width, configurable: true });
-
-    window.chela.openNewMenu({ stopPropagation() {}, currentTarget: anchor });
-
-    assert.equal(m.style.display, 'block');
-    const left = parseFloat(m.style.left);
-    assert.equal(left + width, 1001, 'the menu is not right-aligned to the button');
-    assert.ok(left + width <= window.innerWidth,
-        `the launch menu runs off the RIGHT edge (${left}+${width} > ${window.innerWidth}) — `
-        + 'it is right-aligned off a hardcoded width, not its real one');
-    window.chela.hideNewMenu();
-});
-
-test('…and it never runs off the LEFT edge either (a narrow phone)', () => {
-    const m = document.getElementById('new-menu');
-    const anchor = document.getElementById('btn-new');
-    anchor.getBoundingClientRect = () => ({ top: 8, bottom: 40, left: 68, right: 100, width: 32, height: 32 });
-    Object.defineProperty(m, 'offsetWidth', { value: 232, configurable: true });   // wider than the button's offset
-
-    window.chela.openNewMenu({ stopPropagation() {}, currentTarget: anchor });
-    assert.equal(parseFloat(m.style.left), 8, 'the menu was not clamped to the left edge');
-    window.chela.hideNewMenu();
-});
+// --- 3. the launch menu's placement --------------------------------------------
+// CMX-219: the launch menu is a kit AnchoredPopover (shared/ui): Radix places it, flipped and
+// kept 8px inside the viewport (collisionPadding), so the hand-rolled right/left-edge clamps
+// these tests pinned are gone with it (features/launcher/tests/LaunchMenu.test.tsx).
 
 // --- 4. what was DELETED ---------------------------------------------------------
 //
@@ -676,29 +576,31 @@ test('…and it never runs off the LEFT edge either (a narrow phone)', () => {
 // (Everything above this line runs the real module instead.)
 
 test('the type filter is gone — markup, handler and state', () => {
-    assert.ok(!HTML.includes('agent-filter'), 'the filter chip row is still in index.html');
-    assert.ok(!NAV.includes('setAgentFilter'), 'setAgentFilter still exists');
-    assert.ok(!NAV.includes('_agentFilter'), 'the filter state still exists');
+    assert.equal(document.querySelector('.agent-filter, [class*="agent-filter"]'), null, 'the filter chip row is still on the page');
+    assert.ok(!SHELL.includes('setAgentFilter'), 'setAgentFilter still exists');
+    assert.ok(!SHELL.includes('agentFilter'), 'the filter state still exists');
     assert.ok(!CSS.includes('.agent-filter'), 'the filter chips still have styling');
 });
 
 test('the sidebar is two sections — Launch folded into the launch menu', () => {
-    assert.ok(!HTML.includes('launcher-section'), 'the Launch sidebar section is still there');
-    assert.ok(HTML.includes('new-menu-launch'), 'the launch menu has no Favorites/Recent host');
+    assert.equal(document.querySelector('.launcher-section'), null, 'the Launch sidebar section is still there');
+    assert.ok(document.getElementById('overlays-island'), 'the launch menu has no island to render in');
+    assert.equal(document.querySelectorAll('.sidebar > .sidebar-scroll > .side-section').length, 2, 'the sidebar is not two sections');
     // Every launch behaviour moved WITH the rows: click-to-launch, pin, unpin,
     // forget-a-recent, add-a-favourite.
-    ['launchProject', 'pinFav', 'unpinFav', 'forgetRecent', 'openFavAdd'].forEach(fn =>
+    ['launchProject', 'pinFav', 'unpinFav', 'forgetRecent', 'FavAdd'].forEach(fn =>
         assert.ok(LAUNCHER.includes(fn), `${fn} was lost in the move`));
-    assert.ok(LAUNCHER.includes("getElementById('new-menu-launch')"),
-        'the launcher does not render into the launch menu');
-    // Two toggles in the markup, not three: #btn-menu (the sidebar's own,
+    assert.ok(LAUNCHER.includes('id="new-menu-launch"'),
+        'the launcher does not render the Favorites/Recent host');
+    // Two toggles on the page, not three: #btn-menu (the sidebar's own,
     // inside .sidebar-head) and #btn-menu-mobile (CMX-377's floating
     // .mobile-menu-fab — the sidebar's own toggle is unreachable while the
     // off-canvas drawer is closed, which is why a second trigger exists at
     // all). A third would mean a stray control crept back in, e.g. a
     // resurrected Launch section.
-    assert.equal(HTML.match(/toggleSidebar\(\)/g).length, 2,
+    assert.equal(SHELL.match(/toggleSidebar\(\)/g).length, 2,
         'expected exactly #btn-menu + #btn-menu-mobile to call toggleSidebar() — a toggle was added or removed');
+    assert.deepEqual([...document.querySelectorAll('.sidebar-toggle, .mobile-menu-fab')].map(b => b.id), ['btn-menu', 'btn-menu-mobile']);
 });
 
 // --- CMX-230, round 2: GUARD 3b / GUARD 4 in tests/dashboard_scale_nav_a11y.test.mjs
@@ -719,23 +621,28 @@ test('the sidebar is two sections — Launch folded into the launch menu', () =>
 // A waiting agent is also rendered inside `.side-triage` (the "Needs you" cluster,
 // see renderSidebarAgents), not the plain project-grouped rows — rowFor() finds it
 // either way since `_agentRowHtml` is the same template for both.
-test('CMX-230: the sidebar row\'s .ar-state renders the real status word, not blank — colour is not the only cue', () => {
-    nav.renderSidebarAgents([
+// CMX-121 (in the CMX-276 port): the word left the row FACE (the dot's shape carries the
+// state); it is the dot's accessible name, so it is still never colour alone.
+const stateOf = row => row.querySelector('.term-status-dot').getAttribute('aria-label');
+
+test('CMX-230: the sidebar row\'s dot names the real status word, not blank — colour is not the only cue', () => {
+    sidebar.renderSidebarAgents([
         agent('working-one', { session_status: 'busy' }),
         agent('idle-one', { session_status: 'idle' }),
         agent('waiting-one', { session_status: 'waiting' }),
     ]);
-    assert.equal(rowFor('working-one').querySelector('.ar-state').textContent, 'working',
-        '.ar-state must carry the real status word, not an empty span the colour class alone would leave');
-    assert.equal(rowFor('idle-one').querySelector('.ar-state').textContent, 'idle');
-    assert.equal(rowFor('waiting-one').querySelector('.ar-state').textContent, 'waiting',
-        '.ar-state must carry the real status word for the waiting/yellow row too — leaving it blank for ' +
+    assert.equal(stateOf(rowFor('working-one')), 'Session: working',
+        'the dot must carry the real status word, not the colour class alone');
+    assert.equal(stateOf(rowFor('idle-one')), 'Session: idle');
+    assert.equal(stateOf(rowFor('waiting-one')), 'Session: waiting',
+        'the dot must carry the real status word for the waiting/yellow row too — leaving it blank for ' +
         'exactly this state is unreadable to a red-weak viewer who needs the word most');
+    assert.ok(!rowFor('working-one').textContent.includes('working'), 'the row face carries no status word');
 });
 
 test('CMX-230: the sidebar row\'s .ar-ctx renders the real percentage number, not blank — colour is not the only cue', () => {
-    nav.updateCtxCache([{ window_id: '@1', used_pct: 87 }]);
-    nav.renderSidebarAgents([agent('ctx-one', { window_id: '@1' })]);
+    sidebar.updateCtxCache([{ window_id: '@1', used_pct: 87 }]);
+    sidebar.renderSidebarAgents([agent('ctx-one', { window_id: '@1' })]);
     const chip = rowFor('ctx-one').querySelector('.ar-ctx');
     assert.ok(chip, '.ar-ctx chip did not render for an agent with a cached context %');
     assert.equal(chip.textContent, '87%',
@@ -752,10 +659,10 @@ test('CMX-230: the sidebar row\'s .ar-ctx renders the real percentage number, no
 // up as a missing node, not a passing regex over the source text.
 
 test('CMX-359: a `done` agent renders the word "done" on its row — colour is not the only cue', () => {
-    nav.renderSidebarAgents([agent('finished-one', { session_status: 'idle', done: true })]);
+    sidebar.renderSidebarAgents([agent('finished-one', { session_status: 'idle', done: true })]);
     const row = rowFor('finished-one');
-    assert.equal(row.querySelector('.ar-state').textContent, 'done',
-        '.ar-state must carry the real "done" word, not fall back to "idle" — a red-weak viewer needs the word, not the dot colour');
+    assert.equal(stateOf(row), 'Session: done',
+        'the dot must carry the real "done" word, not fall back to "idle" — a red-weak viewer needs the word, not the dot colour');
     assert.ok(row.querySelector('.term-status-dot').classList.contains('done'),
         'the status dot must carry the done CSS class too, so its colour matches the word');
 });
@@ -763,19 +670,19 @@ test('CMX-359: a `done` agent renders the word "done" on its row — colour is n
 test('CMX-359: an idle agent with no `done` evidence still reads plain "idle" — the counterweight', () => {
     // The issue's explicit guard: dropping the did_work_since-style ordering check
     // would badge EVERY idle row "done". Pin the false/undefined case stays "idle".
-    nav.renderSidebarAgents([
+    sidebar.renderSidebarAgents([
         agent('untouched-one', { session_status: 'idle' }),          // done: undefined
         agent('untouched-two', { session_status: 'idle', done: false }),
     ]);
-    assert.equal(rowFor('untouched-one').querySelector('.ar-state').textContent, 'idle');
-    assert.equal(rowFor('untouched-two').querySelector('.ar-state').textContent, 'idle');
+    assert.equal(stateOf(rowFor('untouched-one')), 'Session: idle');
+    assert.equal(stateOf(rowFor('untouched-two')), 'Session: idle');
 });
 
 // CMX-35 retired the "Finished" cluster: the sidebar groups by FOLDER now (the desktop
 // app's look), and a done row stays in its folder — its check shape and the word
 // "done" carry the state. It must still render exactly once.
 test('CMX-35: a `done` agent stays in its folder group — no Finished cluster, rendered once', () => {
-    nav.renderSidebarAgents([
+    sidebar.renderSidebarAgents([
         agent('done-agent', { window_id: '@2', session_status: 'idle', done: true, cwd: '/home/x/proj' }),
         agent('plain-agent', { window_id: '@3', session_status: 'idle', cwd: '/home/x/proj' }),
     ]);
@@ -784,7 +691,7 @@ test('CMX-35: a `done` agent stays in its folder group — no Finished cluster, 
     const group = document.querySelector('#sidebar-agents .side-group[data-g="/home/x/proj"]');
     assert.ok(group, 'no folder group for /home/x/proj');
     assert.ok(group.querySelector('.agent-row[data-agent="done-agent"]'), 'the done row is not in its folder group');
-    assert.equal(group.querySelector('.agent-row[data-agent="done-agent"] .ar-state').textContent, 'done');
+    assert.equal(stateOf(group.querySelector('.agent-row[data-agent="done-agent"]')), 'Session: done');
     assert.equal(document.querySelectorAll('#sidebar-agents .agent-row[data-agent="done-agent"]').length, 1,
         'the done agent rendered more than once');
 });
@@ -794,7 +701,7 @@ test('CMX-359: "Needs you" outranks "done" — a row can only ever appear in one
     // `!needs_human`), but nav.js's own partition must still resolve the conflict
     // the same way if it ever saw one: wantsHuman wins, so the row is never
     // duplicated into the Needs-you cluster AND its folder.
-    nav.renderSidebarAgents([
+    sidebar.renderSidebarAgents([
         agent('blocked-and-done', { session_status: 'waiting', done: true }),
     ]);
     const needsYou = document.querySelector('#sidebar-agents .side-needs-you');
@@ -814,8 +721,8 @@ test('CMX-72: the orchestrator session stays in its folder group — no "Pinned"
         agent('orch', { window_id: '@1', cwd: '/home/x/proj-a' }),
         agent('teammate', { window_id: '@2', cwd: '/home/x/proj-a' }),
     ];
-    util.setAgentsCache(rows);
-    nav.renderSidebarAgents(rows);
+    agentsStore.set(rows);
+    sidebar.renderSidebarAgents(rows);
     const inProjA = () => {
         const g = [...document.querySelectorAll('#sidebar-agents .side-group')].find(x => x.dataset.g === '/home/x/proj-a');
         return g ? [...g.querySelectorAll('.agent-row')].map(r => r.dataset.agent).sort() : [];
@@ -845,7 +752,7 @@ test('CMX-72: the orchestrator session stays in its folder group — no "Pinned"
 });
 
 test('CMX-35: "Needs you" renders BEFORE the folder groups in the actual DOM order', () => {
-    nav.renderSidebarAgents([
+    sidebar.renderSidebarAgents([
         agent('blocked-one', { window_id: '@2', session_status: 'waiting', cwd: '/home/x/proj-b' }),
         agent('plain-one', { window_id: '@3', session_status: 'idle', cwd: '/home/x/proj-b' }),
     ]);
@@ -858,35 +765,26 @@ test('CMX-35: "Needs you" renders BEFORE the folder groups in the actual DOM ord
 });
 
 // --- CMX-377: New session button + jump-to search, ahead of nav (rendered-DOM,
-// against the REAL index.html, not a source-grep) -------------------------------
+// on the REAL page, not a source-grep) ------------------------------------------
 //
-// Reuses the SAME already-booted module graph + jsdom `window` the file's own
-// `before()` set up (not a second `bootDashboardDom()` call): main.js's module
-// graph only ever executes its top-level side effects ONCE per process (ES
-// module caching) — a second boot call would hand back a FRESH, empty
-// `window.chela` on the new jsdom window that nav.js's already-run
-// `Object.assign(window.chela, {...})` never populates. Grafting the real
-// sidebar-quick markup onto the EXISTING mounted sidebar sidesteps that trap
-// entirely and is honest about it: `chela.sidebarJumpInput` below is the SAME
-// live function the rest of this file's tests already exercise.
+// The REAL page this file booted (the shell, CMX-248): its .sidebar-quick row, its New
+// session button and its jump box, driven the way a user drives them.
 test('CMX-377: the REAL sidebar renders a "New session" button and a jump-to-session search, wired to real functions', async () => {
-    const { sliceTemplate } = await import('./js_helpers/dashboard_dom.mjs');
-    const QUICK_HTML = sliceTemplate('<div class="sidebar-quick">', '\n      </div>\n\n      <!-- Primary navigation.')
-        .replace(/\n\n      <!-- Primary navigation\.$/, '');
-    document.querySelector('.sidebar').insertAdjacentHTML('afterbegin', QUICK_HTML);
-    // This file's own BODY fixture (top of file) has no #palette overlay —
-    // graft the real one on too, so the WIRING check below can drive it for real.
-    if (!document.getElementById('palette')) {
-        const PALETTE_HTML = sliceTemplate('<div class="palette-overlay" id="palette"', '</div>\n\n<!-- Keyboard shortcuts');
-        document.body.insertAdjacentHTML('beforeend', PALETTE_HTML.replace(/\n\n<!-- Keyboard shortcuts$/, ''));
-    }
-    const chela = window.chela;
-
+    // CMX-219: the button is the launcher's, in the slot the shell gives it.
+    // createRoot().render paints on a later scheduler tick: one flush() is not enough on a
+    // loaded CI runner. Wait (up to 1s) for what the asserts below read.
+    const settled = async sel => { for (let i = 0; i < 100 && !document.querySelector(sel); i++) await flush(); };
+    await settled('.sidebar .sidebar-new-btn');
     const newBtn = document.querySelector('.sidebar .sidebar-new-btn');
     assert.ok(newBtn, 'no "New session" button (.sidebar-new-btn) inside the real .sidebar');
     assert.match(newBtn.textContent, /New session/i, '.sidebar-new-btn has no "New session" text');
-    assert.match(newBtn.getAttribute('onclick') || '', /chela\.openNewMenu\(event\)/,
-        '.sidebar-new-btn is not wired to chela.openNewMenu — the SAME launch surface the old sidebar "+" used');
+    clickIsland(newBtn);
+    await settled('.popover.launch-menu #new-sandbox-item');
+    assert.ok(document.querySelector('.popover.launch-menu #new-sandbox-item'),
+        '.sidebar-new-btn does not open the launch menu, the ONE launch surface');
+    const { closeLaunchMenu } = await import('../chela/dashboard/frontend/src/features/launcher/index.ts');
+    closeLaunchMenu();
+    await flush();
 
     const jumpInput = document.getElementById('sidebar-jump-input');
     assert.ok(jumpInput, 'no jump-to-session input (#sidebar-jump-input) inside the real .sidebar');
@@ -906,29 +804,15 @@ test('CMX-377: the REAL sidebar renders a "New session" button and a jump-to-ses
     // and renders real results off it — reusing the existing fuzzy jump, not a
     // second implementation.
     //
-    // CMX-377 round 3 (judge mutations 4+5, defeat_shapes #377b): this used to
-    // call `chela.sidebarJumpInput(jumpInput)` directly, which proves the
-    // FUNCTION works but never reads the `oninput`/`onfocus` attributes a real
-    // keystroke actually fires — blanking both (`onfocus="" oninput=""`) left
-    // this green. And it only checked `.open`, which stayed true even when
-    // `_renderPalette(el.value)` was mutated to `_renderPalette('')` — the
-    // overlay still opens, just never filters. Fixed by (a) compiling and
-    // running the REAL `oninput` attribute text via `fireInlineHandler` — the
-    // same attribute-compile idiom `clickOnclick` already uses for `onclick`,
-    // since jsdom never executes inline handlers off a dispatched event
-    // without `runScripts:"dangerously"` — and (b) asserting the RENDERED
-    // results actually reflect the typed query, the same way
-    // tests/wallnav.test.mjs's "typing a query drops the panes-first section"
-    // test already proves for the palette's own input.
-    assert.equal(typeof chela.sidebarJumpInput, 'function', 'window.chela.sidebarJumpInput is missing');
-    const overlay = document.getElementById('palette');
-    assert.ok(overlay, 'no #palette overlay in the real document');
-    assert.ok(!overlay.classList.contains('open'), 'sanity: the palette starts closed');
-
-    assert.ok(jumpInput.getAttribute('oninput'),
-        '#sidebar-jump-input has no oninput attribute — typing would never reach chela.sidebarJumpInput at all');
-    assert.ok(jumpInput.getAttribute('onfocus'),
-        '#sidebar-jump-input has no onfocus attribute — focusing it while the palette is closed would never open it');
+    // CMX-377 round 3 (judge mutations 4+5, defeat_shapes #377b): this used to call the
+    // handler directly, which proves the FUNCTION works but never the events a real keystroke
+    // fires; and it only checked `.open`, which stayed true when the typed value never reached
+    // the palette. So it fires the box's REAL focus and input events (React's onFocus and
+    // onInput, CMX-248; inline attributes before) and asserts the RENDERED results reflect the
+    // typed query, as tests/wallnav.test.mjs's "typing a query drops the panes-first section"
+    // proves for the palette's own input.
+    const { closePalette, paletteOpen } = await import('./js_helpers/dashboard_dom.mjs');
+    assert.ok(!(await paletteOpen()), 'sanity: the palette starts closed');
 
     // Deterministic palette contents: no open panes (TERMINALS_ON share items and
     // launcher favourites/recents are already absent in this file's boot fixture),
@@ -938,26 +822,27 @@ test('CMX-377: the REAL sidebar renders a "New session" button and a jump-to-ses
     // so "wall" can only ever fuzzy-match "Wall" — an unambiguous discriminator
     // between "the typed query reached _renderPalette" and "it didn't" (mutation 5
     // rendered the FULL unfiltered listing regardless of what was typed).
-    util.setAgentsCache([]);
-    const { fireInlineHandler } = await import('./js_helpers/dashboard_dom.mjs');
+    agentsStore.set([]);
 
-    // CMX-377 round 4 (judge mutation 4): the onfocus attribute was only checked
-    // for being non-empty, so `onfocus="void chela"` stayed green. RUN it — a
-    // real focus on the closed palette must open it — then close it again so
-    // the oninput leg below proves its own wiring from the same closed start.
+    // CMX-377 round 4 (judge mutation 4): a REAL focus on the closed palette must open it;
+    // then close it again so the input leg below proves its own wiring from the same start.
     jumpInput.value = '';
-    fireInlineHandler(jumpInput, 'onfocus');
-    assert.ok(overlay.classList.contains('open'),
-        'running #sidebar-jump-input\'s REAL onfocus attribute did not open the #palette overlay — focusing the ' +
-        'sidebar search while the palette is closed would do nothing');
-    chela.closePalette();
-    assert.ok(!overlay.classList.contains('open'), 'sanity: closePalette() closed the overlay again');
+    jumpInput.focus();
+    await flush();
+    assert.ok(await paletteOpen(),
+        'focusing #sidebar-jump-input did not open the palette: focusing the sidebar search while ' +
+        'the palette is closed would do nothing');
+    await closePalette();
+    assert.ok(!(await paletteOpen()), 'sanity: closePalette() closed the palette again');
 
-    jumpInput.value = 'wall';   // "Wall" is a real registered view label (same query wallnav.test.mjs's own palette test uses)
-    fireInlineHandler(jumpInput, 'oninput');
+    // Typing stays in the sidebar box (CMX-377): the palette opens without taking focus.
+    jumpInput.blur();
+    jumpInput.focus();
+    typeInto(jumpInput, 'wall');   // "Wall" is a real registered view label (same query wallnav.test.mjs's own palette test uses)
+    await flush();
 
-    assert.ok(overlay.classList.contains('open'),
-        'typing into the sidebar search did not open the real #palette overlay');
+    assert.ok(await paletteOpen(), 'typing into the sidebar search did not open the real palette');
+    assert.ok(document.activeElement === jumpInput, 'opening the palette from the sidebar box took focus out of it');
     const rows = Array.from(document.getElementById('palette-list').children);
     assert.ok(rows.every(r => !r.classList.contains('palette-divider')),
         'a non-empty query must not render the panes-first divider — _renderPalette is not seeing the typed value ' +
@@ -970,4 +855,5 @@ test('CMX-377: the REAL sidebar renders a "New session" button and a jump-to-ses
         'the one rendered result is not the "Wall" view — the typed query never reached _renderPalette');
     assert.equal(rows[0].querySelector('.pi-sub')?.textContent, 'view',
         'the one rendered result is not tagged as a "view" — the typed query never reached _renderPalette');
+    await closePalette();
 });

@@ -9,13 +9,13 @@
 // terminals.js in jsdom (same harness as tests/window_id.test.mjs) over three idle
 // windows: a live battery (3/6), one that died before a verdict, and one with none.
 //
-// Run: node --test tests/judge_battery_badge.test.mjs (pytest runs it via
+// Run: pnpm exec vitest run tests/judge_battery_badge.test.mjs (pytest runs it via
 // tests/test_js_suites.py; needs `pnpm install` for jsdom.)
-import { before, test } from 'node:test';
+import { beforeAll, test } from 'vitest';
 import assert from 'node:assert/strict';
 import { JSDOM } from 'jsdom';
 import { readFileSync } from 'node:fs';
-import { batteryState, tileState } from '../chela/dashboard/static/js/wallmodel.js';
+import { batteryState, tileState } from '../chela/dashboard/static/js/wallmodel.ts';
 
 // `current` carries a guard text no surface may print: the dashboard draws the LABEL
 // (counts + elapsed) only — the experiment running now may be a held-out one (CMX-395),
@@ -53,7 +53,6 @@ const PANEL = `
   <select id="term-agent"></select>
   <span id="term-wall-grid"><span id="term-grid-presets"></span><button id="term-lock-btn"></button></span>
   <button id="term-new-shell"></button>
-  <div id="term-switcher"></div>
   <div id="term-stage"></div>
   <div id="term-min-dock"></div>
   <div id="term-bar" class="kb-collapsed"><button class="kb-toggle" id="kb-toggle"></button><div class="kb-body" id="kb-body"></div></div>
@@ -80,10 +79,9 @@ function fakeGridStack() {
     return { init: () => grid };
 }
 
-before(async () => {
+beforeAll(async () => {
     const dom = new JSDOM(`<!doctype html><html><body>${PANEL}</body></html>`,
         { url: 'http://localhost:5005/', pretendToBeVisual: true });
-    dom.window.TERMINALS_ENABLED = true;
     for (const k of ['window', 'document', 'localStorage', 'navigator', 'HTMLElement',
         'Element', 'Node', 'Event', 'MouseEvent', 'KeyboardEvent', 'CustomEvent',
         'getComputedStyle', 'requestAnimationFrame', 'cancelAnimationFrame']) {
@@ -98,11 +96,12 @@ before(async () => {
     });
     globalThis.window.chela = globalThis.window.chela || {};
     globalThis.setInterval = () => 0;
-    await import('../chela/dashboard/static/js/main.js');
-    const util = await import('../chela/dashboard/static/js/util.js');
-    const terminals = await import('../chela/dashboard/static/js/terminals.js');
-    util.setCurrentTab('terminals');
-    util.setAgentsCache(AGENTS);
+    (await import('../chela/dashboard/frontend/src/boot.ts')).start();
+    const { agents: agentsStore } = await import('../chela/dashboard/frontend/src/shared/store/agents.ts');
+    const { view: viewStore } = await import('../chela/dashboard/frontend/src/shared/store/view.ts');
+    const terminals = await import('../chela/dashboard/frontend/src/features/wall/index.ts');
+    viewStore.set('terminals');
+    agentsStore.set(AGENTS);
     await terminals.renderTerminals();
     // A pane minimized to the taskbar: its CHIP carries the same status dot.
     terminals.minimizePane('@43');

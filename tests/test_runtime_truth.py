@@ -22,20 +22,24 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
 import pytest
 
 from chela import (
+    agent_manager,
     capabilities,
     config,
     discovery,
     dispatcher,
     doctor,
+    envutil,
     epoch,
     event_log,
     hooks,
@@ -94,6 +98,9 @@ def fleet(tmp_path, monkeypatch, request):
     # agents.native_status_feed: `claude agents --json` answers fine — the suite stubs the
     # seam instead of shelling out for real (the real call costs up to 30s, see CMX-179).
     monkeypatch.setattr(runtime_truth, "_native_status_probe", lambda: (True, "0.8s"))
+    # plugin.hooks_attributed (CMX-203): the same feed, as the live-session map — empty,
+    # so a hook-blind session a corruption plants is closed unless it says otherwise.
+    monkeypatch.setattr(runtime_truth, "_live_sessions", lambda: {})
     monkeypatch.setattr(config, "DISPATCH_WORKFLOWS", [repo / "WORKFLOW.md"])
     capabilities.publish(capabilities.effective())
 
@@ -117,12 +124,20 @@ def fleet(tmp_path, monkeypatch, request):
     # the state a window not born under a poisoned tmux server actually has. Explicit,
     # not assumed: a leak here would make every other test in this file's baseline lie.
     monkeypatch.delenv("NODE_CHANNEL_FD", raising=False)
+    # telegram.sender_allowlist: no bridge is configured, so there is nobody to let in.
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("CHELA_TELEGRAM_ALLOWED_USERS", raising=False)
     monkeypatch.delenv("NODE_CHANNEL_SERIALIZATION_MODE", raising=False)
     # CMX-313: the fact only applies inside a tmux pane (see _process_node_ipc_env_applies)
     # — force it on here, same as _collector_applies above, so the fleet baseline exercises
     # it deterministically instead of depending on whether the suite happens to be run from
     # inside a real tmux pane.
     monkeypatch.setattr(runtime_truth, "_process_node_ipc_env_applies", lambda: True)
+    # CMX-191: likewise, this process is not a pm2-managed service and carries none of
+    # pm2's app-config keys, whatever shell the suite happens to be run from.
+    monkeypatch.setattr(runtime_truth, "_pm2_manages_this_process", lambda: False)
+    for k in envutil.pm2_app_keys():
+        monkeypatch.delenv(k, raising=False)
     monkeypatch.setattr(epoch, "current", lambda: EPOCH)
     monkeypatch.setattr(runtime_truth, "_in_flight_runs",
                         lambda: {"CMX-66": {"wid": "@1", "epoch": EPOCH}})
@@ -305,6 +320,14 @@ def _break_process_node_ipc_env(tmp_path, monkeypatch):
     monkeypatch.setenv("NODE_CHANNEL_FD", "3")
     monkeypatch.setenv("NODE_CHANNEL_SERIALIZATION_MODE", "json")
     return doctor.ERROR
+
+
+def _break_process_pm2_app_env(tmp_path, monkeypatch):
+    """CMX-191: THIS shell inherited pm2's app config — a `pm2 start` here reads `args=`
+    over the ecosystem file and starts every service bare."""
+    monkeypatch.setenv("args", "")
+    monkeypatch.setenv("exec_mode", "fork_mode")
+    return doctor.WARN
 
 
 def _break_dashboard_port(tmp_path, monkeypatch):
@@ -509,8 +532,10 @@ def _break_hooks_attributed(tmp_path, monkeypatch):
     """A hook DID reach the log, but `wid_for_session` landed None — two agents sharing one
     cwd (CMX-190), or the window closed before the POST arrived. The record is the exact
     shape `chela/hooks.py:ingest` writes: `wid=None`, `session_id` kept."""
-    event_log.append("hook.pre_tool_use", "Bash: ls", {}, wid=None,
-                     session_id="1969180e-dead-beef-cafe-000000000000")
+    sid = "1969180e-dead-beef-cafe-000000000000"
+    event_log.append("hook.pre_tool_use", "Bash: ls", {}, wid=None, session_id=sid)
+    # CMX-203: and the session is still LIVE — a closed one is no longer worth a warning.
+    monkeypatch.setattr(runtime_truth, "_live_sessions", lambda: {sid: "window ? agent"})
     return doctor.WARN
 
 
@@ -656,7 +681,15 @@ def _break_services_current(tmp_path, monkeypatch):
     return doctor.WARN
 
 
+def _break_telegram_sender_allowlist(tmp_path, monkeypatch):
+    """The bridge has a token (in secrets.env, where it belongs) and NO sender allowlist —
+    every member of the bound chat can drive every agent (CMX-185)."""
+    (config.CHELA_DIR / "secrets.env").write_text("TELEGRAM_BOT_TOKEN=123:fake\n")
+    return doctor.WARN
+
+
 CORRUPTIONS = {
+    "telegram.sender_allowlist": _break_telegram_sender_allowlist,
     "relay.transcripts": _break_relay_transcripts,
     "env.file": _break_env_file,
     "env.running": _break_env_running,
@@ -664,6 +697,7 @@ CORRUPTIONS = {
     "tmux.node_ipc_env": _break_tmux_node_ipc_env,
     "tmux.leaked_env": _break_tmux_leaked_env,
     "process.node_ipc_env": _break_process_node_ipc_env,
+    "process.pm2_app_env": _break_process_pm2_app_env,
     "dashboard.port": _break_dashboard_port,
     "dashboard.update_lock": _break_update_apply_lock,
     "plugin.rendered": _break_plugin_rendered,
@@ -1198,7 +1232,7 @@ def test_peer_transport_warns_on_a_stale_socket_file_nothing_is_listening_on(
 
 
 def test_peer_transport_flags_windows_reachable_only_via_the_legacy_default_path(
-        fleet, monkeypatch):
+        fleet, monkeypatch, request):
     """The three-way ask: a `default` window works TODAY, but only by reading OUR OWN
     XDG_RUNTIME_DIR as a stand-in for the target's — it is exactly the window that
     still needs a relaunch to pick up a chela-owned path, and a binary
@@ -1206,9 +1240,15 @@ def test_peer_transport_flags_windows_reachable_only_via_the_legacy_default_path
     Doctor must name it."""
     peer_sock = messenger.deterministic_peer_socket_path("@1")
     peer_sock.unlink()
-    runtime_dir = fleet / "xdg-runtime"
+    # 🎲 CMX-257: NOT under `fleet` (tmp_path). An xdist tmp_path is ~80 bytes before this
+    # suffix, so `…/popen-gw12/test_peer_transport_flags_wind0/xdg-runtime/cc-socks/1.sock`
+    # is 108 bytes — past the AF_UNIX sun_path limit, `bind` raised `OSError: AF_UNIX path
+    # too long` on any worker gw10+ once the basetemp counter reached 4 digits.
+    runtime_dir = Path(tempfile.mkdtemp(prefix="cmx257-", dir="/tmp"))
+    request.addfinalizer(lambda: shutil.rmtree(runtime_dir, ignore_errors=True))
     (runtime_dir / "cc-socks").mkdir(parents=True)
     legacy_sock = runtime_dir / "cc-socks" / "1.sock"
+    assert len(os.fsencode(legacy_sock)) <= 64, legacy_sock  # independent of tmp_path depth
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(str(legacy_sock))
     listener.listen(1)
@@ -2244,3 +2284,95 @@ def test_blocked_race_ack_for_a_DIFFERENT_sha_does_not_clear_the_row(tmp_path, m
         "an acknowledgement recorded for a DIFFERENT judge_sha cleared the current "
         "verdict — one ack must not permanently mute a run"
     )
+
+
+# --- plugin.hooks_attributed: only LIVE hook-blind sessions warn (CMX-203) -------------
+
+_LIVE_SID = "ff3314ed-0000-4000-8000-000000000001"
+_CLOSED_SIDS = ("aaaaaaaa-0000-4000-8000-000000000002", "bbbbbbbb-0000-4000-8000-000000000003")
+
+
+def _attributed(monkeypatch, live):
+    for sid in (*_CLOSED_SIDS, _LIVE_SID):
+        event_log.append("hook.pre_tool_use", "Bash: ls", {}, wid=None, session_id=sid)
+    monkeypatch.setattr(runtime_truth, "_live_sessions", lambda: live)
+    return runtime_truth.audit(runtime_truth.fact("plugin.hooks_attributed"))
+
+
+def test_hooks_attributed_lists_only_the_live_session(fleet, monkeypatch):
+    [f] = _attributed(monkeypatch, {_LIVE_SID: "@16 openmmo-claude", "cccccccc-x": "@2 x"})
+    assert f.level == doctor.WARN
+    assert "1 hook.* event(s) unattributable — 1 LIVE hook-blind session(s)" in f.title
+    assert "@16 openmmo-claude (ff3314ed)" in f.title
+    assert "(2 closed session(s) ignored)" in f.title
+    for sid in _CLOSED_SIDS:
+        assert sid[:8] not in f.title and sid not in f.detail
+    assert f.detail.endswith(f"Sessions: {_LIVE_SID}")
+
+
+def test_hooks_attributed_all_closed_is_ok(fleet, monkeypatch):
+    [f] = _attributed(monkeypatch, {"cccccccc-x": "@2 x"})
+    assert f.level == doctor.OK
+    assert "no live hook-blind sessions" in f.title
+    assert "(3 closed session(s) ignored)" in f.title
+
+
+def test_hooks_attributed_unreadable_feed_is_unknown_not_ok(fleet, monkeypatch):
+    [f] = _attributed(monkeypatch, None)
+    assert f.level == doctor.WARN
+    assert f.title.startswith("UNKNOWN whether 3 hook-blind session(s)")
+    assert _LIVE_SID in f.detail and _CLOSED_SIDS[0] in f.detail
+
+
+def test_hooks_attributed_no_orphans_never_asks_the_feed(fleet, monkeypatch):
+    def boom():
+        raise AssertionError("the feed was asked with nothing to judge")
+    monkeypatch.setattr(runtime_truth, "_live_sessions", boom)
+    [f] = runtime_truth.audit(runtime_truth.fact("plugin.hooks_attributed"))
+    assert f.level == doctor.OK and "no live hook-blind sessions" in f.title
+
+
+def _feed(monkeypatch, *, which="/usr/bin/claude", ok=True, panes=None):
+    status_map = {
+        "by_pid": {101: "busy", 102: "idle"},
+        "session_by_pid": {101: "sid-in-window", 102: "sid-rootless"},
+        "name_by_pid": {101: "cmx-66"},
+    }
+    calls = []
+    monkeypatch.setattr(runtime_truth.shutil, "which", lambda b: calls.append(b) or which)
+    monkeypatch.setattr(agent_manager, "session_status_map",
+                        lambda force=False: calls.append(force) or status_map)
+    monkeypatch.setattr(agent_manager, "native_status_health", lambda: {"ok": ok})
+    if panes is None:
+        panes = lambda force=False: {  # noqa: E731
+            "@1": sessions.Pane(wid="@1", claude_pid=101),
+            "@2": sessions.Pane(wid="@2", claude_pid=None)}
+    monkeypatch.setattr(sessions, "panes", panes)
+    return calls
+
+
+def test_live_sessions_names_each_by_window_and_name(monkeypatch):
+    calls = _feed(monkeypatch)
+    assert runtime_truth._live_sessions() == {
+        "sid-in-window": "@1 cmx-66", "sid-rootless": "window ? pid 102"}
+    # the cached map, not a forced cold call — doctor already paid for one this run
+    assert calls == ["claude", False]
+
+
+def test_live_sessions_no_claude_is_unknown(monkeypatch):
+    calls = _feed(monkeypatch, which=None)
+    assert runtime_truth._live_sessions() is None
+    assert calls == ["claude"]
+
+
+def test_live_sessions_unhealthy_feed_is_unknown(monkeypatch):
+    _feed(monkeypatch, ok=False)
+    assert runtime_truth._live_sessions() is None
+
+
+def test_live_sessions_unreadable_window_table_still_names_sessions(monkeypatch):
+    def broken(force=False):
+        raise RuntimeError("tmux is gone")
+    _feed(monkeypatch, panes=broken)
+    assert runtime_truth._live_sessions() == {
+        "sid-in-window": "window ? cmx-66", "sid-rootless": "window ? pid 102"}

@@ -1,15 +1,12 @@
-// CMX-397 — boots the REAL terminals.js against the terminals panel cut from the
-// REAL templates/index.html, for the collapsible-toolbar suites.
+// CMX-397: boots the REAL page (the shell, CMX-248) with its Wall, for the collapsible-toolbar
+// suites.
 //
-// terminals.js reads the toolbar's resting state ONCE, the first time it builds
-// the picker, so one Node process can only ever observe ONE stored
+// The toolbar (features/walltoolbar) reads its resting state ONCE, the first time it
+// draws, so one Node process can only ever observe ONE stored
 // expand/collapse choice. Each suite that needs a different starting
 // localStorage is its own *.test.mjs (its own process) calling bootWall().
 import { JSDOM } from 'jsdom';   // needs `pnpm install` — tests/test_js_suites.py enforces it
-import { renderShell } from './browser/fixture.mjs';
-
-// The terminals panel exactly as the real template ships it.
-const PANEL = new JSDOM(renderShell()).window.document.getElementById('panel-terminals').outerHTML;
+import { APP_BODY, exposeDomConstructors } from './js_helpers/dashboard_dom.mjs';
 
 const AGENTS = ['@1', '@2', '@3'].map((wid, i) => ({
     name: `a${i}`, window_id: wid, online: true, session_status: 'idle', claude_running: true,
@@ -36,12 +33,8 @@ function fakeGridStack() {
 
 // storage: the localStorage the page loads with (null value = key absent).
 export async function bootWall(storage) {
-    const dom = new JSDOM(`<!doctype html><html><body>${PANEL}</body></html>`,
-        // runScripts so the template's INLINE onclick attributes really fire — a
-        // preset click must reach chela.applyGridLayout the way a browser's does.
-        // The panel carries no <script>, so nothing else is evaluated.
-        { url: 'http://localhost:5005/', pretendToBeVisual: true, runScripts: 'dangerously' });
-    dom.window.TERMINALS_ENABLED = true;
+    const dom = new JSDOM(`<!doctype html><html><body>${APP_BODY}</body></html>`,
+        { url: 'http://localhost:5005/', pretendToBeVisual: true });
     for (const k of ['window', 'document', 'localStorage', 'navigator', 'HTMLElement',
         'Element', 'Node', 'Event', 'MouseEvent', 'KeyboardEvent', 'CustomEvent',
         'getComputedStyle', 'requestAnimationFrame', 'cancelAnimationFrame']) {
@@ -65,11 +58,15 @@ export async function bootWall(storage) {
     });
     globalThis.window.chela = globalThis.window.chela || {};
     globalThis.setInterval = () => 0;
-    await import('../chela/dashboard/static/js/main.js');
-    const util = await import('../chela/dashboard/static/js/util.js');
-    const terminals = await import('../chela/dashboard/static/js/terminals.js');
-    util.setCurrentTab('terminals');
-    util.setAgentsCache(AGENTS);
+    exposeDomConstructors(dom.window);   // the shell's Radix menus and dialogs
+    const boot = await import('../chela/dashboard/frontend/src/boot.ts');
+    boot.mountPage(dom.window);
+    boot.start();
+    const { agents: agentsStore } = await import('../chela/dashboard/frontend/src/shared/store/agents.ts');
+    const { view: viewStore } = await import('../chela/dashboard/frontend/src/shared/store/view.ts');
+    const terminals = await import('../chela/dashboard/frontend/src/features/wall/index.ts');
+    viewStore.set('terminals');
+    agentsStore.set(AGENTS);
     await terminals.renderTerminals();
     return dom;
 }

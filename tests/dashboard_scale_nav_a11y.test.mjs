@@ -26,7 +26,7 @@
 // three real state-pill families this file guards are: the wall's .gs-state
 // pill (idle/working/needs-you/done/unknown — "needs-you" is this codebase's
 // name for "waiting"), the sidebar's .ar-state line (idle/working/waiting), and
-// the Work board's .kanban-state-chip/.kanban-card-error (failed is the real
+// the Work board's .wcard-state/.wcard-note (failed is the real
 // analogue of "error" — a task-level failure, not an agent one). All three
 // already carried a non-hue cue before this ticket; what's new here is the
 // guard, not the cue.
@@ -241,31 +241,27 @@
 // check is a manual visual look at the live dashboard, same discipline as
 // (iv) and the type-scale half of claim 1 above.
 //
-// Run: node --test tests/dashboard_scale_nav_a11y.test.mjs (tests/test_js_suites.py
+// Run: pnpm exec vitest run tests/dashboard_scale_nav_a11y.test.mjs (tests/test_js_suites.py
 // runs every .test.mjs inside pytest, by discovery).
-import { test } from 'node:test';
+import { test } from 'vitest';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { JSDOM } from 'jsdom';   // needs `pnpm install` — tests/test_js_suites.py enforces it
 
-import { tileState } from '../chela/dashboard/static/js/wallmodel.js';
-import { navViews } from '../chela/dashboard/static/js/viewreg.js';
-import { bootDashboardDom } from './js_helpers/dashboard_dom.mjs';
+import { tileState } from '../chela/dashboard/static/js/wallmodel.ts';
+import { navViews } from '../chela/dashboard/frontend/src/features/shell/views.ts';
+import { APP_BODY, bootDashboardDom, SIDEBAR, NAV } from './js_helpers/dashboard_dom.mjs';
 import { cssForViewport, resolveVars } from './js_helpers/css_viewport.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', 'chela', 'dashboard');
 const src = p => readFileSync(join(ROOT, p), 'utf8');
 
 const CSS = src('static/style.css');
-const TERMINALS = src('static/js/terminals.js');
-const NAV = src('static/js/nav.js');
-const KANBAN = src('static/js/kanban.js');
-const VIEWS_SRC = src('static/js/views.js');
 
 // --- jsdom fixtures: mount the REAL style.css and a concrete, hand-written
-// fragment of REAL markup (mirroring terminals.js's paneHead()/
+// fragment of REAL markup (mirroring features/panehead's PaneHead and terminals.js's
 // _wallTileHTML()/_ctxBarHTML(), nav.js's _agentRowHtml(), and index.html's
 // sidebar section closely enough to match every selector these guards read —
 // verified against those sources as of round 9) in jsdom, then read jsdom's
@@ -541,12 +537,12 @@ test('full-space Wall (CMX-377): .grid-stack resolves ZERO padding and ZERO marg
 // --- GUARD 3: non-hue cue, per real state family — deleting the glyph/word
 // span (or the text it carries) and leaving only the colour class must fail.
 
-// 3a. The wall's .gs-state pill: tileState() (wallmodel.js, pure) is the ONE
-// source both the initial paneHead markup and every live repaint
-// (_applyWallTileFrame) draw from — see terminals.js below. Every state it can
-// report must carry a non-empty glyph AND a non-empty word; blanking either
-// for any one state (idle/working/needs-you/done/unknown) fails here.
-test('non-hue cue — wall .gs-state pill: every tileState() result carries a glyph AND a word', () => {
+// 3a. The wall's .gs-state pill: tileState() (wallmodel.ts, pure) is the ONE
+// source the pane header (features/panehead) draws it from. The pill draws only
+// the WORD (CMX-393: the shape is `.gs-dot`; CMX-236 dropped the never-drawn
+// glyph), so every state must carry a non-empty word, and no two states the same
+// one; blanking or merging any (idle/working/needs-you/done/unknown) fails here.
+test('non-hue cue — wall .gs-state pill: every tileState() result carries its own word', () => {
     const cases = [
         { label: 'idle', agent: null, wants: false },
         { label: 'working', agent: { session_status: 'busy' }, wants: false },
@@ -554,135 +550,91 @@ test('non-hue cue — wall .gs-state pill: every tileState() result carries a gl
         { label: 'done', agent: { session_status: 'idle', pr: { url: 'https://x', state: 'open' } }, wants: false },
         { label: 'unknown', agent: { claude_running: true, session_status: null }, wants: false },
     ];
-    for (const c of cases) {
+    const words = cases.map(c => {
         const s = tileState(c.agent, c.wants);
-        assert.ok(s.glyph && s.glyph.trim(), `${c.label}: tileState() glyph is empty — colour would be the only cue`);
         assert.ok(s.word && s.word.trim(), `${c.label}: tileState() word is empty — colour would be the only cue`);
-    }
-});
-
-test('non-hue cue — wall .gs-state pill: both the initial paint AND every live repaint set the word text node', () => {
-    // Initial paint: paneHead's own literal markup (terminals.js), before the
-    // first live repaint ever runs. `[^<]+`-style: the word must be non-empty.
-    // CMX-393: the pill is the WORD only — its shape partner is the header's
-    // `.gs-dot` (a glyph in here drew every state twice); tests/wallnav.test.mjs
-    // 12c guards that the pill stays glyph-free through a live repaint.
-    assert.match(TERMINALS, /<span class="gs-state gs-state-idle"[^>]*><span class="gs-state-word">idle<\/span><\/span>/,
-        'paneHead\'s initial .gs-state markup no longer carries the word "idle" (and only it)');
-    // Live repaint: _applyWallTileFrame must write the word text node from
-    // tileState()'s result, not just recolour the pill via className.
-    const frame = TERMINALS.slice(TERMINALS.indexOf('function _applyWallTileFrame'));
-    const body = frame.slice(0, frame.indexOf('\nfunction ', 10));
-    assert.match(body, /el\.className\s*=\s*'gs-state gs-state-'\s*\+\s*s\.cls/,
-        '_applyWallTileFrame must still recolour the pill from tileState().cls');
-    assert.match(body, /w\.textContent\s*=\s*s\.word/,
-        '_applyWallTileFrame no longer repaints the word text node — a live state change would go hue-only');
-});
-
-// 3b. The sidebar's .ar-state line: idle/working/waiting, each a real word
-// (nav.js's _AGENT_STATUS_WORD), rendered as the span's TEXT content, not just
-// its class.
-test('non-hue cue — sidebar .ar-state: idle/working/waiting each map to a real word, not blank', () => {
-    const m = NAV.match(/_AGENT_STATUS_WORD\s*=\s*\{([^}]*)\}/);
-    assert.ok(m, '_AGENT_STATUS_WORD not found in nav.js');
-    const map = Object.fromEntries(
-        [...m[1].matchAll(/(\w+):\s*'([^']*)'/g)].map(mm => [mm[1], mm[2]]));
-    for (const [color, want] of [['green', 'working'], ['yellow', 'waiting'], ['grey', 'idle']]) {
-        assert.equal(map[color], want, `_AGENT_STATUS_WORD.${color} must be the word "${want}"`);
-    }
-});
-
-test('non-hue cue — sidebar .ar-state: the rendered row interpolates the WORD into the element, not just a colour class', () => {
-    assert.match(NAV, /<span class="ar-state \$\{stCls\}">\$\{stWord\}<\/span>/,
-        '_agentRowHtml no longer renders stWord as the .ar-state text — a red-weak reader would see only the colour class');
-});
-
-// 3c. The Work board's closest real analogue of "error": a failed task. The
-// WORD is what the ticket demands survive greyscale — kanban.js's STATUS_CHIPS
-// already carries one per state; this pins 'failed' specifically, and that the
-// card-level last_error message renders as real text, not colour-only.
-test('non-hue cue — kanban "error" analogue (failed): the status chip carries a real word, not colour alone', () => {
-    const m = KANBAN.match(/failed:\s*\{\s*label:\s*'([^']*)'/);
-    assert.ok(m, 'STATUS_CHIPS.failed not found in kanban.js');
-    assert.ok(m[1].trim().length > 0, 'STATUS_CHIPS.failed.label is empty — the failed chip would be colour-only');
-    assert.match(m[1], /failed/i, 'STATUS_CHIPS.failed.label must literally say "failed"');
-});
-
-// CMX-257 round 9 (CLAIM 4's exception — stays fully guarded, gets the most
-// direct proof available per the human directive): the test above only pins
-// STATUS_CHIPS.failed's label CONSTANT — round 7's source-regex pair pinned
-// the render call site's TEXT but not the VALUE travelling between them, and
-// the judge blanked chipMeta.label right where it's looked up (leaving both
-// regexes byte-identical). This drives the REAL renderKanban() into a REAL
-// DOM (same jsdom-import technique as tests/wallnav.test.mjs/
-// tests/sidebar.test.mjs: real main.js entry order, then the target module)
-// and reads the rendered .kanban-state-chip/.kanban-card-error text nodes
-// back — mirrors the wall .gs-state pill's WIRING test above and
-// sidebar.test.mjs:447's real `.ar-state` read, the two members of this guard
-// family that have never fallen to a judge mutation because they assert the
-// rendered node, not source text.
-test('WIRING: a REAL rendered kanban card shows its status chip word AND its error text — not colour-only', async () => {
-    const BODY = '<div id="work-board"><div id="kanban-board"></div><div id="kanban-empty"></div><div id="kanban-filters"></div></div>';
-    // Browser-faithful import order: main.js is the entry (nav <-> main is a
-    // cycle — import anything else first and its `let`s are in their TDZ).
-    const { modules: { kanban } } = await bootDashboardDom({ body: BODY, extraModules: ['kanban.js'] });
-
-    kanban.renderKanban({
-        configured: true,
-        workflows: [{
-            path: 'wf.yaml',
-            recent_runs: [{ task_id: 'T1', status: 'failed', last_error: 'boom', ended_at: '2026-01-01' }],
-        }],
+        return s.word;
     });
+    assert.equal(new Set(words).size, cases.length, `two states share a word, so only colour tells them apart: ${words}`);
+});
 
-    const chip = document.querySelector('#kanban-board .kanban-state-chip');
-    assert.ok(chip, 'no .kanban-state-chip rendered for a failed card');
-    assert.match(chip.textContent, /failed/i,
-        'the REAL rendered .kanban-state-chip has no "failed" text — only its st-failed colour class would remain, ' +
+// The pill's paint (first render and every live change writing the word, not just the
+// class) is the React pane header's since CMX-241: features/panehead/tests/PaneHead.test.tsx.
+
+// 3b. The palette's status words: idle/working/waiting, each a real word on the row's sub-line
+// (features/palette, CMX-221; nav.js's _AGENT_STATUS_WORD before). The sidebar's own row is read
+// rendered below.
+test('non-hue cue — the palette\'s status words: idle/working/waiting each map to a real word, not blank', async () => {
+    const { STATUS_WORD } = await import('../chela/dashboard/frontend/src/features/palette/model.ts');
+    for (const [color, want] of [['green', 'working'], ['yellow', 'waiting'], ['grey', 'idle']]) {
+        assert.equal(STATUS_WORD[color], want, `STATUS_WORD.${color} must be the word "${want}"`);
+    }
+});
+
+// CMX-276: the rows are the React island's now (frontend/src/features/sidebar), and CMX-121
+// moved the word off the row face into the dot's accessible name. Read the REAL rendered row.
+const SIDEBAR_BODY = '<aside class="sidebar"><div class="side-list" id="sidebar-agents"></div></aside>';
+async function sidebarRows(rows, ctx = []) {
+    const { modules: { nav, sidebar } } = await bootDashboardDom({ body: SIDEBAR_BODY, canvasStub: true, extraModules: [NAV, SIDEBAR] });
+    sidebar.updateCtxCache(ctx);
+    sidebar.renderSidebarAgents(rows);
+    return name => document.querySelector(`#sidebar-agents .agent-row[data-agent="${name}"]`);
+}
+
+test('non-hue cue — sidebar row: the rendered dot NAMES the state word, not just a colour class', async () => {
+    const row = await sidebarRows(['busy', 'waiting', 'idle'].map((st, i) =>
+        ({ name: `r-${st}`, window_id: `@${i + 1}`, cwd: '/x/p', session_status: st })));
+    for (const [st, want] of [['busy', 'working'], ['waiting', 'waiting'], ['idle', 'idle']]) {
+        const dot = row(`r-${st}`).querySelector('.term-status-dot');
+        assert.ok(dot.classList.contains(want), dot.className);
+        assert.equal(dot.getAttribute('aria-label'), `Session: ${want}`,
+            'the dot no longer names its state: a red-weak reader would get only its colour');
+    }
+});
+
+// 3c. The Work board's closest real analogue of "error": a failed task. The WORD is what the
+// ticket demands survive greyscale. CMX-233: the board is React (features/work); its
+// STATUS_CHIPS constant and rendered card are pinned in features/work/tests (models.test.ts,
+// Board.test.tsx). This keeps the page-level read: the REAL page's Work island, fed a
+// failed run by the one poll, shows the state's word and the error text, not colour only.
+test('WIRING: a REAL rendered Work board card shows its state word AND its error text — not colour-only', async () => {
+    const payload = { configured: true, workflows: [{ path: 'wf.yaml', recent_runs: [{ task_id: 'T1', status: 'failed', last_error: 'boom', ended_at: '2026-01-01' }] }] };
+    await bootDashboardDom({
+        body: '<div class="panel active" id="panel-work"></div>', terminalsEnabled: false,
+        fetchImpl: url => Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(String(url).endsWith('/api/dispatcher') ? payload : {}) }),
+    });
+    const { pollWork } = await import('../chela/dashboard/frontend/src/features/work/index.ts');
+    await pollWork();
+    await new Promise(r => setTimeout(r, 0));
+
+    // CMX-316: the board draws the compact card; its state is a WORD beside its icon, and the
+    // run's error is the card's note, not a colour.
+    const state = document.querySelector('#kanban-board .wcard-state');
+    assert.ok(state, 'no .wcard-state rendered for a failed card');
+    assert.match(state.textContent, /failed/i,
+        'the REAL rendered .wcard-state has no "failed" text — only its colour would remain, ' +
         'the exact hue-only regression this guard exists to prevent');
 
-    const err = document.querySelector('#kanban-board .kanban-card-error');
-    assert.ok(err, 'no .kanban-card-error rendered for a failed card with last_error set');
+    const err = document.querySelector('#kanban-board .wcard-note');
+    assert.ok(err, 'no .wcard-note rendered for a failed card with last_error set');
     assert.match(err.textContent, /boom/,
-        'the REAL rendered .kanban-card-error has no error text — only its red colour would remain');
+        'the REAL rendered .wcard-note has no error text — only its colour would remain');
 });
 
 // --- GUARD 4: a context-% threshold is never colour-only — the exact number
 // (and, on the wall, the raw token count too) renders as text alongside the
 // warn/danger class.
-test('context-% threshold non-hue cue — sidebar .ar-ctx renders the numeric percentage as text, class is reinforcement only', () => {
-    assert.match(NAV, /class="ar-ctx \$\{cls\}"[^>]*>\$\{p\}%<\/span>/,
-        'the sidebar context chip no longer interpolates the numeric percentage as text');
+test('context-% threshold non-hue cue — sidebar .ar-ctx renders the numeric percentage as text, class is reinforcement only', async () => {
+    const row = await sidebarRows([{ name: 'hot', window_id: '@7', cwd: '/x/p' }], [{ window_id: '@7', used_pct: 87 }]);
+    const chip = row('hot').querySelector('.ar-ctx');
+    assert.equal(chip.textContent, '87%', 'the sidebar context chip no longer shows the numeric percentage as text');
+    assert.ok(chip.classList.contains('danger'), chip.className);
 });
 
-test('context-% threshold non-hue cue — the wall .gs-ctx chip renders "N% · used/total" as text, class is reinforcement only', () => {
-    const fn = TERMINALS.slice(TERMINALS.indexOf('function _applyTermContext'));
-    const body = fn.slice(0, fn.indexOf('\nfunction ', 10));
-    assert.match(body, /ctxChip\.textContent\s*=\s*`\$\{pct\}%/,
-        '.gs-ctx no longer sets its textContent from the numeric pct — a threshold crossing would be colour-only');
-    assert.match(body, /ctxChip\.className\s*=\s*'gs-ctx'\s*\+\s*\(sev/,
-        '.gs-ctx no longer applies the warn/danger class as a SEPARATE reinforcement on top of the text');
-});
-
-// --- GUARD 5: footer completeness — model, spend, branch, context% and tokens
-// (the exact 5 fields the ticket says "this ticket does NOT trade away") must
-// all still exist in the wall pane footer. Removing any one field's chip must
-// fail here, NAMING the missing field.
-test('wall pane footer completeness: model + spend + branch + context% + tokens all present', () => {
-    const fn = TERMINALS.slice(TERMINALS.indexOf('function _ctxBarHTML'));
-    const body = fn.slice(0, fn.indexOf('\nfunction ', 10));
-    const FIELDS = {
-        'model': /class="gs-model"/,
-        'spend (cost)': /class="gs-cost"/,
-        'branch': /class="gs-branch"/,
-        // context% AND tokens both render inside the SAME .gs-ctx chip — see
-        // _applyTermContext's `${pct}%...${counter}` template, asserted above.
-        'context% / tokens (gs-ctx)': /class="gs-ctx"/,
-    };
-    for (const [name, re] of Object.entries(FIELDS)) {
-        assert.match(body, re, `the wall pane footer is missing its ${name} field`);
-    }
-});
+// The wall .gs-ctx chip's "N% · used/total" text (the class only reinforces it) and the wall
+// footer's completeness (model, spend, branch, context % and tokens) are the tile footer's
+// own (CMX-242): frontend/src/features/tilefoot/tests/TileFoot.test.tsx renders the real
+// component instead of grepping terminals.js for the markup it no longer holds.
 
 // --- GUARD 7: nav inventory — CMX-279 (measured, not assumed: asked which of
 // the seven views he actually opens, Liav named exactly two) supersedes
@@ -694,37 +646,27 @@ test('wall pane footer completeness: model + spend + branch + context% + tokens 
 // pin + the #side-nav-more WIRING tests) wholesale: there is no longer a
 // second nav group, a demotion, or a re-parenting claim to guard piece by
 // piece — the whole shape collapses to one fact, asserted directly against
-// the REAL views.js source and the REAL rendered sidebar.
-function shippedViewIds() {
-    const body = VIEWS_SRC.split('export const VIEWS')[1];
-    const ids = [...body.matchAll(/^\s+id:\s*'([^']+)'/gm)];
-    return ids.map((m, i) => {
-        const start = m.index;
-        const end = i + 1 < ids.length ? ids[i + 1].index : body.length;
-        const block = body.slice(start, end);
-        return { id: m[1], virtual: /virtual:\s*true/.test(block) };
-    });
-}
-
-test('nav inventory: the shipped nav is exactly Wall and Work — the other five views are DELETED, not demoted', () => {
-    const entries = shippedViewIds().filter(v => !v.virtual);
-    const shipped = navViews(entries, { terminalsOn: true }).map(v => v.id);
+// the REAL registry (features/shell, CMX-248; static/js/views.js before) and the REAL page.
+test('nav inventory: the shipped nav is exactly Wall and Work — the other five views are DELETED, not demoted', async () => {
+    const { VIEWS } = await import('../chela/dashboard/frontend/src/features/shell/index.ts');
+    const shipped = navViews(VIEWS.filter(v => !v.virtual), { terminalsOn: true }).map(v => v.id);
     assert.deepEqual(shipped, ['terminals', 'work'],
         'the shipped nav drifted from CMX-279\'s exact 2 views — if this includes feed/knowledge/agents/personas/cost, ' +
         'one of the five deleted views came back; if it is missing terminals or work, one of the two kept views broke');
+    assert.ok(VIEWS.every(v => !('tier' in v)),
+        'a view still carries a `tier` field — CMX-279 removed the primary/secondary split along with the ' +
+        'five demoted-then-deleted views (nothing left needs a second nav group)');
 });
 
-test('nav inventory: the five deleted views leave no trace — no panel, no tier field, no secondary nav group', () => {
-    const html = src('templates/index.html');
+test('nav inventory: the five deleted views leave no trace on the real page — no panel, no secondary nav group', async () => {
+    await bootDashboardDom({ body: APP_BODY });
+    assert.ok(document.querySelector('#root .sidebar #side-nav'), 'the real page did not mount');
     for (const id of ['feed', 'knowledge', 'agents', 'personas', 'cost']) {
-        assert.ok(!html.includes(`id="panel-${id}"`),
-            `index.html still has a panel-${id} div — CMX-279 deleted this view's panel along with its nav entry`);
+        assert.equal(document.getElementById(`panel-${id}`), null,
+            `the page still has a panel-${id} — CMX-279 deleted this view's panel along with its nav entry`);
     }
-    assert.ok(!VIEWS_SRC.includes('tier:'),
-        'views.js still carries a `tier` field — CMX-279 removed the primary/secondary split along with the ' +
-        'five demoted-then-deleted views (nothing left needs a second nav group)');
-    assert.ok(!html.includes('id="side-nav-more"'),
-        'index.html still has a #side-nav-more container — CMX-279 removed the secondary nav group entirely, ' +
+    assert.equal(document.getElementById('side-nav-more'), null,
+        'the page still has a #side-nav-more container — CMX-279 removed the secondary nav group entirely, ' +
         'it did not just empty it');
 });
 
@@ -738,10 +680,8 @@ test('nav inventory: the five deleted views leave no trace — no panel, no tier
 // reads the rendered rows back.
 test('WIRING: the REAL renderNav() renders exactly Wall and Work into #side-nav, in order', async () => {
     const BODY = '<div class="app"><aside class="sidebar"><section class="side-section">' +
-        '<div class="side-list" id="side-nav"></div></section></aside></div>';
-    // Browser-faithful import order: main.js is the entry (nav <-> main is a
-    // cycle — import anything else first and its `let`s are in their TDZ).
-    const { modules: { nav } } = await bootDashboardDom({ body: BODY, extraModules: ['nav.js'] });
+        '<div class="side-list" id="side-nav"></div></section><div id="sidebar-agents"></div></aside></div>';
+    const { modules: { nav } } = await bootDashboardDom({ body: BODY, extraModules: [NAV] });
 
     nav.renderNav();
     const ids = [...document.querySelectorAll('#side-nav .side-item')].map(el => el.dataset.view);

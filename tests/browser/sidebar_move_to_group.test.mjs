@@ -10,7 +10,7 @@
 // Harness: tests/browser/fixture.mjs. Local: `pnpm run test:browser`.
 import { after, before, describe, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { launchChromium, openDashboard } from './fixture.mjs';
+import { launchChromium, openDashboard, DRAWER_OPENER } from './fixture.mjs';
 
 const { browser, why } = await launchChromium();
 after(() => browser && browser.close());
@@ -31,21 +31,22 @@ function setup(fn) {
 }
 
 async function openDrawer(page) {
-    await page.locator('#btn-menu-mobile').tap();
+    await page.locator(DRAWER_OPENER).tap();
     await page.waitForFunction(() => Math.abs(document.querySelector('.sidebar').getBoundingClientRect().left) < 0.5,
         null, { timeout: 5000 });
 }
 
-// The rows of the open row menu, as a viewer sees them: only when it is displayed.
+// The items of the open menu (CMX-277: the kit's Menu, in a portal), as a viewer sees them:
+// null when no menu is displayed.
 const rowMenu = page => page.evaluate(() => {
-    const m = document.getElementById('row-menu');
+    const m = document.querySelector('[role="menu"]');
     if (!m || getComputedStyle(m).display === 'none') return null;
-    return [...m.querySelectorAll('.popover-item')].map(i => (i.querySelector('.vm-label') || i).textContent.trim());
+    return [...m.querySelectorAll('[role^="menuitem"]')].map(i => (i.querySelector('.ov-label') || i).textContent.trim());
 });
 
-// Tap the menu row labelled `label` at its on-screen centre — a real touch, hit-tested.
+// Tap the menu item labelled `label` at its on-screen centre — a real touch, hit-tested.
 async function tapMenu(page, label) {
-    const item = page.locator('#row-menu .popover-item').filter({ hasText: label }).first();
+    const item = page.locator('[role="menu"] [role^="menuitem"]').filter({ hasText: label }).first();
     assert.ok(await item.isVisible(), `"${label}" is not visible in the row menu`);
     await item.tap();
 }

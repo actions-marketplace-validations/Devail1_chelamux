@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import atexit
 import functools
+import gzip
 import hashlib
 import json
 import logging
@@ -28,13 +29,15 @@ from flask import abort, Flask, jsonify, render_template, request, Response, sen
 
 from chela import config
 from chela.config import DISPATCH_WORKFLOWS, CHELA_DIR, TMUX_SESSION, NOTIFY_INTERVAL
-from chela import agent_manager, capabilities, collab, collab_host, collab_stream, context, diffsurface, discovery, dismissed_sessions, dispatcher, epoch, event_log, gateanswer, hold, hooks, inbox, judge, launcher, messenger, notify, okf, personas, pr_status, probecache, rc_rename, restore, rooms, sandbox_status, scheduler, sessionids, share_requests, share_sandbox, share_store, sidebar_archive, sidebar_layout, spawn, starter, tasklists, transcripts, update, usage, userconfig
-from chela.dashboard import resources, term_themes
+from chela import agent_manager, capabilities, collab, concurrency, collab_host, collab_stream, context, diffsurface, discovery, dismissed_sessions, dispatcher, epoch, event_log, fleet, gateanswer, hold, hooks, inbox, judge, launcher, messenger, notify, okf, park, personas, pr_status, probecache, rc_rename, restore, rooms, sandbox_status, scheduler, sessionids, share_requests, share_sandbox, share_store, sidebar_archive, sidebar_layout, spawn, starter, tasklists, transcripts, update, usage, userconfig
+from chela.dashboard import resources, term_fonts, term_themes
+from chela import topic_ledger as tg_topics
 from chela.personas import autolaunch, lease
 from chela.backlog import _BULLET_RE, parse_backlog
 from chela.sources import get_source
 from chela.sources.markdown import OPEN_RE
 from chela.workflow import load_workflow, workflow_error, PROJECT_KEY_RE
+from chela.worktree import reap_run_worktree
 
 logging.basicConfig(
     level=logging.INFO,
@@ -170,6 +173,48 @@ def asset_path(path: str) -> str:
     return f"static/v/{ASSET_VERSION}/{path}"
 
 
+# CMX-178/CMX-215: the page's one module script, the Vite build's entry: the whole page
+# (CMX-248: one React root and the modules it imports). The manifest names it, because its file
+# name is a content hash. Read once, like ASSET_VERSION: a build only lands with a deploy.
+_APP_MANIFEST = _STATIC_DIR / "app" / "manifest.json"
+
+
+def app_entry(manifest: Path = _APP_MANIFEST) -> str | None:
+    """The built entry's path under ``static/`` (``app/assets/main-<hash>.js``), or None when
+    the manifest cannot be read or names no entry. There is no unbundled fallback, so the
+    page then loads with no JS at all: logged as an error, never silently."""
+    try:
+        file = json.loads(manifest.read_text())["src/main.tsx"]["file"]
+    except (OSError, ValueError, LookupError, TypeError) as e:
+        log.error("dashboard has no JS: %s unreadable (%s)", manifest, e)
+        return None
+    if not isinstance(file, str) or not file:
+        log.error("dashboard has no JS: %s names no entry file", manifest)
+        return None
+    return f"app/{file}"
+
+
+APP_ENTRY = app_entry()
+
+
+def app_css(manifest: Path = _APP_MANIFEST) -> str | None:
+    """CMX-248: the entry's stylesheet (style.css, imported by ``src/main.tsx``) as the build
+    emitted it, ``app/assets/main-<hash>.css``; None, logged as an error, when the manifest
+    names none. The page links it in its ``<head>``, so it never paints unstyled."""
+    try:
+        css = json.loads(manifest.read_text())["src/main.tsx"]["css"]
+    except (OSError, ValueError, LookupError, TypeError) as e:
+        log.error("dashboard has no stylesheet: %s unreadable (%s)", manifest, e)
+        return None
+    if not isinstance(css, list) or len(css) != 1 or not isinstance(css[0], str) or not css[0]:
+        log.error("dashboard has no stylesheet: %s names %r, not one file", manifest, css)
+        return None
+    return f"app/{css[0]}"
+
+
+APP_CSS = app_css()
+
+
 @app.route("/static/v/<ver>/<path:filename>")
 def static_versioned(ver, filename):
     resp = send_from_directory(app.static_folder, filename)
@@ -199,8 +244,12 @@ def index():
         "index.html",
         terminals_enabled=config.TERMINALS_ENABLED,
         wall_tile_dispatched=config.WALL_TILE_DISPATCHED,
-        asset_version=ASSET_VERSION,
         asset_path=asset_path,
+        # CMX-217: the page's boot config, one JSON block (frontend/src/shared/api readBoot).
+        boot={"assetVersion": ASSET_VERSION, "terminalsEnabled": config.TERMINALS_ENABLED,
+              "wallTileDispatched": config.WALL_TILE_DISPATCHED},
+        app_src=asset_path(APP_ENTRY) if APP_ENTRY else None,
+        app_css=asset_path(APP_CSS) if APP_CSS else None,
     ))
     # The HTML names the versioned assets, so it must be revalidated on every load.
     resp.headers["Cache-Control"] = "no-cache"
@@ -299,6 +348,33 @@ def _is_home(cwd: str) -> bool:
         return os.path.realpath(cwd) == os.path.realpath(os.path.expanduser("~"))
     except (OSError, ValueError):
         return False
+
+
+def _pane_path(window_id: str) -> str | None:
+    """tmux's ``#{pane_current_path}`` for a window, or None.
+
+    Inside a :func:`chela.probecache.batch` (``/api/agents``) it is read off the shared pane
+    snapshot, so it costs no spawn (CMX-17).
+    """
+    batch = probecache.active()
+    if batch is not None:
+        pane = batch.pane(window_id)
+        return (pane.path or None) if pane is not None else None
+    return discovery.get_window_cwd_by_id(window_id)
+
+
+def _tilde(path: str | None) -> str | None:
+    """``path`` with the home directory written ``~`` (``~``, ``~/src``); others unchanged."""
+    if not path:
+        return None
+    home = os.path.expanduser("~").rstrip("/")
+    if not home:
+        return path
+    if path.rstrip("/") == home:
+        return "~"
+    if path.startswith(home + "/"):
+        return "~" + path[len(home):]
+    return path
 
 
 def _needs_human(wid: str, sess_status: str | None, dispatched: bool) -> bool:
@@ -432,6 +508,9 @@ def api_agents():
             "share_epoch": _share_epoch(window_id),
             "window_type": win_type,
             "claude_running": claude_running,
+            # CMX-241: a plain shell's header reads `Shell · <cwd>` until Claude starts in it.
+            # The session's cwd (below) needs a Claude session, so a shell's comes from tmux.
+            "shell_cwd": None if claude_running else _tilde(_pane_path(window_id)),
             "thinking": sess_status == "busy",
             "session_status": sess_status,
             # "sandbox-proxy" when that status came from a sandboxed session's proxy.
@@ -457,6 +536,8 @@ def api_agents():
             # The live session's own name — after a move to a background session, the
             # name peers must address (ListAgents/SendMessage), not the window's.
             "session_name": entry["name"] if entry else None,
+            # CMX-278: the session this window runs now, so Recent sessions never lists it
+            "session_id": entry.get("session_id") if entry else None,
             "session_moved": bool(entry and entry["moved"]),
             "has_schedules": name in scheduled_agents,
             "schedule_last_run": agent_schedule_summary.get(name, {}).get("last_run"),
@@ -641,8 +722,9 @@ _TERM_PASTE_SHIM = (
 # so no ^V reaches the shell, reads the clipboard, and routes it through
 # /api/term/paste (bracketed paste at the tmux layer). It also handles an image
 # on the clipboard — via /api/term/paste-image, like the paste-event shim — so
-# Ctrl+V never regresses image paste. Ctrl+Shift+V / right-click are left to the
-# native path. wid comes from the iframe path (/term/<wid>/), as above.
+# Ctrl+V never regresses image paste. Ctrl+Shift+V is left to the native path;
+# right-click pastes through this shim too (see _TERM_CONTEXTMENU_SHIM). wid comes
+# from the iframe path (/term/<wid>/), as above.
 _TERM_PASTE_KEY_SHIM = (
     "<script>(function(){"
     "var m=location.pathname.match(/\\/term\\/([^\\/]+)/);"
@@ -658,11 +740,7 @@ _TERM_PASTE_KEY_SHIM = (
     "var r=await fetch('/api/term/paste-image',{method:'POST',body:fd,"
     "credentials:'same-origin'});"
     "if(!r.ok)return;var j=await r.json();if(j&&j.path)await pasteText(j.path);}"
-    "async function onKey(e){"
-    "if(!(e.ctrlKey||e.metaKey)||e.shiftKey||e.altKey)return;"
-    "if(e.key!=='v'&&e.key!=='V')return;"
-    "if(!navigator.clipboard)return;"
-    "e.preventDefault();e.stopImmediatePropagation();"
+    "async function pasteClipboard(){"
     "try{"
     "if(navigator.clipboard.read){"
     "var items=await navigator.clipboard.read();"
@@ -675,7 +753,91 @@ _TERM_PASTE_KEY_SHIM = (
     "}else if(navigator.clipboard.readText){"
     "await pasteText(await navigator.clipboard.readText());}"
     "}catch(err){console.error('paste-key',err);}}"
+    # CMX-201: the right-click shim pastes through this same function.
+    "window.__chelaPasteClipboard=function(){"
+    "return navigator.clipboard?pasteClipboard():Promise.resolve();};"
+    "function onKey(e){"
+    "if(!(e.ctrlKey||e.metaKey)||e.shiftKey||e.altKey)return;"
+    "if(e.key!=='v'&&e.key!=='V')return;"
+    "if(!navigator.clipboard)return;"
+    "e.preventDefault();e.stopImmediatePropagation();"
+    "window.__chelaPasteClipboard();}"
     "document.addEventListener('keydown',onKey,true);"
+    "})();</script>"
+)
+
+# Right-click paste shim injected into ttyd's HTML (see term_http), CMX-201.
+# Windows-Terminal style: select = copy (Claude Code's copy-on-select), right-click
+# = paste. The browser's native context menu (Emoji / Paste / Inspect …) is
+# suppressed and the clipboard goes through the Ctrl/Cmd+V shim's own paste path
+# (window.__chelaPasteClipboard: bracketed paste, an image → /api/term/paste-image),
+# never the browser's Paste. Only `contextmenu` is touched — the mousedown/mouseup
+# events xterm.js forwards to tmux / the app (and that selection relies on) are not
+# swallowed, and neither is propagation. Fine pointers only: on a phone a long-press
+# also fires contextmenu, and it must keep doing what it does today.
+_TERM_CONTEXTMENU_SHIM = (
+    "<script>(function(){"
+    "if(!window.matchMedia||!matchMedia('(pointer: fine)').matches)return;"
+    "document.addEventListener('contextmenu',function(e){"
+    "e.preventDefault();"
+    "var p=window.__chelaPasteClipboard;if(typeof p==='function')p();},true);"
+    "})();</script>"
+)
+
+# OSC 52 clipboard shim injected into ttyd's HTML (see term_http), CMX-206.
+# Claude Code's copy-on-select and tmux copy-mode copy by emitting OSC 52
+# (`ESC ] 52 ; <targets> ; <base64> BEL`); tmux (`set-clipboard on`) forwards it to
+# this client, but xterm.js ignores OSC 52 unless a handler is registered — so the
+# selection never reached the PC clipboard and CMX-201's right-click pasted stale
+# text. This registers that handler on ttyd's `window.term` (polled: the theme
+# shim's setter hook may run first, and ttyd assigns the Terminal late) and writes
+# the decoded text with navigator.clipboard.writeText (the iframe is
+# `allow="clipboard-write"`).
+#   * WRITE ONLY. A `?` payload is a READ query; answering it would let any program
+#     in the pane read the operator's clipboard, so it is swallowed unanswered
+#     (`?` is not base64, so the payload check below rejects it).
+#   * Ignored, never written: unknown target letters, malformed base64, invalid
+#     UTF-8, an empty payload (a "clear"), anything over 1 MiB decoded (checked on
+#     the encoded length first, so a huge payload is never decoded).
+#   * A refused writeText (pane not focused, permission denied) fails VISIBLY: a
+#     short toast in the pane, never a silent no-op.
+_TERM_OSC52_SHIM = (
+    "<script>(function(){"
+    "var MAX=1048576;"
+    "function toast(msg){"
+    "try{var d=document.createElement('div');d.className='chela-osc52-toast';"
+    "d.setAttribute('role','status');d.textContent=msg;"
+    "d.style.cssText='position:fixed;right:8px;bottom:8px;z-index:2147483647;"
+    "padding:6px 10px;border-radius:6px;font:12px system-ui,sans-serif;"
+    "background:#b42318;color:#fff;box-shadow:0 2px 8px rgba(0,0,0,.4);"
+    "pointer-events:none';"
+    "document.body.appendChild(d);setTimeout(function(){d.remove();},3000);"
+    "}catch(e){}}"
+    "function decode(data){"
+    "var i=data.indexOf(';');if(i<0)return null;"
+    "var pc=data.slice(0,i),pd=data.slice(i+1);"
+    "if(!/^[cpqs0-7]*$/.test(pc))return null;"
+    "if(pd.length>Math.ceil(MAX/3)*4)return null;"
+    "if(pd.length%4||!/^[A-Za-z0-9+\\/]+={0,2}$/.test(pd))return null;"
+    "try{var b=atob(pd),u=new Uint8Array(b.length);"
+    "if(u.length>MAX)return null;"
+    "for(var k=0;k<b.length;k++)u[k]=b.charCodeAt(k);"
+    "return new TextDecoder('utf-8',{fatal:true}).decode(u);}catch(e){return null;}}"
+    "function onOsc52(data){"
+    "var text=decode(String(data));"
+    "if(text===null)return true;"
+    "var c=navigator.clipboard;"
+    "var p=(c&&c.writeText)?Promise.resolve().then(function(){return c.writeText(text);})"
+    ":Promise.reject(new Error('no clipboard API'));"
+    "p.catch(function(err){console.warn('osc52',err);"
+    "toast('Copy did not reach the clipboard \\u2014 the browser refused it.'+"
+    "' Click into the pane and select again.');});"
+    "return true;}"
+    "window.__chelaOsc52=onOsc52;"
+    "function hook(){var t=window.term;"
+    "if(!t||t.__chelaOsc52||!t.parser||!t.parser.registerOscHandler)return;"
+    "t.__chelaOsc52=true;t.parser.registerOscHandler(52,onOsc52);}"
+    "hook();setInterval(hook,500);"
     "})();</script>"
 )
 
@@ -769,53 +931,27 @@ _TERM_SCROLL_SHIM = (
 # static/fonts/README.md for per-font licenses (all OFL-1.1 except Miriam Mono
 # CLM, GPL-2 — the only free MONOSPACE Hebrew font, hence its inclusion).
 #
-# Manifest: (family, filename, variable?, weight-if-static). Variable fonts get a
-# 100–900 weight range in one face; static fonts get one @font-face per weight.
-_TERM_FONTS = [
-    # Icons — font-display:block avoids a box-flash before the icon font loads.
-    ("Symbols Nerd Font", "SymbolsNerdFontMono-Regular.ttf", None, None),
-    # Coverage-only fallback (not in the picker — see _TERM_FONT_PREF_SHIM's
-    # `fam` chain): CMX-159. Same Symbola subset CMX-156 bundled for the
-    # /screenshot PNG renderer (U+2300-23FF, U+2600-27BF) — the TUI glyphs
-    # (`⏺` `❌` `✅` `✦` `✷` `✨` `⚙`) that neither JetBrains Mono nor Symbols
-    # Nerd Font contain, and that CMX-155's atlas fix couldn't help because a
-    # texture-atlas rebuild can't rasterize a glyph no stacked font contains.
-    ("Symbola Fallback", "Symbola-Subset.ttf", None, None),
-    # English / Latin monospace (picker: English face)
-    ("JetBrains Mono",  "JetBrainsMono.ttf",       True,  None),
-    ("Fira Code",       "FiraCode.ttf",            True,  None),
-    ("IBM Plex Mono",   "IBMPlexMono-Regular.ttf", False, "normal"),
-    ("IBM Plex Mono",   "IBMPlexMono-Bold.ttf",    False, "bold"),
-    ("Source Code Pro", "SourceCodePro.ttf",       True,  None),
-    ("Cascadia Code",   "CascadiaCode.ttf",        True,  None),
-    # Hebrew (picker: Hebrew face). Miriam is the only monospace one.
-    ("Miriam Mono CLM", "MiriamMonoCLM-Book.ttf",  False, "normal"),
-    ("Miriam Mono CLM", "MiriamMonoCLM-Bold.ttf",  False, "bold"),
-    ("Noto Sans Hebrew", "NotoSansHebrew.ttf",     True,  None),
-    ("Heebo",           "Heebo.ttf",               True,  None),
-    ("Assistant",       "Assistant.ttf",           True,  None),
-    ("Rubik",           "Rubik.ttf",               True,  None),
-    ("Frank Ruhl Libre", "FrankRuhlLibre.ttf",     True,  None),
-    ("David Libre",     "DavidLibre-Regular.ttf",  False, "normal"),
-    ("David Libre",     "DavidLibre-Bold.ttf",     False, "bold"),
-]
-
-
-def _term_font_face(family, filename, variable, weight):
-    if variable is None:  # Symbols icon font — block to avoid glyph-box flash
-        disp = "font-display:block"
-        wgt = ""
-    else:
-        disp = "font-display:swap"
-        wgt = "font-weight:100 900;" if variable else "font-weight:%s;" % weight
-    return ("@font-face{font-family:'%s';%s"
-            "src:url('/static/fonts/%s') format('truetype');%s}"
-            % (family, wgt, filename, disp))
-
+# CMX-322: the manifest, the woff2 files, their content-hashed URLs and the
+# icon blocks' unicode-ranges live in term_fonts.py.
+_TERM_FONTS = term_fonts.TERM_FONTS
 
 _TERM_FONT_CSS = (
-    "<style>" + "".join(_term_font_face(*f) for f in _TERM_FONTS) + "</style>"
+    "<style>" + "".join(term_fonts.font_face_css(f) for f in _TERM_FONTS) + "</style>"
 )
+
+
+@app.route("/static/fonts/v/<digest>/<path:filename>")
+def static_font(digest, filename):
+    """A terminal font at its content-hashed URL (term_fonts.font_url). The URL names
+    these exact bytes, so it is cached for good: a pane never revalidates a font."""
+    resp = send_from_directory(term_fonts.FONTS_DIR, filename)
+    if digest == term_fonts.FONT_DIGESTS.get(filename):
+        resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    else:
+        # An older page asking for a font that has since changed: these are the
+        # CURRENT bytes, which must not be cached under the old URL.
+        resp.headers["Cache-Control"] = "no-cache"
+    return resp
 
 _TERM_SCROLLBAR_CSS = (
     "<style>"
@@ -936,6 +1072,36 @@ def _term_theme_shim() -> str:
 # fixed, later ticks are a cheap no-op; it also re-applies (and re-arms the
 # walk) on tab refocus and on storage changes, and covers `window.term` not
 # existing yet at first tick.
+# CMX-322 (pane-open latency): apply() waits only for the chosen Latin and Hebrew
+# faces, never the icon faces (Symbols Nerd Font, Symbola Fallback). Those are
+# unicode-range blocks a browser downloads once a glyph of theirs is on screen,
+# so one may land after the walk: its `loadingdone` re-arms the walk, which is
+# what keeps an icon rasterised from the fallback from staying tofu. The text
+# faces start downloading when the shim runs (in <head>, alongside ttyd's own
+# script), and the first apply runs on the first frame `window.term` exists, not
+# on the first 500 ms tick.
+#
+# CMX-321 — the pane must not visibly change font or size while it loads. ttyd
+# opens xterm at its own built-in defaults (13px Consolas) and paints; the
+# SET_PREFERENCES frame then re-fonts it to the server's client-options; then this
+# shim applies the viewer's prefs and walks the atlas through a decoy size. Each
+# step reflowed in view. Two changes:
+#   * hidden until settled: `_TERM_BOOT_CSS` keeps `.xterm` at opacity 0 (not
+#     display:none — fit() must still measure, and the helper textarea must stay
+#     focusable) while <html> carries `chela-term-booting`, which this shim adds at
+#     head time and removes one frame after the first apply's final fit (so xterm
+#     has rendered the final rows while still hidden). The decoy walk therefore
+#     runs unseen. A fallback reveals the pane TERM_BOOT_FALLBACK_MS after
+#     window.term appears, so a font that never loads cannot leave it blank;
+#   * at the source: ttyd merges `location.search` into SET_PREFERENCES LAST
+#     (its parseOptsFromUrlQuery), so the shim pins the viewer's fontSize/
+#     fontFamily into the URL (history.replaceState, before ttyd's body script
+#     runs). The server default never lands, on load or on a WS reconnect.
+# The CHELA_GRID_FONT presenter size is not pinned (it is known only later).
+TERM_BOOT_FALLBACK_MS = 1500
+
+_TERM_BOOT_CSS = "<style>html.chela-term-booting .xterm{opacity:0!important}</style>"
+
 _TERM_FONT_PREF_SHIM = (
     "<script>(function(){"
     "var LAT={jetbrains:'JetBrains Mono',firacode:'Fira Code',"
@@ -943,14 +1109,34 @@ _TERM_FONT_PREF_SHIM = (
     "var HEB={miriam:'Miriam Mono CLM',noto:'Noto Sans Hebrew',heebo:'Heebo',"
     "assistant:'Assistant',rubik:'Rubik',frankruhl:'Frank Ruhl Libre',"
     "david:'David Libre'};"
-    "var atlasFixed=false;"
+    "var atlasFixed=false,seen=false,shown=false;"
+    "var root=document.documentElement;"
+    "try{root.classList.add('chela-term-booting');}catch(e){}"
+    "function reveal(){if(shown)return;shown=true;"
+    "try{root.classList.remove('chela-term-booting');}catch(e){}}"
     "function raf(){return new Promise(function(res){"
     "if(window.requestAnimationFrame)requestAnimationFrame(res);else setTimeout(res,16);});}"
-    "function apply(){var t=window.term;if(!t)return;"
-    "var lat=LAT[localStorage.getItem('chela_term_latin')]||LAT.jetbrains;"
-    "var heb=HEB[localStorage.getItem('chela_term_font')]||HEB.miriam;"
-    "var s=window.__CHELA_GRID_FONT__||(parseInt(localStorage.getItem('chela_term_fontsize'),10)||14);"
+    "function pick(){return{lat:LAT[localStorage.getItem('chela_term_latin')]||LAT.jetbrains,"
+    "heb:HEB[localStorage.getItem('chela_term_font')]||HEB.miriam};}"
+    "function prefSize(){return parseInt(localStorage.getItem('chela_term_fontsize'),10)||14;}"
+    "function famOf(lat,heb){"
     "var fam=\"'\"+lat+\"','Symbols Nerd Font','Symbola Fallback','\"+heb+\"',monospace\";"
+    "return fam;}"
+    "function want(p,s){return[s+\"px '\"+p.lat+\"'\",\"bold \"+s+\"px '\"+p.lat+\"'\","
+    "s+\"px '\"+p.heb+\"'\",\"bold \"+s+\"px '\"+p.heb+\"'\"];}"
+    "function load(L){return(document.fonts&&document.fonts.load)?"
+    "Promise.all(L.map(function(f){return document.fonts.load(f).catch(function(){});}))"
+    ":Promise.resolve();}"
+    "function pin(ps,fam){try{var q=new URLSearchParams(location.search);"
+    "if(q.get('fontSize')===String(ps)&&q.get('fontFamily')===fam)return;"
+    "q.set('fontSize',String(ps));q.set('fontFamily',fam);"
+    "history.replaceState(history.state,'',location.pathname+'?'+q.toString()+location.hash);"
+    "}catch(e){}}"
+    "function apply(){var t=window.term;if(!t)return;"
+    "if(!seen){seen=true;setTimeout(reveal," + str(TERM_BOOT_FALLBACK_MS) + ");}"
+    "var p=pick(),lat=p.lat,heb=p.heb,ps=prefSize();"
+    "var s=window.__CHELA_GRID_FONT__||ps;"
+    "var fam=famOf(lat,heb);pin(ps,fam);"
     "function getSize(){return t.options?t.options.fontSize:"
     "(t.getOption?t.getOption('fontSize'):undefined);}"
     "function getFam(){return t.options?t.options.fontFamily:"
@@ -960,13 +1146,7 @@ _TERM_FONT_PREF_SHIM = (
     "function setFam(f){if(t.options)t.options.fontFamily=f;"
     "else if(t.setOption)t.setOption('fontFamily',f);}"
     "if(atlasFixed&&getSize()===s&&getFam()===fam)return;"
-    "var L=[s+\"px '\"+lat+\"'\",\"bold \"+s+\"px '\"+lat+\"'\",s+\"px '\"+heb+\"'\","
-    "\"bold \"+s+\"px '\"+heb+\"'\",s+\"px 'Symbols Nerd Font'\","
-    "s+\"px 'Symbola Fallback'\"];"
-    "var P=(document.fonts&&document.fonts.load)?"
-    "Promise.all(L.map(function(f){return document.fonts.load(f).catch(function(){});}))"
-    ":Promise.resolve();"
-    "P.then(function(){"
+    "load(want(p,s)).then(function(){"
     "try{setFam(fam);setSize(s);"
     "if(t.fit&&!window.__CHELA_GRID_FONT__)t.fit();"
     "if(t.refresh&&t.rows)t.refresh(0,t.rows-1);"
@@ -977,7 +1157,7 @@ _TERM_FONT_PREF_SHIM = (
     "var decoy=s>1?s-1:s+1;"
     "setSize(decoy);"
     "if(t.refresh&&t.rows)t.refresh(0,t.rows-1);"
-    "raf().then(raf).then(function(){"
+    "return raf().then(raf).then(function(){"
     "try{setSize(s);"
     "if(t.refresh&&t.rows)t.refresh(0,t.rows-1);"
     "if(t.fit&&!window.__CHELA_GRID_FONT__)t.fit();"
@@ -985,8 +1165,17 @@ _TERM_FONT_PREF_SHIM = (
     "atlasFixed=true;"
     "});"
     "}catch(e){atlasFixed=true;}"
-    "});}"
+    "}).catch(function(){}).then(raf).then(reveal);}"
     "window.chelaApplyTermPrefs=apply;"
+    "try{var p0=pick(),ps0=prefSize();pin(ps0,famOf(p0.lat,p0.heb));load(want(p0,ps0));}catch(e){}"
+    "var t0=Date.now();"
+    "(function first(){if(window.term)apply();"
+    "else if(Date.now()-t0<10000)raf().then(first);})();"
+    "var ICON={'Symbols Nerd Font':1,'Symbola Fallback':1};"
+    "if(document.fonts&&document.fonts.addEventListener)"
+    "document.fonts.addEventListener('loadingdone',function(e){"
+    "var f=(e&&e.fontfaces)||[];for(var i=0;i<f.length;i++){"
+    "if(ICON[String(f[i].family).replace(/[\"']/g,'')]){atlasFixed=false;apply();return;}}});"
     "var n=0,iv=setInterval(function(){apply();if(++n>60)clearInterval(iv);},500);"
     "document.addEventListener('visibilitychange',function(){"
     "if(!document.hidden){atlasFixed=false;apply();}});"
@@ -1009,6 +1198,12 @@ _TERM_FONT_PREF_SHIM = (
 # postMessage to the parent, and draws the peers the parent sends back. So only the
 # non-secret {shared, wid} is injected here (the old relay/prefix/grid injection is
 # gone — the parent derives all of that from the owner-only /share-info).
+def _term_reconnect_shim() -> str:
+    """CMX-167: the self-reconnect shim (static/term-reconnect.js). A plain synchronous tag,
+    injected FIRST, so it wraps ``window.WebSocket`` before ttyd's body script opens its socket."""
+    return '<script src="/' + asset_path("term-reconnect.js") + '"></script>'
+
+
 def _term_upload_shim() -> str:
     """CMX-412: the file drop/paste shim, with the Settings switch read at serve time (the
     route re-checks it per upload, so a pane opened before a switch-off is still refused)."""
@@ -1027,6 +1222,89 @@ def _term_presence_shim(wid: str) -> str:
     })
     return ("<script>window.__CHELA_COLLAB__=" + cfg + ";</script>"
             '<script type="module" src="/' + asset_path("collab/presence-shim.js") + '"></script>')
+
+
+# CMX-322: ttyd ships its whole client (xterm.js + its app, ~720 kB) INLINE in its
+# HTML page, and term_http fetched that page uncompressed (urllib sends no
+# Accept-Encoding) and served it no-cache, so every pane open re-downloaded it.
+# term_http now lifts that script out to /term-bundle/<digest>.js, a URL named by
+# the script's bytes and served gzipped and immutable: the page shrinks to a few
+# kB and the bundle is downloaded once per ttyd build. An external classic script
+# with no async/defer, at the same spot, runs exactly where the inline one did.
+_TTYD_BUNDLE_MIN_BYTES = 64 * 1024   # only ttyd's client is this big; our shims are not
+_TTYD_BUNDLE_KEEP = 4                # ttyd builds remembered (one per upgrade in flight)
+_TTYD_BUNDLES: dict[str, tuple[bytes, bytes]] = {}   # digest -> (js, gzipped js)
+_TTYD_BUNDLES_LOCK = threading.Lock()
+_INLINE_SCRIPT_RE = re.compile(r"<script\b([^>]*)>(.*?)</script>", re.S | re.I)
+# Only a plain classic script is lifted: an external copy of a module, a nonce'd, a
+# deferred or a data (`type="application/json"`) script would not behave the same.
+_CLASSIC_SCRIPT_ATTRS_RE = re.compile(r"\s*(?:type\s*=\s*([\"']?)text/javascript\1\s*)?", re.I)
+
+
+def _gzip(data: bytes) -> bytes:
+    return gzip.compress(data, compresslevel=6, mtime=0)
+
+
+def _accepts_gzip() -> bool:
+    """The request accepts gzip with a nonzero quality (``gzip;q=0`` is a refusal)."""
+    return request.accept_encodings["gzip"] > 0
+
+
+def _externalize_ttyd_bundle(html: str) -> str:
+    """Replace every inline script of at least _TTYD_BUNDLE_MIN_BYTES with a
+    ``<script src="/term-bundle/<digest>.js">``, remembering its bytes for
+    :func:`term_bundle`. Smaller inline scripts are left where they are."""
+    def lift(m: re.Match) -> str:
+        js = m.group(2).encode("utf-8")
+        if len(js) < _TTYD_BUNDLE_MIN_BYTES or not _CLASSIC_SCRIPT_ATTRS_RE.fullmatch(m.group(1)):
+            return m.group(0)
+        digest = hashlib.sha256(js).hexdigest()[:16]
+        with _TTYD_BUNDLES_LOCK:
+            if digest not in _TTYD_BUNDLES:
+                while len(_TTYD_BUNDLES) >= _TTYD_BUNDLE_KEEP:
+                    _TTYD_BUNDLES.pop(next(iter(_TTYD_BUNDLES)))
+                _TTYD_BUNDLES[digest] = (js, _gzip(js))
+        return f'<script src="/term-bundle/{digest}.js"></script>'
+    return _INLINE_SCRIPT_RE.sub(lift, html)
+
+
+def _ttyd_bundle(digest: str) -> tuple[bytes, bytes] | None:
+    with _TTYD_BUNDLES_LOCK:
+        entry = _TTYD_BUNDLES.get(digest)
+    if entry is not None:
+        return entry
+    for wid, port in _terminals_port_map().items():
+        try:
+            page = urllib.request.urlopen(  # noqa: S310 - loopback only
+                f"http://127.0.0.1:{port}/term/{wid}/", timeout=5).read()
+        except Exception:
+            continue    # a dead ttyd: try the next one
+        _externalize_ttyd_bundle(page.decode("utf-8", "replace"))
+        with _TTYD_BUNDLES_LOCK:
+            entry = _TTYD_BUNDLES.get(digest)
+        if entry is not None:
+            return entry
+    return None
+
+
+@app.route("/term-bundle/<digest>.js")
+@require_auth
+def term_bundle(digest):
+    """ttyd's client script, lifted out of its page by _externalize_ttyd_bundle. The
+    URL names these bytes, so it is immutable. A digest this process has not seen (the
+    dashboard restarted between a page and its script) is looked for in the live ttyds'
+    pages; one none of them serves is a 404."""
+    _require_terminals()
+    entry = _ttyd_bundle(digest)
+    if entry is None:
+        abort(404)
+    js, gz = entry
+    resp = Response(gz if _accepts_gzip() else js, mimetype="text/javascript")
+    if _accepts_gzip():
+        resp.headers["Content-Encoding"] = "gzip"
+    resp.headers["Vary"] = "Accept-Encoding"
+    resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    return resp
 
 
 @app.route("/term/<wid>/", defaults={"rest": ""}, methods=["GET", "POST"])
@@ -1066,15 +1344,22 @@ def term_http(wid, rest):
     # is in _PROXY_DROP_HEADERS, so Flask recomputes it for the modified body.
     ctype = (resp.headers.get("Content-Type") or "")
     if "text/html" in ctype.lower():
-        html = body.decode("utf-8", "replace")
-        shims = (_term_theme_shim() + _TERM_FONT_CSS + _TERM_FONT_PREF_SHIM
+        html = _externalize_ttyd_bundle(body.decode("utf-8", "replace"))
+        shims = (_term_reconnect_shim()
+                 + _term_theme_shim() + _TERM_FONT_CSS + _TERM_BOOT_CSS + _TERM_FONT_PREF_SHIM
                  + _term_presence_shim(wid)
                  + _term_upload_shim()
-                 + _TERM_PASTE_SHIM + _TERM_PASTE_KEY_SHIM + _TERM_PALETTE_KEY_SHIM
+                 + _TERM_PASTE_SHIM + _TERM_PASTE_KEY_SHIM + _TERM_CONTEXTMENU_SHIM
+                 + _TERM_OSC52_SHIM
+                 + _TERM_PALETTE_KEY_SHIM
                  + _TERM_SCROLL_SHIM + _TERM_SCROLLBAR_CSS + _TERM_TOUCH_CSS)
         html = (html.replace("</head>", shims + "</head>", 1)
                 if "</head>" in html else html + shims)
         body = html.encode("utf-8")
+        headers.append(("Vary", "Accept-Encoding"))
+        if _accepts_gzip():
+            body = _gzip(body)
+            headers.append(("Content-Encoding", "gzip"))
     return Response(body, status=status, headers=headers)
 
 
@@ -2198,7 +2483,7 @@ def api_agents_rediscover():
 # tmux reserves ':' (window index) and '.' (pane index) in target specs, so a
 # window name containing either is unaddressable. Our generated folder names
 # (agent_manager.window_name_for_cwd) never hit this, but validate defensively before shelling out.
-_WINDOW_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+_WINDOW_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+\Z")
 # Only `claude` (optionally with args) may be auto-launched into a fresh window.
 # A plain shell is the no-command default; this keeps the spawn endpoint's reach
 # intentional ("launch claude or a shell") rather than an arbitrary-exec route.
@@ -2388,7 +2673,7 @@ def _dispatcher_owned_wid_epochs() -> set[tuple[str, str | None]]:
     return owned
 
 
-def _terminal_run_claims() -> tuple[set[tuple[str, str | None]], set[str]]:
+def _terminal_run_claims(workflows: dict | None = None) -> tuple[set[tuple[str, str | None]], set[str]]:
     """What the dispatcher's FINISHED runs (:func:`chela.dispatcher.run_is_terminal` —
     merged, ``done``/``closed``, or failed past every retry) still claim, as two facts off
     the ``runs`` table: the ``(wid, epoch)`` pairs of their agent and judge windows, and
@@ -2405,7 +2690,7 @@ def _terminal_run_claims() -> tuple[set[tuple[str, str | None]], set[str]]:
     """
     wid_epochs: set[tuple[str, str | None]] = set()
     cwds: set[str] = set()
-    workflows: dict[str, object] = {}
+    workflows = {} if workflows is None else workflows
     for row in dispatcher.list_runs():
         if not dispatcher.run_is_terminal(row):
             continue
@@ -2415,16 +2700,47 @@ def _terminal_run_claims() -> tuple[set[tuple[str, str | None]], set[str]]:
             wid_epochs.add((row["judge_window_id"], row.get("judge_window_epoch")))
         if row.get("worktree_path"):
             cwds.add(os.path.normpath(row["worktree_path"]))
-        wf_path, task_id = row.get("workflow_path"), row.get("task_id")
-        if wf_path and task_id:
-            if wf_path not in workflows:
-                try:
-                    workflows[wf_path] = load_workflow(wf_path)
-                except Exception:  # noqa: BLE001 — a gone/bad workflow file only loses this join
-                    workflows[wf_path] = None
-            if workflows[wf_path] is not None:
-                cwds.add(os.path.normpath(str(judge.judge_worktree_path(workflows[wf_path], task_id))))
+        judge_cwd = _judge_cwd(row, workflows)
+        if judge_cwd:
+            cwds.add(judge_cwd)
     return wid_epochs, cwds
+
+
+def _judge_cwd(row: dict, workflows: dict) -> str | None:
+    """The judge worktree a ``runs`` row's task gets (:func:`chela.judge.judge_worktree_path`),
+    normalized; None when the row names no workflow or it cannot be loaded. ``workflows``
+    caches each workflow file across rows."""
+    wf_path, task_id = row.get("workflow_path"), row.get("task_id")
+    if not (wf_path and task_id):
+        return None
+    if wf_path not in workflows:
+        try:
+            workflows[wf_path] = load_workflow(wf_path)
+        except Exception:  # noqa: BLE001 — a gone/bad workflow file only loses this join
+            workflows[wf_path] = None
+    if workflows[wf_path] is None:
+        return None
+    return os.path.normpath(str(judge.judge_worktree_path(workflows[wf_path], task_id)))
+
+
+def _judge_cwds(runs: list[dict], workflows: dict) -> set[str]:
+    """The judge worktree of EVERY run, finished or not (CMX-278): a judge session is
+    chela's, so it is never resumable, even when a reboot left its worktree on disk and
+    renumbered its window (Liav, 10-19: ``judge-…`` got a Resume button). A fact off the
+    ``runs`` table, never a name guess. ``workflows`` is the request's workflow cache."""
+    return {c for c in (_judge_cwd(r, workflows) for r in runs) if c}
+
+
+def _live_session_ids() -> set[str]:
+    """Every Claude session running anywhere on this host RIGHT NOW (``claude agents``'s
+    feed, the cached map: this never spawns it on the request path). CMX-278: a session
+    alive anywhere is not "recent", whatever window address a dead epoch stamped it with."""
+    try:
+        sids = agent_manager.session_status_map().get("session_by_pid") or {}
+    except Exception:  # noqa: BLE001 — an unreadable feed leaves the server-side filter off
+        log.debug("restore: live session ids unavailable", exc_info=True)
+        return set()
+    return {s for s in sids.values() if isinstance(s, str) and s}
 
 
 def _dismiss_key(v: restore.Verdict, *, resumable: bool) -> str:
@@ -2474,6 +2790,10 @@ def api_restore():
     alive under a different address, which is ``chela restore --apply``'s job (a
     re-stamp), not a resume — showing it here as "resumable" would be a lie.
 
+    CMX-278: a row whose session is running anywhere now (:func:`_live_session_ids`) is
+    left out, matched by session id, never by the dead epoch's window address. A row in a
+    run's judge worktree (:func:`_judge_cwds`) is never resumable.
+
     Dispatcher-owned rows (``_dispatcher_owned_wid_epochs``) and rows whose recorded
     cwd no longer exists (``_cwd_is_live`` — a reaped worktree, a deleted branch) are
     both split into ``dispatcher_rows`` instead of ``rows``: neither can be resumed
@@ -2499,13 +2819,16 @@ def api_restore():
     _require_terminals()
     owned = _dispatcher_owned_wid_epochs()
     runs = dispatcher.list_runs()
-    terminal_wid_epochs, terminal_cwds = _terminal_run_claims()
+    workflows: dict[str, object] = {}   # each WORKFLOW.md parsed once per request
+    terminal_wid_epochs, terminal_cwds = _terminal_run_claims(workflows)
     # CMX-75: a session the sidebar archived (closed) is offered by its Archived section's
     # Unarchive, never a second time here.
     dismissed = dismissed_sessions.ids() | sidebar_archive.archived_session_ids()
+    live = _live_session_ids()
+    judge_cwds = _judge_cwds(runs, workflows)
     candidates = [v for v in _restore_verdicts()
                   if v.verdict == "MANUAL" and v.manual_command()
-                  and v.session_id not in dismissed]
+                  and v.session_id not in dismissed and v.session_id not in live]
     rows, dispatcher_rows = [], []
     for v in candidates:
         cwd_live = _cwd_is_live(v.cwd)
@@ -2514,11 +2837,18 @@ def api_restore():
             continue
         # CMX-125: a worktree its run still owns gets that run's ONE window, never a 2nd.
         resumable = ((v.wid, v.stamped_epoch) not in owned and cwd_live
-                     and restore.live_worktree_owner(v.cwd, runs) is None)
+                     and restore.live_worktree_owner(v.cwd, runs) is None
+                     and os.path.normpath(v.cwd) not in judge_cwds)
         if _dismiss_key(v, resumable=resumable) in dismissed:
             continue
-        (rows if resumable else dispatcher_rows).append(_shape_restore_row(v, resumable=resumable))
-    return jsonify({"rows": rows, "dispatcher_rows": dispatcher_rows, "hidden": len(dispatcher_rows)})
+        shaped = _shape_restore_row(v, resumable=resumable)
+        relaunch = None if resumable else restore.relaunching_run(v.cwd, runs)
+        if relaunch:
+            # CMX-156: shown read-only, outside the toggle, as "dispatcher will relaunch".
+            shaped["relaunch"] = relaunch
+        (rows if resumable else dispatcher_rows).append(shaped)
+    return jsonify({"rows": rows, "dispatcher_rows": dispatcher_rows,
+                    "hidden": sum(1 for r in dispatcher_rows if "relaunch" not in r)})
 
 
 def _session_ids_from_body() -> list[str] | None:
@@ -2607,7 +2937,13 @@ def api_restore_resume():
                         "error": "this session's working directory no longer exists — "
                                  "nowhere to resume it into"}), 409
 
-    owner = restore.live_worktree_owner(verdict.cwd, dispatcher.list_runs())
+    runs = dispatcher.list_runs()
+    relaunch = restore.relaunching_run(verdict.cwd, runs)
+    if relaunch:
+        return jsonify({"ok": False,
+                        "error": f"the dispatcher will relaunch run {relaunch} itself in this "
+                                 "worktree — resuming here would be two agents on one task"}), 409
+    owner = restore.live_worktree_owner(verdict.cwd, runs)
     if owner:
         return jsonify({"ok": False,
                         "error": f"run {owner} is still in flight in this worktree and has "
@@ -2920,6 +3256,18 @@ def api_config():
                     return jsonify({"error": "invalid file_drop",
                                     "valid": [True, False]}), 400
                 userconfig.set_(config.FILE_DROP_KEY, enabled)
+        if "telegram_delete_on_close" in data:
+            # CMX-204: read by the Telegram bridge on its next reap. Strict bool, as above.
+            try:
+                enabled = config.cast_strict_bool(data.get("telegram_delete_on_close"))
+            except ValueError:
+                return jsonify({"error": "invalid telegram_delete_on_close",
+                                "valid": [True, False]}), 400
+            userconfig.set_(tg_topics.DELETE_ON_CLOSE_KEY, enabled or None)
+        if data.get("telegram_cleanup") is True:
+            # The bridge holds the bot token and is the ledger's only writer, so the
+            # dashboard just asks: the bridge deletes the archived topics on its next tick.
+            userconfig.set_(tg_topics.CLEANUP_KEY, time.time())
     stored_mode = dispatcher.settings_permission_mode()
     stored_model = dispatcher.settings_agent_model()
     remote_control, rc_source = config.remote_control_setting()
@@ -2960,6 +3308,10 @@ def api_config():
         "file_drop_env_locked": fd_source == "env",
         "file_drop_env": config.FILE_DROP_ENV,
         "upload_max_mb": config.upload_max_bytes() // (1024 * 1024),
+        # CMX-204: Telegram topics. Archived = remembered closed topics the cleanup deletes.
+        "telegram_delete_on_close": userconfig.get(tg_topics.DELETE_ON_CLOSE_KEY) is True,
+        "telegram_archived_topics": len(tg_topics.TopicLedger().closed_threads()),
+        "telegram_cleanup_pending": bool(userconfig.get(tg_topics.CLEANUP_KEY)),
     })
 
 
@@ -3039,6 +3391,63 @@ def api_config_dispatch():
         for key, value in parsed.items():
             config.apply_dispatch(key, value)
     return jsonify({"knobs": config.dispatch_snapshot()})
+
+
+def _concurrency_available_bytes() -> tuple[int | None, str]:
+    """Free memory for the Settings concurrency rows: the memory-slice line's headroom
+    when a slice bound is in force (``memcap.live_bound``), else the box's MemAvailable."""
+    from chela import memcap
+    bound = memcap.live_bound()
+    if bound and bound.get("current_bytes") is not None:
+        return max(0, bound["max_bytes"] - bound["current_bytes"]), bound["unit"]
+    mem = resources._sample_mem()
+    if mem.get("total") is None:
+        return None, "unknown"
+    return mem["total"] - mem["used"], "MemAvailable"
+
+
+def _concurrency_snapshot() -> dict:
+    rows = []
+    for p in _discover_dispatch_workflows(dispatcher.list_runs()):
+        try:
+            file_value = load_workflow(p).get("concurrency", "max", default=1) or 1
+        except Exception:
+            file_value = None
+        override = concurrency.agent_override(p)
+        rows.append({"path": str(p), "name": p.parent.name, "file_value": file_value,
+                     "override": override,
+                     "effective": override if override is not None else file_value})
+    value, source = concurrency.judges_at_once()
+    available, available_source = _concurrency_available_bytes()
+    return {"min": concurrency.MIN, "max": concurrency.MAX, "workflows": rows,
+            "judges": {"effective": value, "source": source},
+            "judge_peak_bytes": concurrency.JUDGE_PEAK_BYTES,
+            "available_bytes": available, "available_source": available_source}
+
+
+@app.route("/api/config/concurrency", methods=["GET", "POST"])
+@require_auth
+def api_config_concurrency():
+    """Settings > "Agents at once" (per workflow) and "Judges at once" (CMX-164).
+
+    POST ``{"workflow": <path>, "value": n}`` or ``{"judges": n}``; an empty value clears
+    back to WORKFLOW.md / the env var. Validated HERE (integer 1 to 8, and a workflow
+    the dispatcher actually knows), not just in the UI. Read by the dispatcher per tick,
+    and every change lands in the event log (who, old -> new).
+    """
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        if "judges" in data:
+            err = concurrency.set_judges(data["judges"], _granted_by())
+        else:
+            known = {str(p.resolve()) for p in _discover_dispatch_workflows(dispatcher.list_runs())}
+            wf = data.get("workflow")
+            if not isinstance(wf, str) or str(Path(wf).resolve()) not in known:
+                return jsonify({"error": "unknown workflow"}), 400
+            err = concurrency.set_agents(wf, data.get("value"), _granted_by())
+        if err:
+            return jsonify({"error": err}), 400
+    return jsonify(_concurrency_snapshot())
 
 
 def _notify_host(url: str) -> str:
@@ -3634,6 +4043,72 @@ def api_overrides():
     return jsonify({"requests": rows})
 
 
+def _needs_you_items() -> list[dict]:
+    """Everything waiting on the human, oldest first (CMX-183): pending override approvals,
+    pending access requests and runs in ``needs_human``. Each item is ``kind``, ``label``,
+    ``since`` (epoch seconds) and ``url`` (where the dashboard shows it). Raises when a
+    source cannot be read: a partial list would undercount."""
+    from chela import overrides
+    rows, error = overrides.listing_state()
+    if error:
+        raise RuntimeError(error)
+    items = [{"kind": "approval", "label": r.get("label") or r["id"],
+              "since": float(r.get("created") or 0),
+              "url": config.dashboard_url(f"/override/{r['id']}")} for r in rows]
+    share_requests.ingest_all()
+    share_requests.sweep()
+    items += [{"kind": "access", "label": r.get("description") or r.get("id") or "",
+               "since": float(r.get("filed_at") or 0), "url": config.dashboard_url("/")}
+              for r in share_requests.pending()]
+    for run in dispatcher.list_runs():
+        if run.get("status") != "needs_human":
+            continue
+        at = dispatcher._parse_ts(run.get("ended_at") or run.get("started_at"))
+        # an undated row counts as waiting from now: never the epoch, which would rank it
+        # oldest and print an age of decades
+        items.append({"kind": "run", "label": run.get("task_id") or "",
+                      "since": at.timestamp() if at else time.time(),
+                      "url": config.dashboard_url("/")})
+    return sorted(items, key=lambda i: i["since"])
+
+
+# 🙋 CMX-183: the orchestrator session's "needs you" band (mods/chela-hooks) polls this.
+# Read-only; approving stays in Telegram, the dashboard or a plain terminal. A source that
+# cannot be read is a 503, never an empty list the band would show as "nothing waiting".
+@app.route("/api/needs-you")
+@require_auth
+def api_needs_you():
+    try:
+        return jsonify({"items": _needs_you_items()})
+    except Exception as exc:  # noqa: BLE001 - report it, do not 500 into silence
+        return jsonify({"items": [], "error": f"{exc.__class__.__name__}: {exc}"}), 503
+
+
+# 🔒 CMX-184: the Mod (mods/chela-hooks) files a classifier denial straight into the inbox,
+# no event-log tail. One denial the shell hook also logs is still ONE notice: both go through
+# inbox.denied_events, keyed on the tool_use_id. A body that cannot be filed is a 400 and the
+# shell path still carries the denial; the agent never waits on this (the Mod does not await).
+@app.route("/api/inbox/denial", methods=["POST"])
+@require_auth
+def api_inbox_denial():
+    if (request.content_length or 0) > hooks.MAX_BODY:
+        return jsonify({"ok": False, "error": "body too large"}), 413
+    # application/json only: a cross-origin page can send text/plain with no preflight, never this
+    if not request.is_json:
+        return jsonify({"ok": False, "error": "Content-Type must be application/json"}), 415
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"ok": False, "error": "a JSON object is required"}), 400
+    try:
+        events = inbox.file_denial(body)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except Exception as exc:  # noqa: BLE001 - report it, do not 500 into silence
+        log.exception("inbox: a direct denial could not be filed")
+        return jsonify({"ok": False, "error": f"{exc.__class__.__name__}: {exc}"}), 503
+    return jsonify({"ok": True, "queued": len(events)})
+
+
 @app.route("/api/override/<request_id>/<action>", methods=["POST"])
 @require_auth
 def api_override_decide(request_id, action):
@@ -3747,10 +4222,9 @@ def api_hooks(event):
     The plugin (``plugin/hooks/hooks.json``, rendered by :func:`chela.hooks.hooks_spec`)
     POSTs each event here — as an ``http`` hook for most events (no shell script, no
     process spawn per tool call), or via a ``curl`` relaying into this SAME route for
-    ``SessionStart`` and ``MessageDisplay`` (each forced onto a ``command`` hook for its
-    own reason — see :func:`chela.hooks.recap_command` and
-    :func:`chela.hooks.message_display_command`). Correlation to a window is off the
-    session's origin, not the pane.
+    ``SessionStart`` and the tool events (forced onto ``command`` hooks — see
+    :func:`chela.hooks.recap_command` and :func:`chela.hooks.tool_event_command`).
+    Correlation to a window is off the session's origin, not the pane.
 
     **Only one event ever decides anything.** An agent is *blocked* on this request and
     Claude Code reads what comes back, so a ``permissionDecision`` or a
@@ -3760,13 +4234,9 @@ def api_hooks(event):
     Telegram topic within the wait budget (:func:`chela.gateanswer.answer_permission_request`).
     It is the ONLY safe way to answer a multi-question / ``multiSelect`` picker: the
     keystroke path has no cursor to read for those shapes, and the one time it guessed it
-    silently answered the wrong option (CMX-32). Nothing else here decides anything —
-    ``MessageDisplay`` also returns a non-empty body (CMX-285,
-    :func:`chela.hooks.message_display_response`, gated by ``config.TERMINAL_TIMESTAMPS``),
-    but that body only replaces how an assistant reply's own first line is DISPLAYED (a
-    local-time marker prepended inline); it never touches the stored transcript, answers
-    no prompt, and decides nothing a human would call a decision. Every other event still
-    returns ``{}``.
+    silently answered the wrong option (CMX-32). Nothing else here decides anything:
+    every other event returns ``{}`` (bar ``SessionStart``'s recap, which is context, not
+    a decision).
 
     **A blocked request is bounded and fails OPEN.** The wait is at most
     ``CHELA_GATE_WAIT_S`` and the number of simultaneously-held gates is capped; past
@@ -3785,21 +4255,9 @@ def api_hooks(event):
         log.warning("hooks: %s body over %d bytes — not read", event, hooks.MAX_BODY)
         return jsonify({})
     body = request.get_json(force=True, silent=True)
-    if event in hooks.TIMESTAMP_EVENTS:
-        # CMX-285: `MessageDisplay` fires once per streamed BATCH of every assistant
-        # message — far higher volume than PreToolUse/PostToolUse (already ~78% of the
-        # log on their own, per hooks.hooks_spec's own comment). Answered here, ahead of
-        # hooks.ingest, so this display-only decoration never touches the event log (a
-        # firehose of near-duplicate "message display" records nobody would read) and
-        # stays off the hot path — no wid resolution, no disk write — even when
-        # config.TERMINAL_TIMESTAMPS is False. See docs/archive/SPIKE_LIVE_TERMINAL_TIMESTAMPS.md
-        # and hooks.message_display_response.
-        if config.TERMINAL_TIMESTAMPS and isinstance(body, dict):
-            return jsonify(hooks.message_display_response(body))
-        return jsonify({})
     # Only the SessionStart `command` hook can send this (CMX-160) — its curl is the one
-    # that carries an X-Chela-Wid header; MessageDisplay's own curl (CMX-303) and every
-    # `http` hook carry Claude Code's payload and none of the agent's own env.
+    # that carries an X-Chela-Wid header; every other hook carries Claude Code's payload
+    # and none of the agent's own env.
     explicit_wid = request.headers.get("X-Chela-Wid") or None
     hooks.ingest(event, body, explicit_wid=explicit_wid)
     if event == "SessionStart" and isinstance(body, dict):
@@ -4265,10 +4723,10 @@ def _runs_for_workflow(
     reviewer sent back is not done, not active, and not failed: with the old
     ``== 'awaiting_review'`` test it appeared in NO column of the Kanban at all — it simply
     vanished from the board while its agent was being re-spawned. Each card keeps its OWN
-    status (see kanban.js), so the column never claims a rejected PR is awaiting review.
+    status (see the board's flatten, frontend/src/features/work/board.ts), so the column never claims a rejected PR is awaiting review.
 
     ``closed`` (CMX-265) rides in `recent` alongside `done`/`failed` — it is just as
-    terminal, and the frontend's own bucketing (kanban.js's `_kanbanFlatten`) is what
+    terminal, and the frontend's own bucketing (features/work/board.ts's `flatten`) is what
     actually separates it back out into its own `archived` lane. Omitting it here would
     not just mis-lane it — it would make a closed-not-merged row vanish from this API
     payload ENTIRELY (the row survives in the DB either way; only the board view would
@@ -4279,6 +4737,33 @@ def _runs_for_workflow(
     awaiting = [r for r in matching if r.get("status") in dispatcher.REVIEW_STATUSES][:10]
     recent = [r for r in matching if r.get("status") in ("done", "closed", "failed")][:10]
     return active, awaiting, recent
+
+
+def _fold_closed_runs(all_runs: list[dict], wf_path: str, open_ids: set[str]
+                      ) -> tuple[list[dict], bool]:
+    """CMX-193: the board's terminal runs (``done``/``closed``/``failed``, newest first,
+    at most 10) with every ``closed`` run of a task that is still OPEN folded away — the
+    task's open card is that task's one card (a requeued run, or a CMX-68 stall the open
+    card already flags). Before this, each such run filled one of the 10 slots AND drew a
+    second card for the same task next to its open one. Also returns whether the cap cut
+    any run off, so the board can say Done is a sample rather than a count."""
+    terminal = [r for r in _workflow_runs(all_runs, wf_path)
+                if r.get("status") in ("done", "closed", "failed")
+                and not (r.get("status") == "closed" and r.get("task_id") in open_ids)]
+    return terminal[:10], len(terminal) > 10
+
+
+def _open_task_group(task, ready_ids: set[str] | None, type_by_state: dict[str, str]) -> str:
+    """CMX-94: the Runs segment's section for an open task — ``ready`` (what a claim would
+    draw from: Linear's Todo), ``in_progress`` (a ``started``-type state: In Progress / In
+    Review) or ``backlog`` (everything else, an unreadable state included). The READY count
+    is the one the operator reads as "to-dos", so a task only lands there on the
+    dispatcher's own positive read (``ready_task_ids``); unknown is never ready."""
+    if ready_ids is not None and task.id in ready_ids:
+        return "ready"
+    if type_by_state.get(task.tracker_state or "") == "started":
+        return "in_progress"
+    return "backlog"
 
 
 def _repo_root_workflow() -> Path | None:
@@ -4576,6 +5061,8 @@ def api_dispatcher():
             # run state rides on the card as a badge. None for a tracker without states
             # (markdown, gh_issues) or a failed read: the board keeps chela's own lanes.
             "tracker_columns": None,
+            # CMX-193: True when more terminal runs exist than `recent_runs` carries.
+            "recent_runs_capped": False,
         }
 
         active, awaiting, recent = _runs_for_workflow(all_runs, str(wf_path))
@@ -4628,11 +5115,12 @@ def api_dispatcher():
                 # Over ALL of this workflow's runs, not `recent` (capped at 10): an older
                 # closed run blocks its task just the same. Joined only against THIS
                 # tracker's ready ids — task ids are per tracker.
+                ready_ids = dispatcher.ready_task_ids(source, open_tasks)
                 stalled_ids = {
                     s["task_id"] for s in dispatcher.closed_run_stalls(
-                        _workflow_runs(all_runs, str(wf_path)),
-                        dispatcher.ready_task_ids(source, open_tasks) or ())
+                        _workflow_runs(all_runs, str(wf_path)), ready_ids or ())
                 }
+                type_by_state = {c["name"]: c["type"] for c in entry["tracker_columns"] or ()}
                 entry["open_tasks"] = []
                 for t in open_tasks:
                     if t.id in in_flight_ids:
@@ -4658,6 +5146,12 @@ def api_dispatcher():
                         "tracker_url": t.url,
                         # 🗂️📐 CMX-23: the tracker state this read saw (Linear's column).
                         "tracker_state": t.tracker_state,
+                        # ⚖️🎚️ CMX-405: the tracker's risk label (or its inferred fallback).
+                        "risk": t.risk,
+                        "risk_reason": t.risk_reason,
+                        # CMX-94: which Runs-segment section the task sits in — see
+                        # `_open_task_group`.
+                        "group": _open_task_group(t, ready_ids, type_by_state),
                         # True when this task has a `depends:` reference not yet
                         # struck done — kept in sync with `dispatcher._ready`, the
                         # claim-time gate, so a card the dispatcher would refuse to
@@ -4713,6 +5207,8 @@ def api_dispatcher():
         # branch so run-discovered workflows still group + label correctly.
         if project_key is None:
             project_key = _project_key_from_runs(active, awaiting, recent)
+        recent, entry["recent_runs_capped"] = _fold_closed_runs(
+            all_runs, str(wf_path), {t["id"] for t in entry["open_tasks"]})
         entry["project_key"] = project_key
 
         # Stamp project_key onto each run dict — task_number already comes from
@@ -4733,7 +5229,7 @@ def api_dispatcher():
             r["tracker_url"] = r.get("tracker_url") or url_by_id.get(r.get("task_id"))
             # 🗂️📐 CMX-23: the issue's current tracker state, when it is still open there.
             # None for a finished/archived issue — the board then files the card by its
-            # run status (kanbanlinearmodel.js's fallback), never drops it.
+            # run status (features/work/linear.ts's fallback), never drops it.
             r["tracker_state"] = state_by_id.get(r.get("task_id"))
             # Per-run task-list progress (issue #462) — None (not "0/0", not an error)
             # whenever the run can't be joined to a live session's task directory; see
@@ -4741,11 +5237,15 @@ def api_dispatcher():
             r["tasks"] = tasklists.progress_for_run(r, session_entries, current_epoch)
             r["closed_run_stall"] = (dispatcher.CLOSED_RUN_STALL
                                      if r.get("task_id") in stalled_ids else None)
+            # ⏸️ CMX-318: why a claimed/running run is held on purpose (`chela park`, or a
+            # suite-slot wait) — the card's "parked"/"waiting" badge. None otherwise.
+            r["park"] = park.state(r)
         entry["active_runs"] = active
         entry["awaiting_review_runs"] = awaiting
         entry["recent_runs"] = recent
         workflows_payload.append(entry)
 
+    held = hold.active()
     return jsonify({
         # True whenever there's anything to show — explicit config, a discovered
         # repo-root workflow, or workflows with recorded runs. The frontend
@@ -4753,9 +5253,11 @@ def api_dispatcher():
         "configured": bool(workflows_payload),
         "workflows": workflows_payload,
         # CMX-206: the Board's Pause/Resume button reads its state off THIS payload
-        # (the poll `work.js` already runs every 30s) rather than a second fetch of
+        # (the poll features/work already runs every 30s) rather than a second fetch of
         # `/api/settings` — see `hold.active()` for what makes a hold current.
-        "dispatch_hold": (hold.active().as_dict() if hold.active() else None),
+        "dispatch_hold": held.as_dict() if held else None,
+        # CMX-252: what a `--pause --all` stopped (agents, frozen judges, since when).
+        "fleet_pause": fleet.snapshot(held=held),
     })
 
 
@@ -4787,18 +5289,37 @@ def api_dispatcher_pause():
         # A hold the daemon will never see is worse than none — the caller would believe
         # dispatch is paused when it is not. Fail loudly, same as the CLI.
         return jsonify({"ok": False, "error": f"could not take the hold: {e}"}), 500
-    return jsonify({"ok": True, "dispatch_hold": held.as_dict()})
+    if data.get("all") is not True:
+        return jsonify({"ok": True, "dispatch_hold": held.as_dict()})
+    # CMX-252: `chela dispatch --pause --all` — the hold above, then every dispatched agent.
+    try:
+        state = fleet.pause_all(by=held.by)
+    except Exception as e:  # noqa: BLE001 — say the hold stands, whatever broke after it
+        log.exception("fleet pause failed")
+        return jsonify({"ok": False, "dispatch_hold": held.as_dict(),
+                        "error": f"dispatch is held, but pausing the agents failed: {e}"}), 500
+    return jsonify({"ok": True, "dispatch_hold": held.as_dict(),
+                    "fleet_pause": fleet.snapshot(state, held)})
 
 
 @app.route("/api/dispatcher/resume", methods=["POST"])
 @require_auth
 def api_dispatcher_resume():
     """Release the dispatch hold. Idempotent — releasing when nothing is held is not an
-    error, so a stale/duplicate click never surfaces as a failure."""
-    released = hold.release(by="dashboard")
+    error, so a stale/duplicate click never surfaces as a failure.
+
+    CMX-252: like ``chela dispatch --resume``, a ``--pause --all`` fleet is resumed first
+    (agents sent "resume", judges thawed), while the hold still stands."""
+    try:
+        resumed, released = fleet.resume_fleet(by="dashboard")
+    except Exception as e:  # noqa: BLE001 — say the hold stands, whatever broke
+        log.exception("fleet resume failed")
+        return jsonify({"ok": False, "error": f"resuming the agents failed: {e}. "
+                                              "Dispatch is still held."}), 500
     return jsonify({
         "ok": True,
         "released": released.as_dict() if released else None,
+        "fleet_resumed": resumed,
     })
 
 
@@ -5225,11 +5746,9 @@ def _auto_resolve_todo_conflict(
 def _merge_one(row: dict) -> dict:
     """Squash-merge one run's PR, then clean up the local worktree and branch.
 
-    Shared by the single-card merge endpoint and the batch merge-all endpoint.
-    Returns a result dict: on success ``{"ok": True, "merge_commit_sha": ...}``;
+    Used by the single-card merge endpoint. Returns a result dict: on success ``{"ok": True, "merge_commit_sha": ...}``;
     on failure ``{"ok": False, "error": ..., "status": <http-code>}`` where
-    ``status`` is the HTTP code the single-card endpoint should surface (the
-    batch endpoint ignores it and just records the error). Never raises —
+    ``status`` is the HTTP code the endpoint should surface. Never raises:
     gh/subprocess failures are captured into the error string.
 
     Squash — NOT rebase: rebase-merge silently drops the post-PR strike commit
@@ -5288,8 +5807,7 @@ def _merge_one(row: dict) -> dict:
     # Pre-merge: if GitHub reports CONFLICTING, attempt a strictly-guarded
     # auto-resolve of a TODO.md-ONLY bookkeeping conflict in the run's
     # worktree. Anything beyond TODO.md (or an ambiguous strike) aborts to
-    # manual. The batch merge-all path pre-filters to MERGEABLE, so this only
-    # fires for a single-card Merge on a conflicting PR.
+    # manual.
     if _pr_mergeable(pr_number, str(repo_dir)) == "CONFLICTING":
         worktree_path_pre = row.get("worktree_path")
         branch_name_pre = row.get("branch_name")
@@ -5350,6 +5868,7 @@ def _merge_one(row: dict) -> dict:
     repo_cwd = str(repo_dir)
     worktree_path = row.get("worktree_path")
     if worktree_path and Path(worktree_path).exists():
+        reap_run_worktree(worktree_path, row.get("workflow_path"))   # CMX-151: a run's processes die with it
         _best_effort(
             task_id, "worktree-remove",
             ["git", "worktree", "remove", "--force", worktree_path],
@@ -5399,68 +5918,6 @@ def api_dispatcher_run_close(task_id: str):
         return jsonify({"ok": False, "error": "a reason is required"}), 400
     result = dispatcher.close_run(task_id, reason, requeue=requeue, by="dashboard")
     return jsonify(result), (200 if result.get("ok") else 409)
-
-
-@app.route("/api/dispatcher/merge-all", methods=["POST"])
-@require_auth
-def api_dispatcher_merge_all():
-    """Batch squash-merge every awaiting_review run whose PR is MERGEABLE.
-
-    Optional ``{workflow_path}`` filter restricts to one workflow — the Kanban
-    passes the active filter unless it's "all". A run is eligible only when
-    ``status == 'awaiting_review'`` AND ``pr_state in ('open', None)`` AND
-    ``pr_mergeable == 'MERGEABLE'`` AND its checks are green (or the repo has no
-    CI at all); anything CONFLICTING / UNKNOWN / non-open, and anything whose CI
-    is red, pending or unread, lands under ``skipped`` and is never merged. Each
-    eligible run goes through the shared ``_merge_one`` helper, so each merge
-    gets the same cleanup — and the same live CI gate — as the single-card button.
-
-    Returns ``{ok, merged: [task_id...], skipped: [{task_id, reason}],
-    failed: [{task_id, error}]}``.
-    """
-    data = request.get_json(silent=True) or {}
-    wf_filter = (data.get("workflow_path") or "").strip()
-    target: str | None = None
-    if wf_filter:
-        resolved = _resolve_dispatch_workflow(wf_filter)
-        if resolved is None:
-            return jsonify({"ok": False, "error": f"unknown workflow: {wf_filter}"}), 400
-        target = str(resolved)
-
-    merged: list = []
-    skipped: list = []
-    failed: list = []
-    for row in dispatcher.list_runs():
-        if row.get("status") != "awaiting_review":
-            continue
-        if target is not None and row.get("workflow_path") != target:
-            continue
-        task_id = row.get("task_id")
-        pr_state = row.get("pr_state")
-        if pr_state not in ("open", None):
-            skipped.append({"task_id": task_id, "reason": f"pr_state={pr_state}"})
-            continue
-        if row.get("pr_mergeable") != "MERGEABLE":
-            skipped.append({"task_id": task_id, "reason": f"mergeable={row.get('pr_mergeable')}"})
-            continue
-        # Cheap pre-filter on the run row's cached check state, so a red PR is SKIPPED
-        # (reported, batch continues) instead of counted as a failure. _merge_one re-reads
-        # the checks from GitHub anyway and is the actual gate — this only keeps the batch's
-        # own report honest. ⛔ Anything that is not a green cache is skipped here, including
-        # a check state nobody has read yet: a batch merge must never be the thing that finds
-        # out what CI thought. A repo with NO CI at all (`none`) is not red and still merges
-        # — no checks is not the same as failing checks — and _merge_one logs that it did.
-        checks = row.get("pr_checks")
-        if checks not in (dispatcher.CI_PASSING, dispatcher.CI_NONE):
-            skipped.append({"task_id": task_id, "reason": f"checks={checks or 'unread'}"})
-            continue
-        result = _merge_one(row)
-        if result.get("ok"):
-            merged.append(task_id)
-        else:
-            failed.append({"task_id": task_id, "error": result.get("error")})
-
-    return jsonify({"ok": True, "merged": merged, "skipped": skipped, "failed": failed})
 
 
 def _allowed_source_files() -> set[str]:

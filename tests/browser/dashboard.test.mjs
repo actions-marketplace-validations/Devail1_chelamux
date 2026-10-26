@@ -22,7 +22,7 @@
 // CHELA_REQUIRE_JS_TESTS=1 — a browser that cannot launch is a FAILURE there.
 import { after, before, describe, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { AGENTS, STATE_OF, launchChromium, openDashboard } from './fixture.mjs';
+import { AGENTS, DRAWER_OPENER, STATE_OF, launchChromium, openDashboard } from './fixture.mjs';
 
 const { browser, why } = await launchChromium();
 after(() => browser && browser.close());
@@ -264,10 +264,10 @@ describe('phone 390×844: off-canvas drawer, menu FAB, always-visible safety clu
         await assertOnScreen('#btn-shares');   // the fixture's shared @2 lights the kill-switch
     });
 
-    test('the menu FAB is visible and opens the drawer', async () => {
+    test('the pane title bar\'s hamburger is visible and opens the drawer (CMX-313: no floating ☰ over a pane)', async () => {
         ready();
-        await assertOnScreen('#btn-menu-mobile');
-        await page.locator('#btn-menu-mobile').click();
+        await assertOnScreen('#term-stage.term-single .gs-head-menu');
+        await page.locator('#term-stage.term-single .gs-head-menu').click();
         await page.waitForFunction(() => {
             const r = document.querySelector('.sidebar').getBoundingClientRect();
             return r.left >= -1 && r.width > 0 && r.left < window.innerWidth;
@@ -590,8 +590,8 @@ describe('CMX-393 fonts: pane headers, pane footers and modals are the Geist chr
     test('the Decisions modal, opened from the head\'s inbox button, is the Geist stack', async () => {
         ready();
         await page.locator('#btn-decisions').click();
-        await page.waitForSelector('#decisions-menu.open .modal-sheet', { state: 'visible', timeout: 5000 });
-        for (const sel of ['#decisions-menu .modal-sheet-head', '#decisions-menu .modal-sheet-body']) {
+        await page.waitForSelector('[role="dialog"].modal-decisions', { state: 'visible', timeout: 5000 });
+        for (const sel of ['.modal-decisions h3', '.modal-decisions .decisions-body']) {
             const f = await familyOf(sel);
             assert.match(f, GEIST, `${sel} font-family is ${f}`);
         }
@@ -600,15 +600,17 @@ describe('CMX-393 fonts: pane headers, pane footers and modals are the Geist chr
 
     test('the settings/menu popover, opened from the foot\'s gear, is the Geist stack', async () => {
         ready();
-        await page.evaluate(() => window.chela.hideDecisionsMenu && window.chela.hideDecisionsMenu());
+        if (await page.locator('[role="dialog"].modal-decisions').count()) await page.keyboard.press('Escape');
         await page.locator('#btn-primary-menu').click();
-        await page.waitForSelector('#primary-menu', { state: 'visible', timeout: 5000 });
-        const f = await familyOf('#primary-menu .popover-item');
-        assert.match(f, GEIST, `#primary-menu font-family is ${f}`);
+        // the gear menu (CMX-219: the primary-menu island, a kit Menu)
+        await page.waitForSelector('[role="menu"]', { state: 'visible', timeout: 5000 });
+        const f = await familyOf('[role="menu"] .popover-item');
+        assert.match(f, GEIST, `the gear menu's font-family is ${f}`);
+        await page.keyboard.press('Escape');
     });
 });
 
-describe('CMX-393 phone 390×844: the drawer foot is one row, the "+" opens the launch menu with the drawer closed', { skip: why }, () => {
+describe('CMX-393 phone 390×844: the drawer foot is one row, the drawer\'s New session opens the launch menu', { skip: why }, () => {
     let page, context;
     const ready = setup(async () => {
         ({ page, context } = await openDashboard(browser, { width: 390, height: 844 }));
@@ -617,29 +619,6 @@ describe('CMX-393 phone 390×844: the drawer foot is one row, the "+" opens the 
         await stable(page);
     });
     after(() => context && context.close());
-
-    test('the phone "+" is on screen with the drawer closed and opens the launch menu', async () => {
-        ready();
-        const side = await box(page, '.sidebar');
-        assert.ok(side.x + side.width <= px, 'the drawer is not closed at the start of this test');
-        const plus = await box(page, '#btn-new-mobile');
-        assert.ok(plus.x >= 0 && plus.y >= 0 && plus.x + plus.width <= 390 && plus.y + plus.height <= 844,
-            `#btn-new-mobile ${JSON.stringify(plus)} is not inside the viewport`);
-        await page.locator('#btn-new-mobile').click();
-        await page.waitForSelector('#new-menu', { state: 'visible', timeout: 5000 });
-        const menu = await box(page, '#new-menu');
-        assert.ok(menu.width > 0 && menu.x >= 0 && menu.x + menu.width <= 390 + px,
-            `#new-menu ${JSON.stringify(menu)} is not on screen`);
-        const closed = await box(page, '.sidebar');
-        assert.ok(closed.x + closed.width <= px, 'opening the launch menu also opened the drawer');
-        // openNewMenu arms its light-dismiss listener in a setTimeout(0). CDP input
-        // can outrun that timer on a loaded runner (CI 3.11, PR #555), so the click
-        // landed before the listener existed and the menu never closed. A later
-        // setTimeout(0) fires after the earlier one, so awaiting one means armed.
-        await page.evaluate(() => new Promise(r => setTimeout(r, 0)));
-        await page.mouse.click(380, 830);   // light-dismiss
-        await page.waitForSelector('#new-menu', { state: 'hidden', timeout: 5000 });
-    });
 
     test('.safety-float is still on screen with the drawer closed', async () => {
         ready();
@@ -650,7 +629,7 @@ describe('CMX-393 phone 390×844: the drawer foot is one row, the "+" opens the 
 
     test('opened drawer: its foot is one row, and the inbox sits in its head', async () => {
         ready();
-        await page.locator('#btn-menu-mobile').click();
+        await page.locator(DRAWER_OPENER).click();
         await page.waitForFunction(() => {
             const r = document.querySelector('.sidebar').getBoundingClientRect();
             return r.left >= -1 && r.width > 0;
@@ -676,7 +655,8 @@ describe('CMX-393 phone 390×844: the drawer foot is one row, the "+" opens the 
 // topbar math (`top = r.bottom + 6`) opened it below a button at the bottom of
 // the screen: measured live at 1920×916, top=912 for a 324px menu. The whole
 // menu must be inside the viewport — above the gear, since there is no room
-// below it — and so must #new-menu reopened from its "New…" row.
+// below it — and so must the launch menu reopened from its "New…" row (CMX-219: both
+// are kit popovers now, placed by Radix; this holds them to the same claim).
 async function assertInViewport(page, selector, vp) {
     const b = await box(page, selector);
     assert.ok(b.width > 0 && b.height > 0 && b.x >= -px && b.y >= -px
@@ -696,28 +676,28 @@ for (const vp of [{ width: 1920, height: 916 }, { width: 1440, height: 900 }]) {
         });
         after(() => context && context.close());
 
-        test('#primary-menu is inside the viewport, above the gear', async () => {
+        test('the gear menu is inside the viewport, above the gear', async () => {
             ready();
             await page.locator('#btn-primary-menu').click();
-            await page.waitForSelector('#primary-menu', { state: 'visible', timeout: 5000 });
-            const menu = await assertInViewport(page, '#primary-menu', vp);
+            await page.waitForSelector('[role="menu"]', { state: 'visible', timeout: 5000 });
+            const menu = await assertInViewport(page, '[role="menu"]', vp);
             const gear = await box(page, '#btn-primary-menu');
             assert.ok(menu.y + menu.height <= gear.y + px,
-                `#primary-menu ${JSON.stringify(menu)} is not above the foot gear ${JSON.stringify(gear)}`);
+                `the gear menu ${JSON.stringify(menu)} is not above the foot gear ${JSON.stringify(gear)}`);
         });
 
-        test('New… from that menu opens #new-menu inside the viewport too', async () => {
+        test('New… from that menu opens the launch menu inside the viewport too', async () => {
             ready();
-            if (!await page.locator('#primary-menu').isVisible()) await page.locator('#btn-primary-menu').click();
-            await page.locator('#primary-menu .popover-item', { hasText: 'New…' }).click({ timeout: 5000 });
-            await page.waitForSelector('#new-menu', { state: 'visible', timeout: 5000 });
-            await assertInViewport(page, '#new-menu', vp);
-            await page.evaluate(() => window.chela.hideNewMenu());
+            if (!await page.locator('[role="menu"]').isVisible()) await page.locator('#btn-primary-menu').click();
+            await page.locator('[role="menu"] .popover-item', { hasText: 'New…' }).click({ timeout: 5000 });
+            await page.waitForSelector('.popover.launch-menu', { state: 'visible', timeout: 5000 });
+            await assertInViewport(page, '.popover.launch-menu', vp);
+            await page.keyboard.press('Escape');
         });
     });
 }
 
-describe('CMX-398 phone 390×844: the "+" New-session menu is still wholly on screen', { skip: why }, () => {
+describe('CMX-398 phone 390×844: the New-session menu is still wholly on screen', { skip: why }, () => {
     const vp = { width: 390, height: 844 };
     let page, context;
     const ready = setup(async () => {
@@ -727,12 +707,63 @@ describe('CMX-398 phone 390×844: the "+" New-session menu is still wholly on sc
     });
     after(() => context && context.close());
 
-    test('#new-menu from #btn-new-mobile is inside the 390×844 viewport, below the "+"', async () => {
+    test('the launch menu from the drawer\'s New session is inside the 390×844 viewport (CMX-313: no phone "+")', async () => {
         ready();
-        await page.locator('#btn-new-mobile').click();
-        await page.waitForSelector('#new-menu', { state: 'visible', timeout: 5000 });
-        const menu = await assertInViewport(page, '#new-menu', vp);
-        const plus = await box(page, '#btn-new-mobile');
-        assert.ok(menu.y >= plus.y + plus.height - px, `#new-menu ${JSON.stringify(menu)} is not below the "+"`);
+        await page.locator(DRAWER_OPENER).click();
+        await page.waitForFunction(() => document.querySelector('.sidebar')?.classList.contains('open'), null, { timeout: 5000 });
+        await page.locator('.sidebar .sidebar-new-btn').click();
+        await page.waitForSelector('.popover.launch-menu', { state: 'visible', timeout: 5000 });
+        await assertInViewport(page, '.popover.launch-menu', vp);
+    });
+});
+
+describe('CMX-327 desktop 1440×900: a launcher row is one line, icon, name, then actions', { skip: why }, () => {
+    let page, context;
+    const ready = setup(async () => {
+        ({ page, context } = await openDashboard(browser, {
+            width: 1440, height: 900,
+            api: { '/api/launcher': {
+                favorites: [{ path: '/p/one', label: 'one', exists: true }],
+                recent: [{ path: '/p/a-project-with-a-rather-long-name', label: 'a-project-with-a-rather-long-name', exists: false }],
+            } },
+        }));
+        await settle(page);
+        await stable(page);
+    });
+    after(() => context && context.close());
+
+    test('every row: icon, name and actions share one line, a long name included', async () => {
+        ready();
+        await page.locator('.sidebar-new-btn').first().click();
+        await page.waitForSelector('.popover.launch-menu .launch-row', { state: 'visible', timeout: 5000 });
+        const rows = await page.$$eval('.popover.launch-menu .launch-row', (els) => els.map((row) => {
+            const r = (sel) => {
+                const b = (sel ? row.querySelector(sel) : row).getBoundingClientRect();
+                return { top: b.top, bottom: b.bottom, left: b.left, right: b.right, mid: (b.top + b.bottom) / 2 };
+            };
+            return { row: r(null), icon: r('.lr-icon svg'), label: r('.lr-label'), actions: r('.lr-actions') };
+        }));
+        assert.equal(rows.length, 2);
+        for (const { row, icon, label, actions } of rows) {
+            const where = JSON.stringify({ row, icon, label, actions });
+            assert.ok(Math.abs(icon.mid - label.mid) <= 2, `the icon and the name are on different lines: ${where}`);
+            assert.ok(icon.right <= label.left + px, `the icon is not left of the name: ${where}`);
+            assert.ok(label.right <= actions.left + px, `the actions are not right of the name: ${where}`);
+            assert.ok(row.bottom - row.top < (label.bottom - label.top) + 20, `the row is taller than one line: ${where}`);
+            assert.ok(actions.right <= row.right + px, `the actions overflow the row: ${where}`);
+        }
+    });
+
+    test('a hovered row keeps the row tint: its button never takes the menu item\'s accent fill', async () => {
+        ready();
+        if (!await page.locator('.popover.launch-menu').isVisible()) await page.locator('.sidebar-new-btn').first().click();
+        await page.waitForSelector('.popover.launch-menu .launch-row', { state: 'visible', timeout: 5000 });
+        const main = page.locator('.popover.launch-menu .launch-row .lr-main').first();
+        await main.hover();
+        const { bg, color, rowColor } = await main.evaluate((el) => ({
+            bg: getComputedStyle(el).backgroundColor, color: getComputedStyle(el).color,
+            rowColor: getComputedStyle(el.parentElement).color }));
+        assert.equal(bg, 'rgba(0, 0, 0, 0)', `the hovered launcher button paints ${bg}`);
+        assert.equal(color, rowColor, `the hovered launcher button's text turns ${color}, not the row's ${rowColor}`);
     });
 });

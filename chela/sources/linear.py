@@ -32,6 +32,9 @@ Config (workflow front matter, ``tracker:`` block)::
       ready_states: [Todo]       # the state NAMES a task may be CLAIMED from (default Todo)
       done_state: Done           # optional — the state chela sets on merge; default: the
                                  # team's first state of type `completed`
+      project: Chelamux          # optional (CMX-326) — one Linear PROJECT of the team
+                                 # (name, slug id or id): every read and write is scoped to
+                                 # it, and issues chela creates are put in it
       keep_done: 100             # optional — how many of the most recently finished
                                  # (Done + Canceled) issues stay unarchived; 0 = archive
                                  # every finished issue. Default 100.
@@ -51,6 +54,15 @@ The OPEN set (:meth:`list_open_tasks`) is every issue whose state TYPE is not
 ``completed``/``canceled``/``duplicate`` — backlog, unstarted AND started. Linear's GitHub integration moves
 an issue to In Progress / In Review by itself when the PR opens; an open set of just ``Todo``
 would make every such issue read as ABSENT, and the dispatcher reads absence as "done".
+
+🗂️ CMX-326 — several workflows on ONE team. With ``project:`` set, the open set, the ID
+refresh, every by-number read behind a write, and :meth:`LinearSource.create_issue` see only
+that project's issues. Two dispatched workflows on one team must never claim the same issue,
+so a workflow whose team another dispatched workflow also reads REFUSES (``config_error``,
+which ``chela doctor`` reports) unless BOTH set ``project:`` and the projects differ. The
+archive sweep stays TEAM-wide — the free plan's cap counts the whole workspace — throttled
+per team, keeping the largest ``keep_done`` any workflow on the team asks for, so two
+project-scoped workflows run the same sweep, never competing ones.
 """
 from __future__ import annotations
 
@@ -257,6 +269,38 @@ query IssuesByNumber($team: String!, $numbers: [Float!], $after: String) {
 }
 """ % (PAGE_SIZE, _ISSUE_FIELDS)
 
+# 🗂️ CMX-326: the same two reads, narrowed to one project of the team (`$project` is the
+# project's id, resolved from `tracker.project` by TEAM_PROJECTS_QUERY).
+OPEN_PROJECT_ISSUES_QUERY = """
+query OpenProjectIssues($team: String!, $project: ID!, $after: String) {
+  issues(first: %d, after: $after, includeArchived: false,
+         filter: { team: { key: { eq: $team } }, project: { id: { eq: $project } },
+                   state: { type: { nin: %s } } }) {
+    nodes { %s }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+""" % (PAGE_SIZE, json.dumps(list(TERMINAL_STATE_TYPES)), _ISSUE_FIELDS)
+
+PROJECT_ISSUES_BY_NUMBER_QUERY = """
+query ProjectIssuesByNumber($team: String!, $project: ID!, $numbers: [Float!], $after: String) {
+  issues(first: %d, after: $after, includeArchived: true,
+         filter: { team: { key: { eq: $team } }, project: { id: { eq: $project } },
+                   number: { in: $numbers } }) {
+    nodes { %s }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+""" % (PAGE_SIZE, _ISSUE_FIELDS)
+
+TEAM_PROJECTS_QUERY = """
+query TeamProjects($team: String!) {
+  teams(filter: { key: { eq: $team } }) {
+    nodes { projects(first: 250) { nodes { id name slugId } } }
+  }
+}
+"""
+
 TEAM_STATES_QUERY = """
 query TeamStates($team: String!) {
   teams(filter: { key: { eq: $team } }) {
@@ -292,6 +336,22 @@ mutation Archive($id: String!) {
 CREATE_ISSUE_MUTATION = """
 mutation CreateIssue($input: IssueCreateInput!) {
   issueCreate(input: $input) { success issue { id identifier title url } }
+}
+"""
+
+# CMX-305: the nightly sweep files its issues with labels BY NAME (`risk:normal`, `sweep`).
+# A workspace label (no team) or one of this team's; a missing one is created on the team.
+LABELS_BY_NAME_QUERY = """
+query LabelsByName($names: [String!]) {
+  issueLabels(first: 100, filter: { name: { in: $names } }) {
+    nodes { id name team { key } }
+  }
+}
+"""
+
+CREATE_LABEL_MUTATION = """
+mutation CreateLabel($input: IssueLabelCreateInput!) {
+  issueLabelCreate(input: $input) { success issueLabel { id name } }
 }
 """
 
@@ -381,6 +441,62 @@ def _finished_at(node: dict) -> datetime:
     return datetime.min.replace(tzinfo=timezone.utc)
 
 
+def _team_siblings(wf: WorkflowDef, team: str) -> list[WorkflowDef]:
+    """🗂️ CMX-326 — every OTHER dispatched workflow (``CHELA_DISPATCH_WORKFLOWS``) whose
+    linear tracker reads ``team``. A sibling that has never parsed is not dispatching
+    anything, so it is not one; one that parsed before keeps its last good config."""
+    from chela import config
+    from chela.workflow import load_workflow_cached
+
+    own = Path(wf.path).expanduser().resolve()
+    out = []
+    for path in config.DISPATCH_WORKFLOWS:
+        if Path(path).expanduser().resolve() == own:
+            continue
+        other = load_workflow_cached(path).workflow
+        if other is None or other.get("tracker", "kind") != "linear":
+            continue
+        if _team_of(other).upper() == team.upper():
+            out.append(other)
+    return out
+
+
+def _team_of(wf: WorkflowDef) -> str:
+    return str(wf.get("tracker", "team", default="") or "").strip()
+
+
+def _project_of(wf: WorkflowDef) -> str | None:
+    return str(wf.get("tracker", "project", default="") or "").strip() or None
+
+
+def _team_clash(wf: WorkflowDef, team: str, project: str | None,
+                siblings: list[WorkflowDef]) -> str | None:
+    """Why ``wf`` must not claim from ``team``: another dispatched workflow reads it too and
+    the two could take the same issue — one of them sets no ``project:``, or both set the
+    same one. None when every sibling is fenced off by a different project."""
+    for other in siblings:
+        theirs = _project_of(other)
+        if project and theirs and project.casefold() != theirs.casefold():
+            continue
+        why = (f"both set `project: {project}`" if project and theirs else
+               "a workflow without `project:` reads the whole team")
+        return (
+            f"{wf.path}: Linear team {team} is also dispatched by {other.path}, and {why}, so "
+            "the two would claim the same issues. Give each workflow on a shared team its own "
+            "`tracker.project`. Claiming NO work until then."
+        )
+    return None
+
+
+def _match_project(nodes: list[dict], value: str) -> list[dict]:
+    """The team's projects ``value`` names: by id, else by slug id, else by name (case- and
+    edge-space-insensitive). More than one hit is ambiguous; the caller decides."""
+    want = value.strip().casefold()
+    return ([p for p in nodes if p["id"] == value.strip()]
+            or [p for p in nodes if str(p.get("slugId") or "").casefold() == want]
+            or [p for p in nodes if str(p.get("name") or "").strip().casefold() == want])
+
+
 def _slug(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")[:48].strip("-")
 
@@ -415,6 +531,16 @@ class LinearSource:
         done = wf.get("tracker", "done_state", default=None)
         self.done_state: str | None = str(done).strip() if done else None
         self.keep_done = _keep_done(wf.get("tracker", "keep_done", default=None))
+        self.project: str | None = _project_of(wf)
+        siblings = _team_siblings(wf, self.team) if self.team else []
+        # The sweep is the TEAM's (the cap is workspace-wide), so every workflow on the team
+        # sweeps with the same, most conservative, keep_done — never competing ones.
+        self.sweep_keep_done = max([self.keep_done] + [
+            _keep_done(o.get("tracker", "keep_done", default=None)) for o in siblings])
+        # The siblings' own `project:` values — the clash check above compares the strings;
+        # `_project_id` also compares what they RESOLVE to (a name and a slug of one project).
+        self._sibling_projects: list[tuple[Path, str]] = [
+            (o.path, proj) for o in siblings if (proj := _project_of(o))]
         named = wf.get("tracker", "states", default=None)
         named = named if isinstance(named, dict) else {}
         self.transition_states: dict[str, str] = {
@@ -444,6 +570,8 @@ class LinearSource:
                 f"{wf.path}: tracker.team is not set. A linear tracker needs the team KEY "
                 "(e.g. `team: CMX`). Claiming NO work until then."
             )
+        elif clash := _team_clash(wf, self.team, self.project, siblings):
+            self.config_error = clash
         elif self._transport is None:
             key = load_api_key()
             if not key:
@@ -504,6 +632,49 @@ class LinearSource:
                     "first %d", self.team, PAGE_SIZE * MAX_PAGES, PAGE_SIZE * MAX_PAGES)
         return nodes
 
+    def _project_id(self) -> str | None:
+        """The id of ``tracker.project`` in this team, or None when the workflow is not
+        project-scoped. Matched by id, then slug id, then name (case-insensitive). Raises
+        :class:`LinearError` when it cannot be read, or names no project — or two — of the
+        team: a scope that cannot be resolved fails the read CLOSED, never widens to the team."""
+        if not self.project:
+            return None
+        data = self._call(TEAM_PROJECTS_QUERY, {"team": self.team})
+        teams = data.get("teams")
+        teams = teams.get("nodes") if isinstance(teams, dict) else None
+        team = teams[0] if isinstance(teams, list) and teams else None
+        conn = team.get("projects") if isinstance(team, dict) else None
+        nodes = conn.get("nodes") if isinstance(conn, dict) else None
+        if not isinstance(nodes, list):
+            raise LinearError("malformed", f"team {self.team}'s projects missing")
+        nodes = [p for p in nodes if isinstance(p, dict) and isinstance(p.get("id"), str)]
+        hits = _match_project(nodes, self.project)
+        if len(hits) != 1:
+            msg = (f"{self.workflow_path}: tracker.project {self.project!r} names "
+                   f"{'no' if not hits else 'more than one'} project of Linear team "
+                   f"{self.team}. Claiming NO work until it names exactly one.")
+            _report_once((str(self.workflow_path), "project"), msg)
+            raise LinearError("config", msg)
+        project_id = hits[0]["id"]
+        for path, theirs in self._sibling_projects:
+            if project_id in {p["id"] for p in _match_project(nodes, theirs)}:
+                msg = (f"{self.workflow_path}: tracker.project {self.project!r} and "
+                       f"{theirs!r} in {path} are the same project of Linear team "
+                       f"{self.team}, so the two would claim the same issues. Claiming NO "
+                       "work until each workflow has its own project.")
+                _report_once((str(self.workflow_path), "project-clash"), msg)
+                raise LinearError("config", msg)
+        return project_id
+
+    def _scoped(self, team_query: str, project_query: str,
+                variables: dict) -> tuple[str, dict]:
+        """``team_query`` for a team-wide workflow, else ``project_query`` with the
+        project's id. Raises :class:`LinearError` when the project cannot be resolved."""
+        project_id = self._project_id()
+        if project_id is None:
+            return team_query, variables
+        return project_query, {**variables, "project": project_id}
+
     # --- reading -------------------------------------------------------------------------
 
     def _open_nodes(self) -> list[dict] | None:
@@ -514,7 +685,8 @@ class LinearSource:
             _report_once((str(self.workflow_path), "config"), self.config_error)
             return None
         try:
-            self._snapshot = self._paged(OPEN_ISSUES_QUERY, {"team": self.team})
+            self._snapshot = self._paged(*self._scoped(
+                OPEN_ISSUES_QUERY, OPEN_PROJECT_ISSUES_QUERY, {"team": self.team}))
         except LinearError as e:
             log.warning("linear: could not list open issues for team %s: %s", self.team, e)
             return None
@@ -567,8 +739,10 @@ class LinearSource:
         if not numbers:
             return []
         try:
-            return self._paged(ISSUES_BY_NUMBER_QUERY, {"team": self.team, "numbers": numbers},
-                               cache=cache)
+            query, variables = self._scoped(ISSUES_BY_NUMBER_QUERY,
+                                            PROJECT_ISSUES_BY_NUMBER_QUERY,
+                                            {"team": self.team, "numbers": numbers})
+            return self._paged(query, variables, cache=cache)
         except LinearError as e:
             log.warning("linear: could not refresh %d issue(s) for team %s: %s",
                         len(numbers), self.team, e)
@@ -875,7 +1049,8 @@ class LinearSource:
         return ok
 
     def archive_sweep(self, *, force: bool = False) -> int | None:
-        """Apply the ``keep_done`` rule (CMX-8): of the team's finished
+        """Apply the ``keep_done`` rule (CMX-8) — TEAM-wide even for a project-scoped
+        workflow (CMX-326: the cap counts the workspace), with :attr:`sweep_keep_done`: of the team's finished
         (completed/canceled/duplicate) but unarchived issues — whoever closed them — keep
         the ``keep_done`` most recently finished and archive the older ones, oldest first. Open issues are never archived
         and never count toward ``keep_done``. Then publish the team's non-archived count
@@ -903,7 +1078,7 @@ class LinearSource:
         ]
         # Newest first; the number breaks a tie so the order never depends on the page.
         finished.sort(key=lambda n: (_finished_at(n), n.get("number") or 0), reverse=True)
-        older = finished[self.keep_done:]
+        older = finished[self.sweep_keep_done:]
         archived = 0
         for node in reversed(older):              # oldest first: a capped sweep takes those
             if archived >= ARCHIVES_PER_SWEEP:
@@ -917,24 +1092,28 @@ class LinearSource:
                 "linear: team %s has %d non-archived issues — the free plan stops at %d. "
                 "Lower `keep_done` (now %d), or archive or delete issues, before new ones "
                 "are refused.",
-                self.team, remaining, ISSUE_CAP, self.keep_done,
+                self.team, remaining, ISSUE_CAP, self.sweep_keep_done,
             )
         if archived:
             log.info("linear: archived %d finished issue(s) in team %s (keeping the newest "
-                     "%d)", archived, self.team, self.keep_done)
+                     "%d)", archived, self.team, self.sweep_keep_done)
         return archived
 
     def create_issue(self, title: str, description: str = "", priority: int = 0,
-                     blocked_by=(), parent: str | None = None) -> dict:
+                     blocked_by=(), parent: str | None = None, labels=()) -> dict:
         """📐 CMX-6 — create one issue in this team, in its first configured READY state,
         and a ``blocks`` relation from each of ``blocked_by`` (identifiers of this team).
+        🗂️ CMX-326: a project-scoped workflow puts it in its project, and its blockers and
+        parent must be issues of that project.
 
         Returns ``{"identifier", "url", "title", "warnings"}``. Raises :class:`LinearError`
         when nothing was created (a bad input, an unknown blocker, Linear refused) — the
         caller keeps the typed brief. A relation that fails AFTER the issue exists is a
         warning, not an error: the issue is real, and creating it twice would be worse.
         📏 CMX-126: ``parent`` (an identifier of this team) makes it a sub-issue of that
-        issue, inheriting its labels (so its risk) — a size-gate split's slice."""
+        issue, inheriting its labels (so its risk) — a size-gate split's slice.
+        🧹 CMX-305: ``labels`` are label NAMES, added to a parent's inherited ones; one that
+        can be neither found nor created is a warning, never a lost issue."""
         title = (title or "").strip()
         if not title:
             raise LinearError("input", "a title is required")
@@ -971,18 +1150,25 @@ class LinearSource:
                                         f"{' / '.join(self.ready_states)}")
         fields = {"teamId": team_id, "title": title, "description": description or "",
                   "priority": priority, "stateId": state_id}
+        project_id = self._project_id()
+        if project_id is not None:
+            fields["projectId"] = project_id
         if parent:
             node = found[parent.upper()]
             fields["parentId"] = node["id"]
             fields["labelIds"] = [lbl["id"] for lbl in (node.get("labels") or {}).get("nodes")
                                   or [] if isinstance(lbl, dict) and lbl.get("id")]
+        warnings = []
+        names = [str(n).strip() for n in (labels or ()) if str(n).strip()]
+        if names:
+            ids, warnings = self._label_ids(names, team_id)
+            fields["labelIds"] = list(dict.fromkeys(fields.get("labelIds", []) + ids))
         data = self._call(CREATE_ISSUE_MUTATION, {"input": fields}, cache=False)
         created = data.get("issueCreate") or {}
         issue = created.get("issue") if isinstance(created, dict) else None
         if not (isinstance(created, dict) and created.get("success") and isinstance(issue, dict)
                 and issue.get("id") and issue.get("identifier")):
             raise LinearError("graphql", "Linear did not create the issue")
-        warnings = []
         for ident, bid in blocker_ids.items():
             try:
                 rel = self._call(CREATE_RELATION_MUTATION, {"input": {
@@ -997,6 +1183,40 @@ class LinearSource:
                 warnings.append(f"could not mark {issue['identifier']} blocked by {ident}")
         return {"identifier": issue["identifier"], "url": str(issue.get("url") or ""),
                 "title": str(issue.get("title") or title), "warnings": warnings}
+
+    def _label_ids(self, names: list[str], team_id: str) -> tuple[list[str], list[str]]:
+        """🧹 CMX-305: ``(label ids, warnings)`` for label ``names`` — a workspace label or
+        this team's, else one created on the team. Only a create whose ``success`` is true
+        counts, whatever node came back. A label that can be neither read nor created is a
+        warning: the issue is still worth filing without it."""
+        try:
+            data = self._call(LABELS_BY_NAME_QUERY, {"names": names}, cache=False)
+        except LinearError as e:
+            return [], [f"could not read labels {', '.join(names)}: {e}"]
+        found: dict[str, str] = {}
+        for lbl in ((data.get("issueLabels") or {}).get("nodes") or []):
+            if not (isinstance(lbl, dict) and lbl.get("id") and lbl.get("name") in names):
+                continue
+            team = lbl["team"].get("key") if isinstance(lbl.get("team"), dict) else None
+            if team in (None, self.team):
+                found.setdefault(lbl["name"], lbl["id"])
+        ids, warnings = [], []
+        for name in names:
+            if name not in found:
+                try:
+                    made = (self._call(CREATE_LABEL_MUTATION, {"input": {
+                        "name": name, "teamId": team_id}}, cache=False)
+                        .get("issueLabelCreate") or {})
+                except LinearError as e:
+                    made = {"error": str(e)}
+                label = made.get("issueLabel") if made.get("success") is True else None
+                if not (isinstance(label, dict) and label.get("id")):
+                    warnings.append(f"label {name!r} could not be created"
+                                    + (f": {made['error']}" if made.get("error") else ""))
+                    continue
+                found[name] = label["id"]
+            ids.append(found[name])
+        return ids, warnings
 
     def issue_links(self, identifier: str) -> dict | None:
         """📏 CMX-143 — ``{"priority", "blocked_by"}`` for one issue of this team, read FRESH

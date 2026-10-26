@@ -17,7 +17,7 @@
     font-style: normal;
     font-display: swap;
 }
-/* Hebrew-capable chrome fallback — the SAME already-vendored fonts/Heebo.ttf
+/* Hebrew-capable chrome fallback — the SAME already-vendored fonts/Heebo.woff2
    app.py's _TERM_FONT_CSS offers the terminal font picker, re-declared here
    because that system only injects into the ttyd iframe, never the dashboard
    page itself — without this rule 'Heebo' in --ui-font's stack would never
@@ -25,7 +25,7 @@
    silently defeating the fallback for every Hebrew-reading viewer. */
 @font-face {
     font-family: 'Heebo';
-    src: url('fonts/Heebo.ttf') format('truetype');
+    src: url('fonts/Heebo.woff2') format('woff2');
     font-weight: 100 900;
     font-style: normal;
     font-display: swap;
@@ -56,7 +56,7 @@
        genuine code/diff content — see .term-frame below. Everything else
        (sidebar, pane headers, pane footers, modals, Work) reads --ui-font,
        the "calm desktop app" restyle's whole point ("sans chrome"). Heebo is
-       already vendored (fonts/Heebo.ttf) as the Hebrew-capable fallback the
+       already vendored (fonts/Heebo.woff2) as the Hebrew-capable fallback the
        brief asks for; it is loaded on demand the same way every other
        bundled font is (app.py's _TERM_FONT_CSS), so naming it here costs
        nothing until Hebrew text actually needs it. */
@@ -196,21 +196,6 @@ body {
     white-space: nowrap;
 }
 
-.stat-pill {
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 4px 10px;
-    font-size: 12px;
-    white-space: nowrap;
-}
-
-.stat-pill .label { color: var(--text-dim); }
-.stat-pill .value { color: var(--text); font-weight: 600; }
-.stat-pill .value.green { color: var(--green); }
-.stat-pill .value.red { color: var(--red); }
-.stat-pill .value.yellow { color: var(--yellow); }
-
 /* ---- Tabs ---- */
 
 .tabs {
@@ -271,8 +256,6 @@ body {
        overlaid the terminal's live last row instead of blank space. */
     margin-bottom: var(--term-ctx-bar-h);
 }
-.term-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap: 10px; }
-.term-grid .term-frame { height: 42vh; }
 
 /* Focus ring (CMX-377: "a thin inset ring in --accent — no glow, no thick
    border"): the pane whose embedded terminal currently holds browser focus
@@ -338,9 +321,14 @@ body {
     flex: 1 1 auto; min-width: 0; user-select: none;
     display: flex; flex-direction: row; align-items: baseline; gap: 8px; overflow: hidden;
 }
-.gs-grip { cursor: move; }
+/* CMX-329: the move cursor only where Gridstack can move a tile (grid.ts toggles
+   `.wall-movable` with enableMove); in Auto and Focus the header keeps the
+   default cursor, or the Focus strip's pointer (below). */
+.wall-movable .gs-grip { cursor: move; }
 .pane-title { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .gs-label .pane-subtitle, .gs-grip .pane-subtitle { flex: 1 1 0; min-width: 0; }
+/* CMX-241: a shell's cwd beside its `Shell` title reads `Shell · ~`. */
+.pane-subtitle.pane-cwd::before { content: '· '; }
 /* CMX-146: Claude's own auto-generated session title, dim and small under the
    pane name — a distinct record from the name itself (which is the tmux window
    name / rename), so it rides alongside it rather than replacing it. */
@@ -406,7 +394,7 @@ body {
    so mobile's forced single mode at <768px is untouched). The WORD here plus
    the `.gs-dot` SHAPE carry the state (Liav is red-weak); the Okabe-Ito
    colour below is decoration on top, never the sole signal. `tileState`
-   (wallmodel.js) is the one source of the word/class pair; this file only
+   (wallmodel.ts) is the one source of the word/class pair; this file only
    paints it.
    CMX-393: a SOFT pill with the WORD only (the mockup's) — a tint of the
    state colour behind it, no border and no glyph. The shape lives once, on
@@ -424,6 +412,8 @@ body {
 .gs-state-unknown { color: var(--text-dim); opacity: 0.85; border: 1px dashed currentColor; }
 .gs-state-testing { color: var(--ok-green); }
 .gs-state-died { color: var(--ok-vermillion); }
+/* CMX-241: a pane with no Claude in it (a plain shell): neutral, its word says what it is. */
+.gs-state-shell { color: var(--text-dim); opacity: 0.85; }
 
 .gs-menu-wrap { position: relative; flex: 0 0 auto; }
 .gs-menu-btn {
@@ -463,8 +453,11 @@ body {
     background: var(--term-bg);
     pointer-events: none;   /* never intercept gridstack's bottom resize handle */
 }
+/* CMX-242: the strip sits INSIDE the focus ring (the pane's 2px inset ::before ring, z 6,
+   above this bar), never under it: at bottom 0 the ring covered it on exactly the pane you
+   were looking at. The 2px insets are that ring's width. Width is the context %, of the bar. */
 .term-ctx-fill {
-    position: absolute; left: 0; right: 0; bottom: 0; height: 2px; width: 0;
+    position: absolute; left: 2px; right: 2px; bottom: 2px; height: 2px; width: 0; max-width: calc(100% - 4px);
     background: var(--green); transition: width 0.4s ease;
 }
 .term-ctx-fill.ctx-warn { background: var(--yellow); }
@@ -482,14 +475,15 @@ body {
     white-space: nowrap; font-variant-numeric: tabular-nums;
 }
 .gs-branch { flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; }
+.gs-branch-icon { vertical-align: -1px; margin-right: 3px; }
 .gs-ctx.ctx-warn { color: var(--yellow); }
 .gs-ctx.ctx-danger { color: var(--red); }
 
 /* --- Wall redesign slice 1: the meta row's model + PR + cost chips, folded
    into this SAME bottom bar rather than a separate strip (enrich, don't
    duplicate — .gs-branch/.gs-ctx above already live here). Wall-only
-   (_ctxBarHTML's draggable gate), left-grouped in normal flow same as
-   .gs-branch/.gs-ctx. */
+   (features/tilefoot draws them on a wall tile only), left-grouped in normal
+   flow same as .gs-branch/.gs-ctx. */
 .gs-model, .gs-cost {
     flex: 0 0 auto; font-weight: 500; line-height: 1;
     white-space: nowrap; font-variant-numeric: tabular-nums;
@@ -499,6 +493,7 @@ body {
     color: var(--ok-sky); text-decoration: none; pointer-events: auto;
 }
 .gs-pr:hover { text-decoration: underline; }
+.gs-pr-flag { vertical-align: -1px; margin-right: 3px; }
 /* CMX-41: a merged/closed/draft PR is history, not a call to action. */
 .gs-pr.gs-pr-dim { color: var(--text-dim); font-weight: 500; }
 
@@ -580,12 +575,14 @@ body {
    same (#term-approvals). Each is hidden while it has nothing to say. A phone
    has no row controls (the "+" FAB starts sessions) — there the floating pills stay. */
 #term-shares, #term-approvals { display: none; }
+/* CMX-240: each pill copy is a React island; its slot adds no box of its own. */
+.shares-pill-slot { display: contents; }
 @media (min-width: 769px) {
     #term-shares:not([hidden]), #term-approvals:not([hidden]) {
         display: inline-flex; height: var(--ctl-h-sm); margin-left: auto;
         padding: 0 11px; font-size: 12px;
     }
-    #term-shares:not([hidden]) ~ #term-approvals { margin-left: 0; }
+    #shares-pill-row:has(> #term-shares:not([hidden])) ~ .island-slot #term-approvals { margin-left: 0; }
     body:has(#panel-terminals.active) .safety-float #btn-shares,
     body:has(#panel-terminals.active) .safety-float #btn-approvals { display: none; }
 }
@@ -595,8 +592,12 @@ body {
    inline beside it and the chevron turns up. The toggle is as tall as the
    presets' segmented track (32px) so collapsing never changes the toolbar
    row's height — the Wall below does not jump. */
+#term-wall-grid { display: inline-flex; gap: 6px; align-items: center; }
+#term-wall-grid[hidden] { display: none; }
 #term-grid-row { display: inline-flex; gap: 6px; align-items: center; }
 #term-grid-row[hidden] { display: none; }
+#term-grid-row .gl-label { color: var(--text-dim); font-size: 11px; }
+#term-lock-btn, #term-auto-btn, #term-focus-btn { margin-left: 6px; }
 #term-grid-toggle { gap: 4px; padding: 0 7px; height: var(--ctl-h-sm); border-radius: 9px; background: var(--surface); }
 #term-grid-toggle .grid-chevron { display: inline-flex; transition: transform .15s ease; }
 #term-grid-toggle.grid-open .grid-chevron { transform: rotate(180deg); }
@@ -604,7 +605,8 @@ body {
 /* Pane title: rename target. Subtle dotted underline on hover hints it's
    editable; the inline edit input matches the dark header. */
 .pane-title { cursor: text; }
-.gs-grip .pane-title { cursor: move; }
+.gs-grip .pane-title { cursor: default; }
+.wall-movable .gs-grip .pane-title { cursor: move; }
 .pane-title:hover { text-decoration: underline dotted; text-underline-offset: 2px; }
 .pane-title-edit {
     font: inherit; color: var(--text); background: var(--bg);
@@ -613,12 +615,6 @@ body {
 }
 
 .gs-keys { flex: 0 0 auto; display: flex; align-items: stretch; gap: 3px; }
-/* Vertical divider separating the nav/key buttons from the window controls
-   (minimize / maximize / close), so the three window buttons read as a group. */
-.gs-keys-sep {
-    width: 1px; align-self: stretch; margin: 2px 4px;
-    background: var(--border);
-}
 .gs-win-ctl { display: inline-flex; align-items: center; gap: 3px; }
 .gs-keys button {
     font: inherit; font-size: 11px; line-height: 1; padding: 4px 7px;
@@ -630,15 +626,6 @@ body {
    `.gs-min-btn, .gs-max-btn { display: none }` mobile rule below (same trap
    the pane-header-v2 comment above already flags for this pair of classes). */
 .gs-min-btn svg, .gs-max-btn svg { vertical-align: middle; }
-/* Mobile single-pane fullscreen toggle (paneHead, terminals.js) — same
-   base-hide/mobile-reveal shape as `.term-switcher`/`.term-keybar` below
-   (not the specificity-trap shape the comment above warns about: this is a
-   *different* selector, not `.gs-min-btn`/`.gs-max-btn` themselves). Belt and
-   suspenders: paneHead() only ever renders this button when
-   !draggable && _isMobileTerm(), so it never exists in a desktop DOM at all —
-   this base rule only guards a stale render surviving a resize past 768px. */
-.gs-mobile-full-btn { display: none; }
-.gs-mobile-full-btn svg { vertical-align: middle; }
 .gs-keys button:hover { border-color: var(--accent); }
 .gs-keys button.btn-accent { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
 /* × kill — only rendered for non-managed sessions. Red hover signals it's
@@ -653,23 +640,21 @@ body {
    between the status dot and the name. CMX-114: rows render as a LABELED VERTICAL
    list — the topbar `#primary-menu`'s look (nav.js/index.html), reused
    verbatim via the same `overflow-menu` (min-width) and `.popover-item.ov-item`
-   (icon+label row) classes. `.popover` (position:fixed — top/left set by
-   togglePaneOverflow) still supplies the fixed box that escapes
-   .grid-stack-item-content's overflow:hidden clip; this just stacks rows. */
+   (icon+label row) classes. CMX-241: the kit's Menu (Radix) portals it to <body>
+   and places it, so it escapes .grid-stack-item-content's overflow:hidden clip;
+   this just stacks rows. */
 .pane-overflow-menu { display: flex; flex-direction: column; align-items: stretch; gap: 1px; }
-.pane-overflow-menu[hidden] { display: none; }
 /* Each row IS the real state-bearing .gs-share-btn/.gs-orch-btn/.gs-pin-btn/
-   .gs-port button (not a wrapper around it) — reset its UA button chrome back
-   to a plain full-width popover row, scoped to this menu (not `.gs-keys`,
-   which now holds only the window controls — CMX-117 moved the menu out from
-   under it). */
-.pane-overflow-menu button.popover-item {
+   .gs-port menu item (not a wrapper around it), drawn as a plain full-width
+   popover row, scoped to this menu (not `.gs-keys`, which holds only the window
+   controls — CMX-117 moved the menu out from under it). */
+.pane-overflow-menu .popover-item {
     display: flex; align-items: center; gap: 10px; width: 100%;
     padding: 7px 10px; font-size: 12px; text-align: left; line-height: 1.3;
     font: inherit; border: 0; background: none; border-radius: 4px; color: var(--text);
 }
-.pane-overflow-menu button.popover-item:hover { background: var(--accent); color: var(--on-accent); }
-.pane-overflow-menu button.popover-item:hover .ov-ic { color: var(--on-accent); }
+.pane-overflow-menu .popover-item:hover { background: var(--accent); color: var(--on-accent); }
+.pane-overflow-menu .popover-item:hover .ov-ic { color: var(--on-accent); }
 
 /* --- collab: share button + presence facepile ------------------------------ */
 /* Share/Orchestrator/Pin: neutral until active, then a solid colour fill so
@@ -678,12 +663,12 @@ body {
    --accent for share, --ok-blue for orchestrator, --yellow for pin).
    CMX-116 lesson (do not regress): the base row rule above and this `.on` fill
    are the SAME node, so the higher-specificity selector wins regardless of
-   source order — `.pane-overflow-menu button.X.on` (0,3,1) outranks
-   `.pane-overflow-menu button.popover-item` (0,2,1) unconditionally, unlike a
+   source order — `.pane-overflow-menu .X.on` (0,3,0) outranks
+   `.pane-overflow-menu .popover-item` (0,2,0) unconditionally, unlike a
    bare `.X.on` (0,2,0) would. */
-.pane-overflow-menu button.gs-share-btn.on { color: var(--on-accent); background: var(--accent); }
-.pane-overflow-menu button.gs-orch-btn.on { color: #0d1117; background: var(--ok-blue); }
-.pane-overflow-menu button.gs-pin-btn.on { color: #0d1117; background: var(--yellow); }
+.pane-overflow-menu .gs-share-btn.on { color: var(--on-accent); background: var(--accent); }
+.pane-overflow-menu .gs-orch-btn.on { color: #0d1117; background: var(--ok-blue); }
+.pane-overflow-menu .gs-pin-btn.on { color: #0d1117; background: var(--yellow); }
 .gs-share-btn.on .ov-ic, .gs-orch-btn.on .ov-ic, .gs-pin-btn.on .ov-ic { color: inherit; }
 /* The peer-count badge used to float over a small square icon button (the
    old horizontal strip); in a full-width row it just rides the row's right
@@ -714,20 +699,6 @@ body {
     display: inline-flex; align-items: center; height: 18px;
     transform: scale(0.78); transform-origin: right center;
 }
-.gs-presence .pf-dot {
-    width: 17px; height: 17px; border-radius: 50%; color: #fff;
-    display: inline-flex; align-items: center; justify-content: center;
-    font-size: 9px; font-weight: 700; box-shadow: 0 0 0 1.5px var(--surface);
-}
-.gs-presence .pf-more { font-size: 10px; color: var(--text-dim); font-weight: 600; }
-.gs-presence .pf-agent {
-    position: relative; display: inline-flex; align-items: center;
-    font-size: 12px; color: var(--text-dim); margin-left: 1px;
-}
-.gs-presence .pf-agent .pf-pip {
-    position: absolute; bottom: -1px; right: -3px; width: 6px; height: 6px;
-    border-radius: 50%; box-shadow: 0 0 0 1.5px var(--surface);
-}
 /* Share toast — throwaway bubble anchored under the pane header. */
 .term-share-toast {
     position: absolute; top: 100%; right: 8px; margin-top: 4px; z-index: 20;
@@ -737,22 +708,13 @@ body {
     font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 
-/* tsp-lbl/tsp-row/tsp-in/tsp-copy/tsp-warn are the join-link/pairing-code row
-   markup (_shareInfoRowsHTML), rendered inside the "Active shares" sheet
-   (.ss-row-body) — the sole place a share's link + code are shown. */
-.shares-sheet .tsp-lbl { display: block; margin: 8px 0 4px; font-size: 10.5px; color: var(--muted, #7d8590); }
-.shares-sheet .tsp-hint { opacity: 0.8; }
-.shares-sheet .tsp-row { display: flex; gap: 6px; }
-.shares-sheet .tsp-in {
-    flex: 1; min-width: 0; padding: 6px 8px; border-radius: 6px;
-    background: var(--bg, #0a0c11); color: var(--text); border: 1px solid var(--border);
-    font: 600 12px/1 ui-monospace, Menlo, Consolas, monospace;
-}
-.shares-sheet .tsp-copy {
-    cursor: pointer; border-radius: 6px; border: 1px solid var(--border);
-    background: var(--surface); color: var(--text); font-size: 11.5px; padding: 6px 10px;
-}
-.shares-sheet .tsp-copy:hover { border-color: var(--accent); }
+/* A share's join link + pairing code (ShareInfoRows, CMX-239), inside the "Active shares"
+   sheet (.ss-row-body): the sole place they are shown. The sheet is narrow, so its field
+   rows (these and the UNSANDBOXED upgrade's, CMX-240) stack the label above the control. */
+.shares-sheet .field-row { grid-template-columns: minmax(0, 1fr); margin: 6px 0 0; }
+.shares-sheet .field-row > * { grid-column: 1; }
+.shares-sheet .field-label { font-size: 10.5px; color: var(--muted, #7d8590); }
+.ss-row-body .ui-copy-in { font: 600 12px/1 ui-monospace, Menlo, Consolas, monospace; }
 .shares-sheet .tsp-warn { color: var(--warn, #d29922); font-size: 11.5px; margin: 4px 0; }
 
 /* Host resources strip (#resources-strip, CMX-172) — three compact CPU/RAM/Disk
@@ -896,6 +858,7 @@ body {
     font-size: 11px; font-weight: 700; letter-spacing: 0.02em;
 }
 .gs-unsafe-banner[hidden] { display: none; }
+.gs-unsafe-banner svg, .gs-net-badge svg, .gs-share-mode svg { vertical-align: -2px; }
 
 /* A web-mode sandboxed session (CMX-418): the pane can reach public web hosts. */
 .gs-net-badge {
@@ -905,27 +868,17 @@ body {
 }
 .gs-net-badge[hidden] { display: none; }
 
-/* Share dialog (CMX-403) — reuses the Active-shares sheet chrome. */
-.share-dialog .sd-opt {
-    display: flex; gap: 10px; align-items: flex-start; cursor: pointer;
-    padding: 10px; margin: 8px 0; border: 1px solid var(--border); border-radius: 8px;
-}
-.share-dialog .sd-opt input { margin-top: 2px; }
-.share-dialog .sd-opt > span { display: flex; flex-direction: column; gap: 3px; font-size: 12.5px; }
+/* Share dialog (CMX-403; React since CMX-239): the kit's Dialog and RadioGroup, on the
+   modal layer (above the Wall and the safety float, under its own Select's list). */
+.modal.share-dialog { width: 460px; }
+.share-dialog .sd-opt { margin: 8px 0; }
+.share-dialog .sd-opt strong { display: flex; align-items: flex-start; gap: 6px; }
+.share-dialog .sd-opt strong svg { flex: 0 0 auto; margin-top: 2px; }
 .share-dialog .sd-desc { color: var(--text-dim); font-size: 11.5px; }
 .share-dialog .sd-reason { color: var(--warn, #d29922); font-size: 11.5px; }
-.share-dialog .sd-disabled { cursor: not-allowed; opacity: 0.7; }
 .share-dialog .sd-unsafe { border-color: var(--ok-vermillion, #d55e00); }
 .share-dialog .sd-confirm { margin: 4px 0 8px; }
-.share-dialog .sd-confirm .tsp-in { width: 100%; box-sizing: border-box; }
-.share-dialog .sd-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 10px; }
-.share-dialog .sd-actions button {
-    cursor: pointer; border-radius: 6px; border: 1px solid var(--border);
-    background: var(--surface); color: var(--text); font-size: 12.5px; padding: 7px 14px;
-}
-.share-dialog .sd-share { border-color: var(--accent); }
-.share-dialog .sd-share.sd-danger { background: var(--ok-vermillion, #d55e00); border-color: var(--ok-vermillion, #d55e00); color: #fff; }
-.share-dialog .sd-share:disabled { opacity: 0.5; cursor: not-allowed; }
+.share-dialog .sd-error { color: var(--warn, #d29922); font-size: 12px; margin: 6px 0 0; }
 .shares-sheet .ss-mode { font-size: 12px; }
 .shares-sheet .ss-mode-unsafe {
     background: var(--ok-vermillion, #d55e00); color: #fff; border-radius: 4px;
@@ -935,7 +888,9 @@ body {
 
 /* Decisions inbox button — the sidebar head's #btn-decisions (icon-btn) plus
    its state dot, colour-only decoration on top of a title tooltip (never the
-   sole signal — Liav is red-weak, same rule as .decisions-chip below). */
+   sole signal — Liav is red-weak, same rule as .decisions-chip below). Its
+   island slot (#decisions-island, CMX-228) takes no box of its own. */
+.decisions-island { display: contents; }
 #btn-decisions { position: relative; }
 .decisions-dot {
     position: absolute; top: 6px; right: 6px; width: 8px; height: 8px;
@@ -946,7 +901,7 @@ body {
 .decisions-dot.dot-bad { background: var(--ok-vermillion); }
 .decisions-dot.dot-warn { background: var(--ok-orange); }
 
-/* The unread-count badge (decisionsmodel.js) — a SEPARATE signal from the dot
+/* The unread-count badge (features/decisions/model.ts) — a SEPARATE signal from the dot
    above (state vs. "how many you haven't looked at"), so it sits at the
    opposite corner and reads as a number, never colour-only (same red-weak
    rule as the dot/chip: the digits carry the fact, urgency colour is on top). */
@@ -970,6 +925,9 @@ body {
 .shares-sheet .ss-hd { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; font-weight: 700; font-size: 13px; }
 .shares-sheet .ss-close { margin-left: auto; background: none; border: 0; color: var(--muted, #7d8590);
     font-size: 20px; cursor: pointer; line-height: 1; padding: 0 4px; }
+.shares-sheet .ss-hd h3 { margin: 0; font: inherit; }
+.shares-sheet .ss-mode-opt svg, .shares-indicator svg { flex: 0 0 auto; vertical-align: -2px; }
+.shares-sheet .ss-confirm-go { margin-top: 8px; min-height: 28px; }
 .shares-sheet .ss-sub { color: var(--muted, #7d8590); font-size: 11.5px; margin-bottom: 11px; }
 .shares-sheet .ss-list { display: flex; flex-direction: column; gap: 8px; max-height: 50vh; overflow-y: auto; }
 .shares-sheet .ss-row {
@@ -1008,7 +966,6 @@ body {
 .shares-sheet .ss-mode-desc { color: var(--text-dim); font-size: 11.5px; margin-bottom: 4px; }
 .shares-sheet .ss-mode-desc-unsafe { color: var(--ok-vermillion, #d55e00); font-weight: 600; }
 .shares-sheet .ss-mode-reason, .shares-sheet .ss-mode-err { color: var(--warn, #d29922); font-size: 11.5px; margin-bottom: 4px; }
-.shares-sheet .ss-mode-err[hidden], .shares-sheet .ss-unsafe-confirm[hidden] { display: none; }
 .shares-sheet .ss-confirm-go {
     cursor: pointer; border-radius: 6px; padding: 0 12px; font-size: 12px; font-weight: 700;
     background: var(--ok-vermillion, #d55e00); border: 1px solid var(--ok-vermillion, #d55e00); color: #fff;
@@ -1029,8 +986,6 @@ body {
     .shares-sheet .ss-stop { padding: 11px 16px; min-height: 44px; }
     .shares-sheet .ss-stopall { min-height: 48px; }
     .shares-sheet .ss-mode-opt, .shares-sheet .ss-confirm-go { min-height: 44px; }
-    .shares-sheet .tsp-in { padding: 11px 12px; font-size: 14px; }
-    .shares-sheet .tsp-copy { min-height: 44px; padding: 0 16px; }
     /* Keep the amber pill readable but compact in .safety-float on a phone. */
     .shares-indicator { height: 38px; padding: 0 11px; }
     /* CMX-135: "⚖️ 2 pending", not "…approvals" — the full pill pushed .safety-float
@@ -1044,6 +999,7 @@ body {
    would otherwise win on source order and let the terminal text show through),
    so it gets a SOLID surface bg + shadow and reads as a popup over the pane. */
 .term-pane, .grid-stack-item-content { position: relative; }
+.pane-kill-confirm .pane-kill-error { color: var(--red); }
 .kanban-confirm.pane-kill-confirm {
     position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
     z-index: 20; margin: 0; width: max-content; max-width: 90%;
@@ -1074,7 +1030,7 @@ body {
     border: 2px solid var(--border); border-top-color: var(--accent);
     border-radius: 50%; animation: term-spin 0.8s linear infinite;
 }
-.term-retry { color: var(--accent); cursor: pointer; }
+.term-retry { /* a <button> since CMX-246, drawn as the link it was */ color: var(--accent); cursor: pointer; background: none; border: 0; padding: 0; font: inherit; text-decoration: underline; }
 @keyframes term-spin { to { transform: rotate(360deg); } }
 
 /* Maximize / shrink: expand the pane to fill the wall area IN PLACE rather
@@ -1131,12 +1087,30 @@ body.pane-is-maximized .grid-stack-item:not(:has(.pane-maximized)) {
    top/left/right gutters and the no-dock case are exactly as before. _wallFill
    reads BOTH margins off the computed style, so the panes still end 4px
    (the margin-top) above the dock. */
+/* CMX-242 (Liav 2026-10-19): ONE row whatever the count. It used to wrap to a 2nd and 3rd
+   row as panes were minimized, stealing height from every pane on the wall. The chips scroll
+   sideways instead (a vertical wheel scrolls them too, features/walldock), a fade marks each
+   edge that hides more, and the tray's height never changes with the number of chips. */
 #term-min-dock {
-    display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+    display: flex; flex-wrap: nowrap; align-items: center; gap: 6px;
+    max-height: 32px; overflow: hidden;
     margin-top: 4px; margin-bottom: -10px; padding: 2px 8px;
     background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
 }
-.min-dock-label { color: var(--text-dim); font-size: 11px; margin-right: 2px; }
+#term-min-dock[hidden] { display: none; }
+.min-dock-label { flex: 0 0 auto; color: var(--text-dim); font-size: 11px; margin-right: 2px; white-space: nowrap; }
+.min-dock-chips {
+    display: flex; flex-wrap: nowrap; align-items: center; gap: 6px;
+    flex: 1 1 auto; min-width: 0;
+    overflow-x: auto; overflow-y: hidden; scrollbar-width: none;
+}
+.min-dock-chips::-webkit-scrollbar { display: none; }
+.min-dock-chips > .min-chip { flex-shrink: 0; }
+.min-dock-chips.fade-start { mask-image: linear-gradient(to right, transparent, #000 24px); }
+.min-dock-chips.fade-end { mask-image: linear-gradient(to left, transparent, #000 24px); }
+.min-dock-chips.fade-start.fade-end {
+    mask-image: linear-gradient(to right, transparent, #000 24px, #000 calc(100% - 24px), transparent);
+}
 
 /* Pin the minimized dock to the bottom of the wall. The panel fills the canvas
    as a flex column and #term-stage grows to take the slack, so the dock sits at
@@ -1155,8 +1129,8 @@ body.pane-is-maximized .grid-stack-item:not(:has(.pane-maximized)) {
    3-state dialect (filled/hollow/glow-ring) and only the sidebar got the new
    4 shapes, AND used the wrong shape per state — see the per-state comments
    below). Every one of these elements wears the SAME `.term-status-dot
-   <state>` pair; _colorTermDots (terminals.js) computes `<state>` from the
-   SAME tileState() (wallmodel.js) the pane's `.gs-state` word pill already
+   <state>` pair; features/panehead and the dock's chips compute `<state>` from the
+   SAME tileState() (wallmodel.ts) the pane's `.gs-state` word pill already
    used, so the dot and the pill can never disagree, and nav.js's sidebar row
    computes the same four class names off its own status predicates. Exact
    spec (Liav-approved mockup 2026-09-28, `renderVals()`'s palette): working =
@@ -1164,9 +1138,10 @@ body.pane-is-maximized .grid-stack-item:not(:has(.pane-maximized)) {
    orange), done = check (dim — deliberately NOT coloured; a checkmark's
    silhouette alone is the signal, and it would otherwise be the only shape
    here to double as a second colour cue), idle = hollow ring (dim outline).
-   Shape is reinforcement on top of the `.ar-state`/`.gs-state` WORD that
-   already carries the non-hue signal elsewhere (dashboard_scale_nav_a11y's
-   GUARD 3) — never the only cue. */
+   Shape is reinforcement on top of the WORD that carries the non-hue signal:
+   the pane's `.gs-state` pill, and on a sidebar row (CMX-121) the dot's own
+   aria-label and the row's tooltip (dashboard_scale_nav_a11y's GUARD 3) —
+   never the only cue. */
 .term-status-dot {
     flex: 0 0 auto; width: 8px; height: 8px; border-radius: 50%; box-sizing: border-box;
     display: inline-block; background: var(--text-dim); border: none; box-shadow: none;
@@ -1219,9 +1194,7 @@ body.pane-is-maximized .grid-stack-item:not(:has(.pane-maximized)) {
 .min-chip-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .min-chip-icon { flex: 0 0 auto; display: inline-flex; align-items: center; opacity: 0.7; }
 .min-chip-icon svg { display: block; }
-/* Visible (active) panes: accent left-border so they read as "on the wall".
-   Minimized panes: dimmed/muted. */
-.min-chip-active { border-left: 3px solid var(--accent); }
+/* A minimized pane's chip: dimmed/muted. */
 .min-chip-minimized { opacity: 0.55; background: var(--surface); }
 .min-chip-minimized .min-chip-title { color: var(--text-dim); }
 /* Waiting on user input: yellow ring on the chip; un-dim if minimized so it
@@ -1238,18 +1211,16 @@ body.pane-is-maximized .grid-stack-item:not(:has(.pane-maximized)) {
 /* Wall redesign slice 1: when the action bar (below) is showing, it stacks
    ABOVE the ctx bar (same absolutely-positioned-footer technique as that bar
    uses against the iframe) — so the iframe needs to reserve that much MORE
-   margin. `.has-term-action` is toggled by _applyWallTileFrame the instant
-   the bar's kind changes, in lockstep with the bar's own [hidden]. */
+   margin. `.has-term-action` is toggled by the footer (features/tilefoot) the
+   instant the bar's kind changes, in lockstep with the bar's own [hidden]. */
 .grid-stack-item-content.has-term-action .term-frame {
     margin-bottom: calc(var(--term-ctx-bar-h) + var(--term-action-bar-h));
 }
 /* --- Wall redesign slice 1: the action bar. Amber (Approve/Answer, a
-   wantsHuman pane) or blue (Review, a finished pane with a PR) — GLYPH + WORD
-   still carry the state here too (◆/✓, matching the header pill), colour is
-   decoration. Sends its action via the EXISTING /api/term/key path
-   (chela.termActionClick -> termKeyFor), no new endpoint. Always rendered,
-   hidden by default — _applyWallTileFrame fills content and un-hides it, the
-   same pattern the ctx bar's chips already use. */
+   wantsHuman pane) or blue (Review, a finished pane with a PR) — ICON + WORD
+   still carry the state here too, colour is decoration. Sends its action via
+   the EXISTING /api/term/key path, no new endpoint. Always rendered on a wall
+   tile, hidden while there is nothing to do (features/tilefoot). */
 :root { --term-action-bar-h: 26px; }
 .term-action-bar {
     position: absolute; left: 0; right: 0; bottom: var(--term-ctx-bar-h); z-index: 5;
@@ -1327,7 +1298,7 @@ body.term-dragging { overflow: hidden; }
    The gesture reuses `.gs-dragging` (above) to neutralise the iframes' pointer
    events — it must NOT hide the terminals (`.term-dragging`): watching them while
    you wire them is the whole point. */
-/* Layout/colour come from `.pane-overflow-menu button.popover-item` (above,
+/* Layout/colour come from `.pane-overflow-menu .popover-item` (above,
    higher specificity) — this just keeps the drag affordance: dimmed until
    hovered, crosshair cursor for the drag-to-wire gesture. */
 .gs-port { cursor: crosshair; opacity: 0.75; }
@@ -1335,6 +1306,8 @@ body.term-dragging { overflow: hidden; }
 /* The live wire: an SVG over the whole stage. Above the tiles and gridstack's own
    dragged item (z 100), below a maximized pane's own chrome (z 150 → 160 sits over
    it, which is fine: the wire is transient and never intercepts a click). */
+/* each wire's own container (features/wire): no box of its own, so the SVG is placed by the stage */
+.wire-overlay-box { display: contents; }
 .wire-overlay {
     position: absolute; inset: 0; width: 100%; height: 100%;
     pointer-events: none; z-index: 160;
@@ -1367,13 +1340,13 @@ body.term-dragging { overflow: hidden; }
     background: rgba(0, 0, 0, 0.15); transform: scale(1.15);
 }
 /* In a room: a 3px stripe in the room's colour along the TOP of the header —
-   PAIRED WITH A NON-HUE CUE (the badge below carries the room's own name + a 🔌
-   glyph), because hue is never the only signal here.
+   PAIRED WITH A NON-HUE CUE (the badge below carries the room's own name + a plug
+   icon), because hue is never the only signal here.
    CMX-104: a stripe, not a whole-pane ring. The old room-coloured border + 1px
    outer ring was a third ring style beside focus and waiting, and was read as
    focus (or as an ownership marker). Inset on the header itself, so it paints
    above the header's own background and never shifts the layout. */
-.grid-stack-item-content.in-room > .gs-head {
+.grid-stack-item-content.in-room .gs-head {
     box-shadow: inset 0 3px 0 0 var(--room-accent, var(--accent));
 }
 .gs-room {
@@ -1383,8 +1356,14 @@ body.term-dragging { overflow: hidden; }
     color: var(--text); background: color-mix(in srgb, var(--room-accent, var(--accent)) 22%, transparent);
     border: 1px solid var(--room-accent, var(--accent));
 }
+.gs-room svg { vertical-align: -2px; margin-right: 3px; }
 .gs-room:hover { background: color-mix(in srgb, var(--room-accent, var(--accent)) 40%, transparent); }
 /* On-screen key bar: sticky bottom dock, collapsible, grouped + inverted-T D-pad */
+/* The keybar island's slot adds no box: #term-bar stays the panel's own sticky child. */
+.keybar-island { display: contents; }
+/* CMX-219: an island that draws one control in a legacy row (.safety-float, the Wall's toolbar,
+   the sidebar) adds no box either: the control lays out as the row's own child. */
+.island-slot { display: contents; }
 #term-stage { padding-bottom: 4px; }
 #term-bar {
     flex-direction: column;
@@ -1489,60 +1468,6 @@ body.term-dragging { overflow: hidden; }
     --ok-purple: #CC79A7;   /* ▸ prompt    */
 }
 
-.feed-list { display: flex; flex-direction: column; gap: 12px; font-size: 12px; }
-
-/* --- the chips (one per row class, rendered from feedmodel.js) --- */
-.feed-chips { display: flex; gap: 6px; flex-wrap: wrap; }
-.feed-chip {
-    border: 1px solid var(--border); background: transparent; color: var(--text-dim);
-    border-radius: 999px; padding: 4px 10px; font-size: 12px; cursor: pointer;
-}
-.feed-chip:hover { color: var(--text); border-color: var(--accent); }
-/* Active = fill + weight + ring, never hue alone. */
-.feed-chip.active {
-    background: var(--surface); color: var(--text); font-weight: 600;
-    border-color: var(--text-dim); box-shadow: inset 0 0 0 1px var(--border);
-}
-
-/* --- a lane --- */
-.feed-lane { border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
-/* An agent that needs you: a heavy left rule + the ◆ NEEDS YOU badge in the header.
-   The rule is thickness, not hue — it reads in greyscale. */
-.feed-lane.lane-attention { border-left: 4px solid var(--ok-orange); }
-.feed-lane.lane-system { opacity: 0.85; }
-.lane-head {
-    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
-    padding: 8px 12px; cursor: pointer; border-bottom: 1px solid var(--border);
-}
-.lane-head:hover { background: var(--surface-2, var(--surface)); }
-.lane-fold { color: var(--text-dim); width: 10px; }
-.lane-name { font-weight: 600; color: var(--text); }
-.lane-wid, .lane-count { color: var(--text-dim); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-.lane-project { color: var(--text-dim); }
-.lane-count { margin-left: auto; }
-.lane-status { font-size: 11px; }
-.lane-status-waiting { color: var(--ok-orange); font-weight: 600; }
-.lane-status-busy { color: var(--ok-blue); }
-.lane-status-idle, .lane-status-gone, .lane-status-system { color: var(--text-dim); }
-.lane-needs {
-    font-size: 11px; font-weight: 700; letter-spacing: 0.04em;
-    padding: 2px 8px; border-radius: 999px;
-    border: 1px solid var(--ok-orange); color: var(--text);
-    background: rgba(230, 159, 0, 0.16);
-}
-/* A dead window whose PR is still open (CMX-62). Same shape as NEEDS YOU because it is
-   the same kind of claim on you — but a different WORD, and a dotted rule so the two
-   read apart in greyscale: hue is decoration, never the signal. */
-.lane-needs.lane-review { border-style: dotted; background: rgba(86, 180, 233, 0.14); }
-.lane-rows { display: flex; flex-direction: column; }
-
-/* The folded graveyard: one row for every finished agent, saying what it holds. */
-.feed-graveyard {
-    border: 1px dashed var(--border); border-radius: 8px;
-    padding: 8px 12px; cursor: pointer; background: var(--surface);
-}
-.feed-graveyard:hover { border-color: var(--accent); }
-
 /* --- a row --- */
 .feed-row {
     display: grid; grid-template-columns: 56px 72px 108px auto 1fr;
@@ -1550,7 +1475,7 @@ body.term-dragging { overflow: hidden; }
     padding: 5px 10px; border-bottom: 1px solid var(--border);
 }
 .feed-row:last-child { border-bottom: none; }
-.feed-seq, .feed-ts, .feed-wid { color: var(--text-dim); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.feed-ts, .feed-wid { color: var(--text-dim); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .feed-glyph { font-weight: 600; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; white-space: nowrap; }
 .feed-summary { color: var(--text); overflow-wrap: anywhere; }
 .feed-cls-gate .feed-glyph { color: var(--ok-orange); }
@@ -1561,18 +1486,6 @@ body.term-dragging { overflow: hidden; }
 .feed-cls-other .feed-glyph { color: var(--ok-sky); }
 .feed-cls-tool .feed-glyph { color: var(--text-dim); }
 
-/* What the filter is hiding — counted and named, never swallowed. */
-.feed-hidden {
-    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
-    padding: 6px 10px; color: var(--text-dim); font-size: 11px;
-    border-bottom: 1px solid var(--border);
-}
-.feed-show-btn {
-    border: 1px solid var(--border); background: transparent; color: var(--text);
-    border-radius: 6px; padding: 2px 8px; font-size: 11px; cursor: pointer;
-}
-.feed-show-btn:hover { border-color: var(--accent); }
-
 .feed-gap {
     padding: 8px 10px; margin-bottom: 8px; border-radius: 6px;
     background: rgba(210, 153, 34, 0.12); border: 1px solid var(--yellow);
@@ -1581,12 +1494,13 @@ body.term-dragging { overflow: hidden; }
 @media (max-width: 768px) {
     .feed-row { grid-template-columns: 48px 64px 1fr; }
     .feed-wid, .feed-summary { grid-column: 1 / -1; }
-    .lane-count { margin-left: 0; }
 }
 
 .work-toolbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
-.work-toolbar-hint { color: var(--text-dim); font-size: 12px; }
-.work-toolbar-hint code { background: rgba(110, 118, 129, 0.18); padding: 1px 5px; border-radius: 4px; }
+.fleet-pause { border: 1px solid var(--border); border-radius: 6px; padding: 8px 12px; margin-bottom: 14px; font-size: 12px; }
+.fleet-pause-head { margin: 0 0 4px; }
+.fleet-pause-empty { margin: 0; color: var(--text-dim); }
+.fleet-pause-list { margin: 0; padding-left: 18px; }
 
 .work-empty {
     max-width: 560px;
@@ -1604,12 +1518,6 @@ body.term-dragging { overflow: hidden; }
     background: rgba(110, 118, 129, 0.18);
     padding: 1px 5px; border-radius: 4px; font-size: 11.5px;
 }
-.work-empty-cta {
-    display: inline-block; cursor: pointer;
-    background: #1f6feb; border: 1px solid #1f6feb; color: #fff;
-    padding: 8px 16px; border-radius: 6px; font-size: 13px; font-weight: 500;
-}
-.work-empty-cta:hover { background: #388bfd; }
 .work-empty-hint { font-size: 11px; color: var(--text-dim); margin-top: 12px; }
 .work-empty-hint code {
     background: rgba(110, 118, 129, 0.18);
@@ -1629,47 +1537,6 @@ body.term-dragging { overflow: hidden; }
 .init-result:empty { display: none; }
 .init-result.ok { color: var(--text); }
 .init-result.err { color: var(--red); }
-
-/* ---- Agent grid ---- */
-
-.agent-grid {
-    display: flex;
-    gap: 12px;
-    align-items: stretch;
-    flex-wrap: wrap;
-}
-.agent-card { flex: 1 1 280px; min-width: 280px; max-width: 400px; }
-.pipeline-arrow {
-    display: flex;
-    align-items: center;
-    color: var(--text-dim);
-    font-size: 20px;
-    padding: 0 2px;
-    flex-shrink: 0;
-}
-.pipeline-arrow::after { content: '→'; }
-
-.agent-card {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 14px;
-    position: relative;
-    display: flex;
-    flex-direction: column;
-}
-.agent-card .context-bar-wrap {
-    margin-top: auto;
-}
-
-.agent-card .agent-name {
-    font-size: 14px;
-    font-weight: 600;
-    margin-bottom: 6px;
-}
-/* The name links to the agent's live pane (selectAgent → focusPaneByWid). */
-.agent-name-link { cursor: pointer; }
-.agent-name-link:hover { color: var(--accent); text-decoration: underline; }
 
 .context-bar-wrap {
     margin-top: 8px;
@@ -1694,14 +1561,6 @@ body.term-dragging { overflow: hidden; }
     color: var(--text-dim);
 }
 
-.agent-card .agent-meta {
-    font-size: 11px;
-    color: var(--text-dim);
-    line-height: 1.8;
-}
-
-.agent-card .agent-meta span { display: block; }
-
 .health-dot {
     display: inline-block;
     width: 8px;
@@ -1716,36 +1575,7 @@ body.term-dragging { overflow: hidden; }
 .health-dot.red { background: var(--red); box-shadow: 0 0 6px var(--red); }
 .health-dot.grey { background: var(--text-dim); }
 
-.agent-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    min-width: 0;
-    gap: 6px;
-}
-
-.agent-header > .agent-name {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-}
-
-.claude-badge {
-    font-size: 9px;
-    padding: 1px 5px;
-    border-radius: 3px;
-    font-weight: 600;
-    text-transform: uppercase;
-    margin-left: 6px;
-    vertical-align: middle;
-}
-
-.claude-on { background: #0d4429; color: var(--green); }
-.claude-off { background: #3d1c1c; color: var(--red); }
-
-/* PR badge — clickable link to the latest PR opened from this session.
-   Lives in the agent header row alongside claude-on/off, same compact look. */
+/* PR badge — clickable link to the latest PR opened from this session. */
 .pr-badge {
     font-size: 9px;
     padding: 1px 6px;
@@ -1760,204 +1590,6 @@ body.term-dragging { overflow: hidden; }
     text-decoration: none;
 }
 .pr-badge:hover { background: #1f6feb; color: #0d1117; border-color: #1f6feb; }
-
-/* Recap (latest away_summary) — collapsed by default, click to expand */
-.agent-recap {
-    margin-top: 8px;
-    font-size: 11px;
-    color: var(--text-dim);
-    line-height: 1.5;
-}
-.agent-recap > summary {
-    cursor: pointer;
-    list-style: none;
-    display: flex;
-    gap: 6px;
-    align-items: baseline;
-    overflow: hidden;
-    min-width: 0;
-}
-.agent-recap > summary::-webkit-details-marker { display: none; }
-.agent-recap[open] > summary > .recap-head { display: none; }
-.recap-label {
-    flex: 0 0 auto;
-    color: var(--text-dim);
-    text-transform: uppercase;
-    font-size: 9px;
-    letter-spacing: 0.5px;
-    padding: 1px 5px;
-    border-radius: 3px;
-    background: var(--border);
-}
-.recap-age {
-    flex: 0 0 auto;
-    color: var(--text-dim);
-    font-size: 9px;
-    font-variant-numeric: tabular-nums;
-}
-.recap-age.stale { color: var(--yellow, #d6a700); }
-.recap-head {
-    flex: 1 1 auto;
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    color: var(--text);
-}
-.recap-body {
-    margin-top: 6px;
-    padding: 6px 8px;
-    background: var(--bg);
-    border-left: 2px solid var(--accent);
-    border-radius: 3px;
-    color: var(--text);
-    white-space: pre-wrap;
-    word-break: break-word;
-}
-
-/* Kebab menu */
-
-.kebab-wrap { position: relative; }
-
-.kebab-btn {
-    background: none;
-    border: none;
-    color: var(--text-dim);
-    font-size: 18px;
-    padding: 2px 6px;
-    line-height: 1;
-    cursor: pointer;
-    border-radius: 4px;
-}
-
-.kebab-btn:hover { background: var(--border); color: var(--text); }
-
-.kebab-menu {
-    display: none;
-    position: absolute;
-    top: 100%;
-    right: 0;
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    min-width: 160px;
-    z-index: 50;
-    box-shadow: 0 4px 12px rgba(0,0,0,0.4);
-    padding: 4px 0;
-}
-
-.kebab-menu.open { display: block; }
-
-.menu-item {
-    padding: 6px 12px;
-    font-size: 12px;
-    cursor: pointer;
-    color: var(--text);
-}
-
-.menu-item:hover { background: var(--border); }
-.menu-danger { color: var(--red); }
-.menu-danger:hover { background: rgba(248,81,73,0.1); }
-.menu-disabled { color: var(--text-dim); cursor: default; pointer-events: none; }
-
-.menu-sep {
-    height: 1px;
-    background: var(--border);
-    margin: 4px 0;
-}
-.menu-group { position: relative; }
-.menu-group summary { list-style: none; }
-.menu-group summary::-webkit-details-marker { display: none; }
-.menu-group[open] > .menu-item { padding-left: 20px; font-size: 11px; }
-
-.menu-toggle {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    cursor: pointer;
-}
-
-.menu-toggle input[type="checkbox"] {
-    accent-color: var(--accent);
-    cursor: pointer;
-}
-
-.agent-functions {
-    margin-top: 8px;
-    display: flex;
-    flex-wrap: wrap;
-    gap: 4px;
-}
-
-.fn-badge {
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    font-size: 10px;
-    color: var(--text-dim);
-    font-family: var(--ui-font);
-}
-
-.fn-badge summary {
-    padding: 2px 6px;
-    cursor: pointer;
-    list-style: none;
-}
-
-.fn-badge summary::-webkit-details-marker { display: none; }
-
-.fn-badge .fn-desc {
-    display: block;
-    padding: 2px 6px 4px;
-    font-size: 9px;
-    color: var(--text-dim);
-}
-
-.fn-badge[open],
-.fn-badge:hover {
-    color: var(--accent);
-    border-color: var(--accent);
-}
-
-.fn-cross-agent {
-    border-color: #d29922;
-    background: rgba(210, 153, 34, 0.08);
-}
-
-.fn-cross-agent:hover,
-.fn-cross-agent[open] {
-    border-color: #d29922;
-    color: #d29922;
-}
-
-.cross-agent-icon {
-    display: inline-block;
-    font-size: 10px;
-    margin-right: 3px;
-    cursor: help;
-    vertical-align: middle;
-    color: #d29922;
-}
-
-.fn-ai {
-    border-color: #8957e5;
-    background: rgba(137, 87, 229, 0.08);
-}
-
-.fn-ai:hover,
-.fn-ai[open] {
-    border-color: #8957e5;
-    color: #8957e5;
-}
-
-.ai-icon {
-    display: inline-block;
-    font-size: 10px;
-    margin-right: 3px;
-    cursor: help;
-    vertical-align: middle;
-    color: #8957e5;
-}
 
 /* ---- Buttons ---- */
 
@@ -2033,19 +1665,10 @@ tr:hover td { background: rgba(88, 166, 255, 0.04); }
 /* Grey by choice, not by fallthrough — see runstate.js. */
 .badge-done { background: #21262d; color: var(--text-dim); }
 /* A closed-not-merged run (CMX-265) — its own colour so it never reads as `.badge-done`'s
-   "shipped" grey; matches the board's Archived-lane orange (.kanban-state-chip.st-closed-unmerged). */
+   "shipped" grey; matches the board's Archived-lane orange (.kanban-col-archived). */
 .badge-closed { background: #3a2a13; color: var(--orange, #d18616); }
 
-.badge-priority-critical { background: #6e1b1b; color: #ff7b72; }
-.badge-priority-high { background: #3d1c1c; color: var(--red); }
-.badge-priority-normal { background: #1c2d3d; color: var(--accent); }
 .badge-priority-low { background: #21262d; color: var(--text-dim); }
-
-.badge-activity-signal { background: #1c2d3d; color: var(--accent); }
-.badge-activity-order { background: #2d2b1c; color: var(--yellow); }
-.badge-activity-fill { background: #0d4429; color: var(--green); }
-.badge-activity-reject { background: #3d1c1c; color: var(--red); }
-.badge-activity-close { background: #21262d; color: var(--text); }
 
 /* ---- Inputs ---- */
 
@@ -2079,6 +1702,7 @@ input[type="text"]:focus, textarea:focus, select:focus {
 .modal-overlay.active { display: flex; }
 
 .modal {
+    position: relative;   /* CMX-306: its close button (.task-modal-close) sits in its corner */
     background: var(--surface);
     border: 1px solid var(--border);
     border-radius: 10px;
@@ -2089,22 +1713,10 @@ input[type="text"]:focus, textarea:focus, select:focus {
 
 .modal h3 { margin-bottom: 12px; font-size: 14px; }
 
-.modal .form-row { margin-bottom: 10px; }
-
-.modal .form-row label {
-    display: block;
-    font-size: 11px;
-    color: var(--text-dim);
-    margin-bottom: 3px;
-}
-
-.modal .form-row input, .modal .form-row textarea { width: 100%; }
-.modal .form-row select { width: 100%; }
 .modal textarea { min-height: 60px; resize: vertical; }
 .modal-newtask { width: 560px; }
 .modal-newtask .newtask-error { color: var(--red); font-size: 12px; min-height: 1em; white-space: pre-wrap; }
 
-.modal .form-actions,
 .modal .modal-actions {
     display: flex;
     gap: 8px;
@@ -2144,7 +1756,7 @@ input[type="text"]:focus, textarea:focus, select:focus {
 }
 .task-modal-close:hover { color: var(--text); background: var(--bg); }
 
-/* The wrapper taskmodal.js fills. It must be a flex column that FILLS
+/* The wrapper the task modal (features/taskmodal) fills. It must be a flex column that FILLS
    .modal-task and passes the height constraint down (min-height:0), or the
    modal's 86vh cap clips a long brief/timeline instead of letting
    .task-modal-body scroll — the wrapper was display:block, so it grew to
@@ -2199,10 +1811,34 @@ input[type="text"]:focus, textarea:focus, select:focus {
     padding-bottom: 16px;
 }
 
+/* CMX-122: phone — the details column stacks ABOVE the tabs as a compact header, and
+   .task-modal-body stays the ONE scroll area (no column scrolls on its own). The round
+   list is dropped there: 13 rows would bury the tabs, and the Review tab's collapsed
+   one-line cards are the same list. */
 @media (max-width: 720px) {
     .task-modal-body { grid-template-columns: 1fr; }
+    .task-modal-body > .task-modal-side { order: -1; position: static; }
+    .task-modal-rounds { display: none; }
     .modal-task { max-width: 96vw; max-height: 92vh; }
 }
+
+.task-modal-main { min-width: 0; }
+.task-modal-tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--border); margin-bottom: 10px; }
+.task-modal-tab {
+    background: none; border: none; border-bottom: 2px solid transparent; margin-bottom: -1px;
+    color: var(--text-dim); font: inherit; font-size: 12px; padding: 6px 10px; min-height: 24px; cursor: pointer;
+}
+.task-modal-tab[aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); }
+.task-modal-tab:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.task-modal-round { border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; margin-bottom: 8px; background: var(--bg); }
+.task-modal-round > summary { cursor: pointer; }
+.task-modal-round-no { font-weight: 600; }
+.task-modal-roundlist { list-style: none; margin: 0; padding: 0; }
+.task-modal-roundlink {
+    display: flex; align-items: center; gap: 8px; width: 100%; min-height: 24px; padding: 3px 0;
+    background: none; border: none; border-bottom: 1px solid var(--border); color: var(--text); font: inherit; cursor: pointer;
+}
+.kanban-tracker-link svg { vertical-align: -1px; }
 
 .task-modal-brief.md { font-size: 13px; line-height: 1.6; min-width: 0; }
 .task-modal-brief.md :is(h1, h2, h3, h4) { font-size: 14px; font-weight: 700; margin: 14px 0 6px; }
@@ -2226,7 +1862,8 @@ input[type="text"]:focus, textarea:focus, select:focus {
 }
 .task-modal-brief.md .kn-code code { background: none; border: none; padding: 0; }
 
-.task-modal-side { min-width: 0; font-size: 12px; }
+/* Sticky on desktop so the round list stays in reach while a long report scrolls. */
+.task-modal-side { min-width: 0; font-size: 12px; position: sticky; top: 0; }
 
 .task-modal-sub {
     font-size: 11px;
@@ -2263,19 +1900,6 @@ input[type="text"]:focus, textarea:focus, select:focus {
     word-break: break-word;
 }
 
-.task-modal-timeline {
-    list-style: none;
-    margin: 0; padding: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-}
-.task-modal-timeline-step {
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 6px 8px;
-    background: var(--bg);
-}
 .task-modal-timeline-head {
     display: flex;
     align-items: center;
@@ -2283,19 +1907,19 @@ input[type="text"]:focus, textarea:focus, select:focus {
     flex-wrap: wrap;
 }
 .task-modal-timeline-body {
-    margin-top: 4px;
-    font-size: 11px;
-    color: var(--text-dim);
+    margin-top: 6px;
+    font-size: 12px;
+    line-height: 1.55;
     word-break: break-word;
 }
 /* .md: the timeline body is now rendered through knMd (verdict text like
    "## ✅ KEEP AS-IS …" has real headings/lists/code), not shown as a raw
    pre-wrapped string — so it needs the same block-element rules as
-   .task-modal-brief.md/.kn-body, just smaller to match the timeline's scale. */
+   .task-modal-brief.md, just smaller to match the timeline's scale. */
 .task-modal-timeline-body.md p { margin: 4px 0; }
 .task-modal-timeline-body.md p:first-child { margin-top: 0; }
 .task-modal-timeline-body.md :is(h1, h2, h3, h4) {
-    font-size: 12px; font-weight: 700; margin: 8px 0 4px; color: var(--text);
+    font-size: 13px; font-weight: 700; margin: 8px 0 4px; color: var(--text);
 }
 .task-modal-timeline-body.md :is(h1, h2, h3, h4):first-child { margin-top: 0; }
 .task-modal-timeline-body.md :is(.kn-ul, .kn-ol) { margin: 4px 0; padding-left: 18px; }
@@ -2307,7 +1931,7 @@ input[type="text"]:focus, textarea:focus, select:focus {
 }
 .task-modal-timeline-body.md code {
     background: var(--bg); border: 1px solid var(--border);
-    border-radius: 4px; padding: 0 3px; font-size: 10px;
+    border-radius: 4px; padding: 0 3px; font-size: 11px;
 }
 .task-modal-timeline-body.md .kn-code {
     background: var(--bg); border: 1px solid var(--border);
@@ -2330,13 +1954,6 @@ input[type="text"]:focus, textarea:focus, select:focus {
     flex-direction: column;
     overflow: hidden;
 }
-#diff-modal-content {
-    display: flex;
-    flex-direction: column;
-    flex: 1 1 auto;
-    min-height: 0;
-    overflow: hidden;
-}
 .diff-modal-head {
     flex: 0 0 auto;
     padding-right: 28px;
@@ -2344,7 +1961,7 @@ input[type="text"]:focus, textarea:focus, select:focus {
     margin-bottom: 10px;
     padding-bottom: 10px;
 }
-.diff-modal-head h3 { margin: 0 0 4px; }
+.modal-diff > h3 { margin: 0 0 4px; padding-right: 28px; }
 .diff-modal-summary { font-size: 12px; color: var(--text-dim); font-variant-numeric: tabular-nums; }
 .diff-modal-body {
     flex: 1 1 auto;
@@ -2407,8 +2024,6 @@ input[type="text"]:focus, textarea:focus, select:focus {
 }
 .gs-files:hover { color: var(--text); }
 
-.kanban-pr-wrap { display: inline-flex; }
-
 /* ---- Timestamp ---- */
 
 .ts { color: var(--text-dim); font-size: 11px; }
@@ -2433,102 +2048,81 @@ input[type="text"]:focus, textarea:focus, select:focus {
     min-width: 600px;
 }
 
-/* ---- Section divider (managed / unmanaged) ---- */
-
-.section-divider {
-    width: 100%;
-    font-size: 11px;
-    color: var(--text-dim);
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    padding: 8px 0 4px;
-    border-top: 1px solid var(--border);
-    margin-top: 4px;
-}
-
-.agent-card-session {
-    border-style: dashed;
-    border-color: #1b2028;
-}
-
 /* ---- Kanban board ---- */
 
-.kanban-filters {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-    margin-bottom: 12px;
-    align-items: center;
-}
-
-.kanban-filter-chip {
-    background: var(--bg);
-    border: 1px solid var(--border);
-    color: var(--text-dim);
-    border-radius: 12px;
-    padding: 3px 10px;
-    font-size: 11px;
-    cursor: pointer;
-    transition: background 0.15s, border-color 0.15s, color 0.15s;
-    font-family: var(--ui-font);
-}
-
-.kanban-filter-chip:hover { color: var(--text); border-color: var(--accent); }
-.kanban-filter-chip.active { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 600; }
-
 .kanban-board {
-    display: grid;
-    /* --kanban-cols: set by kanban.js — chela's 6 lanes, or a Linear team's visible
-       states (CMX-23). */
-    grid-template-columns: repeat(var(--kanban-cols, 6), minmax(0, 1fr));
-    gap: 10px;
+    /* CMX-316 (Liav, 10-23): Backlog and Done are 44px rails at the board's edges (or, opened,
+       a column there); Todo, In Progress and In Review are fixed 320px columns in the middle
+       (.kanban-middle), which scrolls sideways when there are many. A column is a lane, not a
+       share of the window (Liav, 2026-10-19): it never grows past 400px. The edges never
+       scroll, so Done is never cut off. */
+    display: flex;
+    gap: 12px;
+    align-items: stretch;
+    min-width: 0;
+}
+.kanban-middle {
+    display: flex;
+    gap: 12px;
+    flex: 0 1 auto;
+    min-width: 0;
+    overflow-x: auto;
     align-items: stretch;
 }
 
 .kanban-col {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 10px;
+    flex: 0 0 320px;
+    width: 320px;
+    max-width: 400px;
     display: flex;
     flex-direction: column;
     min-height: 200px;
     min-width: 0;
+    box-sizing: border-box;
 }
+/* An opened edge column sits on a faint well, so it reads as the rail it folds back to. */
+.kanban-col-edge { padding: 0 8px 8px; border: 1px solid var(--border); border-radius: 12px; background: color-mix(in srgb, var(--surface) 45%, var(--bg)); }
 
 .kanban-col-head {
-    font-size: 11px;
+    font: 600 12px var(--ui-font);
     text-transform: uppercase;
-    letter-spacing: 0.5px;
+    letter-spacing: 0.08em;
     color: var(--text-dim);
-    padding-bottom: 8px;
-    border-bottom: 1px solid var(--border);
-    margin-bottom: 8px;
+    padding: 6px 4px 10px;
     display: flex;
-    justify-content: space-between;
     align-items: center;
+    gap: 8px;
 }
 
-.kanban-col-head .kanban-col-label { flex: 1 1 auto; min-width: 0; }
+.kanban-col-head .kanban-col-label { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.kanban-col-collapse {
+    flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; padding: 0;
+    border: 0; border-radius: 6px; background: none; color: var(--text-dim); cursor: pointer;
+}
+.kanban-col-collapse:hover, .kanban-col-collapse:focus-visible { color: var(--text); background: var(--surface); }
 
-/* Accordion caret — hidden by default (desktop grid + swipe carousel have no
-   collapse). The mobile Rows layout flips it on. */
-.kanban-col-caret { display: none; }
+/* A collapsed edge column: its count over its name written down the rail. */
+.kanban-rail {
+    flex: 0 0 44px; width: 44px; min-height: 200px; box-sizing: border-box;
+    display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 14px 0;
+    border: 1px solid var(--border); border-radius: 12px; background: color-mix(in srgb, var(--surface) 45%, var(--bg));
+    color: var(--text-dim); font-family: var(--ui-font); cursor: pointer;
+}
+.kanban-rail:hover, .kanban-rail:focus-visible { color: var(--text); border-color: var(--accent); }
+.kanban-rail-count { font: 12px var(--font); }
+.kanban-rail-label { writing-mode: vertical-rl; font-size: 12px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; white-space: nowrap; }
 
 .kanban-col-head .col-count {
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    padding: 1px 7px;
-    font-size: 10px;
-    color: var(--text);
+    font: 12px var(--font);
+    letter-spacing: 0;
+    color: var(--text-dim);
     flex: 0 0 auto;
 }
 
 /* 6 lanes (Backlog / To Do / In Progress / Review / Done / Archived —
-   kanbanlanemodel.js's KANBAN_LANES). Review holds awaiting_review +
+   features/work/lanes.ts's KANBAN_LANES). Review holds awaiting_review +
    changes_requested + needs_human + failed cards together — its head colour
-   is a lane-level cue only; each card's own status pill (kanban.js's
+   is a lane-level cue only; each card's own status pill (features/work's
    STATUS_CHIPS) is what says which of the four it is. Archived (CMX-265) is
    the `closed`-run lane — PRs a human closed without merging — kept separate
    from Done so counting Done's cards always answers "what shipped?" correctly. */
@@ -2542,36 +2136,9 @@ input[type="text"]:focus, textarea:focus, select:focus {
 .kanban-cards {
     display: flex;
     flex-direction: column;
-    gap: 6px;
+    gap: 10px;
     overflow-y: auto;
     max-height: 70vh;
-}
-
-.kanban-card {
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-left: 3px solid var(--border);
-    border-radius: 5px;
-    padding: 7px 9px;
-    font-size: 12px;
-    line-height: 1.35;
-    min-width: 0;
-}
-
-.kanban-card-title {
-    color: var(--text);
-    margin-bottom: 4px;
-    word-break: break-word;
-    overflow-wrap: anywhere;
-}
-
-.kanban-card-meta {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-    align-items: center;
-    font-size: 10px;
-    color: var(--text-dim);
 }
 
 .kanban-card-id {
@@ -2602,101 +2169,7 @@ a.kanban-tracker-link:focus-visible { text-decoration: underline; }
     font-weight: 600;
 }
 
-.kanban-section-chip {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    color: var(--text-dim);
-    border-radius: 10px;
-    padding: 0 8px;
-    font-size: 10px;
-}
-
-.kanban-parked-reason {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    color: var(--text-dim);
-    border-radius: 10px;
-    padding: 0 8px;
-    font-size: 10px;
-    max-width: 100%;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-}
-
-.kanban-promote-btn {
-    font-size: 9px;
-    padding: 1px 6px;
-    border-radius: 3px;
-    font-weight: 600;
-    text-transform: uppercase;
-    background: rgba(88, 166, 255, 0.12);
-    color: var(--accent);
-    border: 1px solid rgba(88, 166, 255, 0.4);
-    cursor: pointer;
-    font-family: inherit;
-    line-height: 1.4;
-}
-.kanban-promote-btn:hover:not(:disabled) { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
-.kanban-promote-btn:disabled { opacity: 0.6; cursor: wait; }
-
-.kanban-promote-toast {
-    margin-top: 6px;
-    padding: 4px 6px;
-    background: rgba(248, 81, 73, 0.1);
-    border: 1px solid rgba(248, 81, 73, 0.4);
-    border-radius: 3px;
-    color: var(--red);
-    font-size: 10px;
-    word-break: break-word;
-    white-space: pre-wrap;
-}
-
-.kanban-card-backlog         { border-left-color: var(--border); opacity: 0.85; background: transparent; }
-.kanban-card-parked          { border-left-color: var(--text-dim); opacity: 0.85; background: transparent; }
-.kanban-card-open            { border-left-color: var(--text-dim); }
-.kanban-card-claimed         { border-left-color: var(--accent); }
-.kanban-card-running         { border-left-color: var(--green); }
-.kanban-card-awaiting_review { border-left-color: var(--yellow); background: rgba(210, 153, 34, 0.04); }
-.kanban-card-failed          { border-left-color: var(--red); background: rgba(248, 81, 73, 0.04); }
-.kanban-card-done            { border-left-color: var(--text-dim); opacity: 0.75; }
-.kanban-card-closed          { border-left-color: var(--orange, #d18616); opacity: 0.75; }
-
-/* The rework loop's two other states, plus failed, share the Review lane. The border is a
-   secondary cue only — the card also carries a WORD (.kanban-state-chip), because a
-   colour on its own is not a signal anyone can be assumed to read. */
-.kanban-card-changes_requested { border-left-color: var(--orange, #d18616); background: rgba(209, 134, 22, 0.06); }
-.kanban-card-needs_human       { border-left-color: var(--red); background: rgba(248, 81, 73, 0.07); }
-
-/* Per-card status pill (kanban.js's STATUS_CHIPS) — shown on every non-backlog card so a
-   reader can tell two cards sharing a lane apart (claimed vs running in In Progress;
-   awaiting/changes/needs-human/failed in Review). The base rule is a neutral outline; each
-   `.st-*` modifier only ADDS a colour — the pill's WORD (set in kanban.js) is what actually
-   carries the meaning, exactly like .kanban-ci-chip below. */
-.kanban-state-chip {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    color: var(--text-dim);
-    border-radius: 10px;
-    padding: 0 8px;
-    font-size: 10px;
-    white-space: nowrap;
-}
-.kanban-state-chip.st-open         { color: var(--text-dim); }
-.kanban-state-chip.st-claimed      { color: var(--accent); border-color: rgba(88, 166, 255, 0.45); background: rgba(88, 166, 255, 0.10); }
-.kanban-state-chip.st-running      { color: var(--green); border-color: rgba(63, 185, 80, 0.45); background: rgba(63, 185, 80, 0.10); }
-.kanban-state-chip.st-awaiting     { color: var(--yellow); border-color: rgba(210, 153, 34, 0.45); background: rgba(210, 153, 34, 0.10); }
-.kanban-state-chip.st-changes      { color: var(--orange, #d18616); border-color: rgba(209, 134, 22, 0.45); background: rgba(209, 134, 22, 0.10); }
-.kanban-state-chip.st-needs-human  { color: var(--red); border-color: rgba(248, 81, 73, 0.5); background: rgba(248, 81, 73, 0.10); font-weight: 600; }
-.kanban-state-chip.st-failed       { color: var(--red); border-color: rgba(248, 81, 73, 0.55); background: rgba(248, 81, 73, 0.14); font-weight: 600; }
-.kanban-state-chip.st-done         { color: var(--text-dim); }
-/* 🗂️📐 CMX-23 — run-state badges that ride beside the status pill (kanbanlinearmodel.js). */
-.kanban-state-chip.st-judging      { color: var(--accent); border-color: rgba(88, 166, 255, 0.45); background: rgba(88, 166, 255, 0.10); }
-.kanban-state-chip.st-rework       { color: var(--orange, #d18616); border-color: rgba(209, 134, 22, 0.45); background: rgba(209, 134, 22, 0.10); }
-.kanban-state-chip.st-blocked-race { color: var(--red); border-color: rgba(248, 81, 73, 0.5); background: rgba(248, 81, 73, 0.10); }
-.kanban-state-chip.st-closed-unmerged { color: var(--orange, #d18616); border-color: rgba(209, 134, 22, 0.45); background: rgba(209, 134, 22, 0.10); }
-
-/* ⚖️🎚️ CMX-405 — the run's RISK level (kanban.js / taskmodal.js via riskChip). The WORD
+/* ⚖️🎚️ CMX-405 — the run's RISK level (the Runs table / the task modal via riskChip). The WORD
    ("risk: high") carries it; the colour only agrees. */
 .kanban-risk-chip {
     background: var(--surface);
@@ -2741,81 +2214,7 @@ a.kanban-tracker-link:focus-visible { text-decoration: underline; }
     color: var(--text-dim);
 }
 
-.kanban-card-error {
-    color: var(--red);
-    font-size: 10px;
-    margin-top: 4px;
-    word-break: break-word;
-}
-
-/* A hand-closed run's reason (CMX-406) — a note, not an error: dim, never red. */
-.kanban-card-closed-note {
-    color: var(--text-dim);
-    font-size: 10px;
-    margin-top: 4px;
-    word-break: break-word;
-}
-
-/* CMX-52: the agent's own handoff note — informational, dim, never a warning colour. */
-.kanban-card-handoff {
-    color: var(--text-dim);
-    font-size: 10px;
-    margin-top: 4px;
-    word-break: break-word;
-}
-
-/* CMX-68: a closed run silently holding a READY task — a warning, not a note. */
-.kanban-card-stall {
-    color: var(--yellow, #d29922);
-    font-size: 10px;
-    margin-top: 4px;
-    word-break: break-word;
-}
-
-.kanban-requeue-btn {
-    font-size: 9px;
-    padding: 1px 6px;
-    border-radius: 3px;
-    font-weight: 600;
-    text-transform: uppercase;
-    background: transparent;
-    color: var(--text-dim);
-    border: 1px solid var(--border, rgba(139, 148, 158, 0.4));
-    cursor: pointer;
-    font-family: inherit;
-    line-height: 1.4;
-}
-.kanban-requeue-btn:hover:not(:disabled) { color: var(--text, #e6edf3); }
-.kanban-requeue-btn:disabled { opacity: 0.6; cursor: wait; }
-
-.kanban-merge-btn {
-    font-size: 9px;
-    padding: 1px 6px;
-    border-radius: 3px;
-    font-weight: 600;
-    text-transform: uppercase;
-    background: #1c3d2a;
-    color: var(--green);
-    border: 1px solid rgba(35, 134, 54, 0.4);
-    cursor: pointer;
-    font-family: inherit;
-    line-height: 1.4;
-}
-.kanban-merge-btn:hover:not(:disabled) { background: var(--green); color: #0d1117; border-color: var(--green); }
-.kanban-merge-btn:disabled { opacity: 0.6; cursor: wait; }
-
-.kanban-merged-badge {
-    font-size: 9px;
-    padding: 1px 6px;
-    border-radius: 3px;
-    font-weight: 600;
-    text-transform: uppercase;
-    background: rgba(35, 134, 54, 0.15);
-    color: var(--text-dim);
-    border: 1px solid rgba(35, 134, 54, 0.3);
-    line-height: 1.4;
-    cursor: default;
-}
+.task-progress-chip svg, .init-line svg { vertical-align: -2px; }
 
 .kanban-merge-toast {
     margin-top: 6px;
@@ -2827,30 +2226,6 @@ a.kanban-tracker-link:focus-visible { text-decoration: underline; }
     font-size: 10px;
     word-break: break-word;
     white-space: pre-wrap;
-}
-
-/* Batch-merge button in the Kanban toolbar — pushed to the right edge of the
-   filter row. Reuses .kanban-merge-btn for the rest of its styling. */
-.kanban-merge-all-btn { margin-left: auto; }
-
-/* Floating summary toast for the merge-all action (not card-anchored). */
-.kanban-toast {
-    position: fixed;
-    bottom: 16px;
-    right: 16px;
-    max-width: 420px;
-    z-index: 1000;
-    padding: 10px 14px;
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    color: var(--text);
-    font-size: 12px;
-    line-height: 1.5;
-    white-space: pre-wrap;
-    word-break: break-word;
-    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
-    cursor: pointer;
 }
 
 /* Run-state review toasts (dispatcher run → awaiting_review / done / failed).
@@ -2891,40 +2266,9 @@ a.kanban-tracker-link:focus-visible { text-decoration: underline; }
     font-style: italic;
 }
 
-/* Delete (×) button — top-right of each kanban card. Hidden until hover/focus
-   on desktop so it doesn't compete with the title text; always visible on
-   touch (no :hover) via the @media block below. */
-.kanban-card { position: relative; }
-.kanban-delete-btn {
-    position: absolute;
-    top: 4px;
-    right: 4px;
-    width: 18px;
-    height: 18px;
-    padding: 0;
-    line-height: 1;
-    font-size: 14px;
-    border-radius: 3px;
-    background: transparent;
-    border: 1px solid transparent;
-    color: var(--text-dim);
-    cursor: pointer;
-    opacity: 0;
-    transition: opacity 0.15s, color 0.15s, background 0.15s, border-color 0.15s;
-}
-.kanban-card:hover .kanban-delete-btn,
-.kanban-card:focus-within .kanban-delete-btn {
-    opacity: 1;
-}
-.kanban-delete-btn:hover {
-    color: var(--red);
-    border-color: var(--red);
-    background: rgba(248, 81, 73, 0.1);
-}
-
-/* Inline confirm: replaces the card body when the × is clicked. Plain DOM,
-   not window.confirm — survives the next refresh cleanly via a per-card
-   data attribute on the card root. */
+/* Inline confirm: shown on the card when its ⋮ Delete is picked. Plain DOM,
+   not window.confirm, so it survives the next poll's repaint (the card keeps
+   its key). */
 .kanban-confirm {
     margin-top: 6px;
     padding: 6px 8px;
@@ -2980,42 +2324,34 @@ a.kanban-tracker-link:focus-visible { text-decoration: underline; }
 .dispatcher-table .row-confirm-cell .kanban-confirm {
     margin: 0;
 }
+/* The Runs segment (frontend/src/features/runs) and Schedules (features/schedules), CMX-231. */
+.dispatcher-table code { font-size: 11px; }
+#work-runs .card h3 { margin-bottom: 6px; }
+.runs-summary { font-size: 11px; color: var(--text-dim); margin-bottom: 10px; }
+.runs-section, .sched-cron-head {
+    font-size: 11px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.5px; margin-top: 14px;
+}
+summary.runs-section { cursor: pointer; }
+.open-backlog { margin-top: 14px; }
+.runs-empty { padding: 8px 0; color: var(--text-dim); font-size: 11px; }
+.runs-error { color: var(--red); font-size: 11px; padding: 4px 0; }
+.sched-cron-head { margin: 22px 0 8px; font-weight: 600; }
+.sched-cron-head span { font-weight: 400; text-transform: none; }
+.sched-none { color: var(--text-dim); }
+.cron-empty { padding: 20px; text-align: center; color: var(--text-dim); }
+.field-control .s-textarea, .field-control .s-multi { flex: 1 1 auto; }
 
 @media (max-width: 768px) {
-    /* Touch — no hover, so always show the × */
-    .kanban-delete-btn { opacity: 1; }
     /* Mobile dispatcher row is a stacked grid; confirm row uses full width */
     .dispatcher-table tr.row-confirming td:not(.row-confirm-cell) { display: none; }
     .dispatcher-table tr.row-confirming .row-confirm-cell { display: block; padding: 4px 0; }
 }
 
-/* ---- Mobile layout controls (Kanban) ---- */
-/* The Swipe/Rows toggle + swipe quick-nav strip. Hidden on desktop (the 5-lane
-   grid needs no controls); the ≤768px block below flips them on. */
-.kanban-mobile-controls { display: none; }
-
 /* ---- Responsive ---- */
-
-@media (max-width: 900px) {
-    .kanban-board { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-}
 
 @media (max-width: 768px) {
     .header { padding: 8px 12px; gap: 10px; flex-wrap: wrap; }
     .content { padding: 10px 12px; }
-    /* Drop flex layout in favor of plain block stacking — flex-column with
-       wrap + flex-shrink:0 lets unmanaged session cards exceed the
-       container width when their content has a wide min-content. */
-    .agent-grid { display: block; }
-    .agent-card { max-width: none; min-width: 0; flex: none; width: 100%; }
-    .agent-recap > summary { flex-wrap: wrap; }
-    /* Block layout needs explicit margin between cards (previously the flex
-       gap handled this). */
-    .agent-grid > .agent-card { margin-bottom: 12px; }
-    .agent-grid > .agent-card:last-child { margin-bottom: 0; }
-    .pipeline-arrow { align-self: center; transform: rotate(90deg); }
-    #panel-agents > div:first-child { flex-wrap: wrap; }
-    #broadcast-input { min-width: 0; width: 100%; flex-basis: 100%; }
 
     /* Tab strip: horizontal scroll instead of wrap/break. Terminals' inline
        margin-left:auto pushes it off-screen in the scroller, override it. */
@@ -3031,135 +2367,28 @@ a.kanban-tracker-link:focus-visible { text-decoration: underline; }
     .tab { flex: 0 0 auto; white-space: nowrap; padding: 8px 12px; }
     .tab[data-tab="terminals"] { margin-left: 0 !important; }
 
-    /* ---- Kanban mobile layouts (Swipe / Rows) ---- */
-    /* Controls (toggle + nav strip) are mobile-only. */
-    .kanban-mobile-controls { display: block; }
-
-    .kanban-layout-toggle {
-        display: inline-flex;
-        gap: 0;
-        margin-bottom: 8px;
-        border: 1px solid var(--border);
-        border-radius: 8px;
-        overflow: hidden;
+    /* ---- CMX-315: the phone Work view (Liav's mockups, 10-23) ----
+       Board (swiped): the status tabs ARE the columns, one screen wide, scroll
+       snapped; the active tab is underlined (an underline + weight, never hue
+       alone). No column header and no peek of the next column. */
+    .wtabs {
+        display: flex; flex-wrap: nowrap; gap: 20px; overflow-x: auto; scrollbar-width: none;
+        margin: 0 -14px 12px; padding: 0 16px; border-bottom: 1px solid var(--border);
     }
-    .kanban-layout-btn {
-        background: var(--bg);
-        color: var(--text-dim);
-        border: none;
-        padding: 6px 16px;
-        font-size: 12px;
-        font-family: var(--ui-font);
-        cursor: pointer;
+    .wtabs::-webkit-scrollbar { display: none; }
+    .wtab {
+        flex: 0 0 auto; display: inline-flex; align-items: center; gap: 6px; white-space: nowrap;
+        min-height: 44px; padding: 0; border: 0; border-bottom: 2px solid transparent; background: none;
+        color: var(--text-dim); font: 14px var(--ui-font); cursor: pointer;
     }
-    .kanban-layout-btn + .kanban-layout-btn { border-left: 1px solid var(--border); }
-    /* Active state is colorblind-safe: solid fill + bold weight + inset ring,
-       not hue alone. */
-    .kanban-layout-btn.active {
-        background: var(--accent);
-        color: var(--on-accent);
-        font-weight: 700;
-        box-shadow: inset 0 0 0 2px var(--accent);
+    .wtab.active { color: var(--text); font-weight: 600; border-bottom-color: var(--accent); }
+    .wtab-count { font-variant-numeric: tabular-nums; }
+    .kanban-board.wboard {
+        display: flex; flex-wrap: nowrap; gap: 0; overflow-x: auto; scroll-snap-type: x mandatory;
+        -webkit-overflow-scrolling: touch; scrollbar-width: none;
     }
-
-    /* Quick-nav strip — swipe layout only (hidden in rows below). */
-    .kanban-nav-strip {
-        display: flex;
-        flex-wrap: nowrap;
-        gap: 6px;
-        overflow-x: auto;
-        -webkit-overflow-scrolling: touch;
-        scrollbar-width: none;
-        margin-bottom: 10px;
-        padding-bottom: 2px;
-    }
-    .kanban-nav-strip::-webkit-scrollbar { display: none; }
-    .kanban-nav-chip {
-        flex: 0 0 auto;
-        display: inline-flex;
-        align-items: center;
-        gap: 5px;
-        background: var(--bg);
-        border: 1px solid var(--border);
-        color: var(--text-dim);
-        border-radius: 12px;
-        padding: 3px 10px;
-        font-size: 11px;
-        font-family: var(--ui-font);
-        cursor: pointer;
-        white-space: nowrap;
-    }
-    .kanban-nav-chip .kanban-nav-count {
-        background: var(--surface);
-        border-radius: 8px;
-        padding: 0 6px;
-        font-size: 10px;
-        color: var(--text);
-    }
-    /* Active chip is colorblind-safe: fill + bold + ring, plus the count pill
-       stays legible — never hue as the only cue. */
-    .kanban-nav-chip.active {
-        background: var(--accent);
-        border-color: var(--accent);
-        color: var(--on-accent);
-        font-weight: 700;
-        box-shadow: inset 0 0 0 2px var(--accent);
-    }
-    .kanban-nav-chip.active .kanban-nav-count { background: rgba(13, 17, 23, 0.18); color: #0d1117; }
-
-    /* Default (swipe carousel): horizontal scroll-snap; all 5 lanes swipe
-       with a peek of the next. */
-    .kanban-board {
-        display: flex;
-        flex-wrap: nowrap;
-        grid-template-columns: none;
-        overflow-x: auto;
-        scroll-snap-type: x mandatory;
-        -webkit-overflow-scrolling: touch;
-        gap: 10px;
-    }
-    .kanban-col {
-        flex: 0 0 86%;
-        scroll-snap-align: start;
-        margin-bottom: 0;
-    }
-    .kanban-cards { max-height: none; }
-
-    /* Rows accordion — full-width stacked columns; each head is a tap toggle
-       that collapses/expands its cards. Every header + count stays visible. */
-    #work-board.kanban-mobile-rows .kanban-nav-strip { display: none; }
-    #work-board.kanban-mobile-rows .kanban-board {
-        display: block;
-        overflow-x: visible;
-        scroll-snap-type: none;
-    }
-    #work-board.kanban-mobile-rows .kanban-col {
-        flex: none;
-        width: 100%;
-        min-height: 0;
-        margin-bottom: 8px;
-    }
-    #work-board.kanban-mobile-rows .kanban-col-head {
-        margin-bottom: 0;
-        border-bottom: none;
-        cursor: pointer;
-        padding-bottom: 4px;
-    }
-    #work-board.kanban-mobile-rows .kanban-col-caret {
-        display: inline-block;
-        flex: 0 0 auto;
-        width: 12px;
-        color: var(--text-dim);
-        transition: transform 0.15s;
-    }
-    #work-board.kanban-mobile-rows .kanban-col-caret::before { content: '▾'; }
-    #work-board.kanban-mobile-rows .kanban-col-collapsed .kanban-col-caret::before { content: '▸'; }
-    #work-board.kanban-mobile-rows .kanban-col:not(.kanban-col-collapsed) .kanban-col-head {
-        border-bottom: 1px solid var(--border);
-        margin-bottom: 8px;
-        padding-bottom: 8px;
-    }
-    #work-board.kanban-mobile-rows .kanban-col-collapsed .kanban-cards { display: none; }
+    .wboard::-webkit-scrollbar { display: none; }
+    .wcol { flex: 0 0 100%; min-width: 0; scroll-snap-align: start; display: flex; flex-direction: column; gap: 10px; }
 
     /* Dispatcher tables: re-flow as stacked label/value rows. Cells carry a
        data-label attribute set by app.js so the column header survives the
@@ -3200,37 +2429,12 @@ a.kanban-tracker-link:focus-visible { text-decoration: underline; }
     /* Hide rows with no useful payload (e.g. Error column when empty). */
     .dispatcher-table td.cell-empty { display: none; }
 
-    /* Terminals: wall mode doesn't fit a 375px viewport. Hide the toggle
-       and grid presets; renderTerminals() also force-switches to single. */
-    #term-mode-wall { display: none; }
+    /* Terminals: wall mode doesn't fit a 375px viewport. Hide the grid presets;
+       renderTerminals() also force-switches to single. */
     #term-wall-grid { display: none !important; }
     #panel-terminals > div:first-child { flex-wrap: wrap; }
-    #term-agent { margin-left: 0 !important; flex: 1 1 100%; }
-    /* Fill the screen: 100dvh (NOT vh — the mobile address bar collapses and
-       vh overshoots the real visible height) minus the chrome that sits
-       above/below the pane on a phone. CMX-130's 70vh was a rough guess
-       tuned against the old collapsible #term-bar and left dead space below
-       the pane once the v2 fixed keybar replaced it (this fixes that).
-       --gs-head-h / --term-switcher-h below are the two new measured
-       constants: --gs-head-h is the mobile .gs-head row itself (2px+2px
-       padding around the title+subtitle label — two lines now the ai-title
-       subtitle is shown again, above); --term-switcher-h is the agent-pill
-       strip's own footprint (28px pill row + 2px padding-bottom + 8px
-       margin-bottom). --term-keybar-h (47px, below) and --term-ctx-bar-h
-       (30px, :root) already existed. Subtracting the keybar's footprint AND
-       env(safe-area-inset-bottom) separately still matters (CMX-130): the
-       keybar's own bottom padding is `calc(6px + env(safe-area-inset-bottom))`,
-       so on a home-indicator phone the bar is 47px + inset tall — subtracting
-       only the 47px would leave the inset's worth of the pane's bottom row
-       (input box + "auto mode on") still under the bar. */
-    :root { --gs-head-h: 32px; --term-switcher-h: 38px; }
-    .term-single .term-pane {
-        height: calc(100dvh - var(--gs-head-h) - var(--term-switcher-h) - var(--term-keybar-h, 0px) - var(--term-ctx-bar-h) - env(safe-area-inset-bottom) - var(--kb-occluded, 0px));
-    }
-    /* NB: the pane is DELIBERATELY left inset by .content's horizontal padding
-       (no width reclaim). That side gutter is what lets a touch-drag beside the
-       terminal scroll the PAGE instead of being swallowed by the iframe — a
-       full-bleed pane traps the scroll. Do not re-add a negative margin here. */
+    /* The phone pane's box (full-bleed, pinned to the viewport) is the mobile
+       keybar block's `.term-single .term-pane` rule (CMX-313). */
     #term-bar { max-height: 60vh; overflow-y: auto; }
 
     /* Dense layout: Special & Ctrl as full-width rows; D-pad + Nav + Scroll
@@ -3274,7 +2478,9 @@ a.kanban-tracker-link:focus-visible { text-decoration: underline; }
 
 .app {
     display: grid;
-    grid-template-columns: 264px 1fr;
+    /* CMX-278: the desktop width is the user's, dragged by .sidebar-resize and kept in the
+       server layout (features/sidebar/lib/layout.ts sets the var); the phone drawer keeps 264px. */
+    grid-template-columns: var(--sidebar-w, 288px) 1fr;
     height: 100vh;
 }
 
@@ -3294,9 +2500,10 @@ a.kanban-tracker-link:focus-visible { text-decoration: underline; }
 /* --- Sidebar (CMX-377: the dashboard's only chrome — no top bar) ---
    A flex column so the head (toggle + brand) and foot (ambient readouts +
    Decisions/Menu) stay put while only the middle — nav + sessions + recent —
-   scrolls. Same 264px column, same off-canvas/rail behaviour as before; only
+   scrolls. Same column (now resizable, CMX-278), same off-canvas/rail behaviour; only
    what used to live in a separate <header class="topbar"> moved inside it. */
 .sidebar {
+    position: relative;   /* the width handle sits on its right edge */
     display: flex; flex-direction: column;
     border-right: 1px solid var(--border);
     background: var(--bg);
@@ -3356,8 +2563,17 @@ a.kanban-tracker-link:focus-visible { text-decoration: underline; }
     flex: 0 0 auto; display: flex; align-items: center; gap: 8px; flex-wrap: nowrap;
     padding: 10px 14px; border-top: 1px solid var(--border);
 }
-.sidebar-foot .res-strip { min-width: 0; }
+/* CMX-291: three 100% readouts need ~187px; the 264px column leaves the strip 189px beside
+   the gear, so the strip drops its own side padding and tightens its gap here. */
+.sidebar-foot .res-strip { min-width: 0; gap: 6px; padding: 0; }
 .sidebar-foot #btn-primary-menu { margin-left: auto; flex: 0 0 auto; }
+/* CMX-178: the version island (React). CMX-291: it lives in the Settings modal's foot now,
+   a quiet line under the source offer; selectable, so a build can be copied into a report. */
+.settings-modal-foot #version-island { display: block; margin-top: 4px; user-select: text; }
+.version-badge {
+    display: block; font-size: 10.5px; color: var(--muted, #7d8590); font-variant-numeric: tabular-nums;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
 /* The head's right end: the Decisions inbox (CMX-393, moved up from the foot). */
 .sidebar-head-actions {
     margin-left: auto; flex: 0 0 auto; display: flex; align-items: center; gap: 2px;
@@ -3366,7 +2582,7 @@ a.kanban-tracker-link:focus-visible { text-decoration: underline; }
 /* Phone-only floating trigger for the off-canvas drawer (CMX-377) — see the
    mobile media query below for when it shows. Desktop never needs it: the
    sidebar's own toggle in .sidebar-head is always on screen there. */
-.mobile-menu-fab, .mobile-new-fab {
+.mobile-menu-fab {
     display: none; position: fixed; z-index: 46;
     top: max(14px, env(safe-area-inset-top)); left: max(14px, env(safe-area-inset-left));
     width: 42px; height: 42px; border-radius: 50%;
@@ -3374,11 +2590,8 @@ a.kanban-tracker-link:focus-visible { text-decoration: underline; }
     background: var(--surface); border: 1px solid var(--border); color: var(--text);
     box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35);
 }
-/* CMX-386: the "+" (New session) sits one fab-width + an 8px gap to the right
-   of the ☰, off the same safe-area inset. */
-.mobile-new-fab { left: calc(max(14px, env(safe-area-inset-left)) + 50px); }
-.mobile-menu-fab svg, .mobile-new-fab svg { width: 20px; height: 20px; display: block; }
-.mobile-menu-fab:hover, .mobile-new-fab:hover { border-color: var(--accent); color: var(--accent); }
+.mobile-menu-fab svg { width: 20px; height: 20px; display: block; }
+.mobile-menu-fab:hover { border-color: var(--accent); color: var(--accent); }
 
 /* Always-on-top safety cluster (CMX-377) — see index.html's comment on why
    #status-health-warn and #btn-shares live here, outside the sidebar, on
@@ -3390,6 +2603,18 @@ a.kanban-tracker-link:focus-visible { text-decoration: underline; }
 }
 
 .side-section { margin-bottom: 18px; }
+/* CMX-278: the island slots draw their section (or nothing); the slot itself takes no box. */
+.side-recent-slot, .sidebar-resize-slot { display: contents; }
+.sidebar-resize {
+    position: absolute; top: 0; right: 0; bottom: 0; width: 6px; z-index: 5;
+    cursor: col-resize; touch-action: none;
+}
+.sidebar-resize:hover, .sidebar-resize:focus-visible, body.sidebar-resizing .sidebar-resize {
+    background: var(--accent); opacity: 0.5; outline: none;
+}
+/* While dragging, the pane iframes must not take the pointer or flash a text selection. */
+body.sidebar-resizing { cursor: col-resize; user-select: none; }
+body.sidebar-resizing iframe { pointer-events: none; }
 .side-section:first-child { margin-top: 2px; }
 /* CMX-377 round 2: sentence-case, no letter-spacing — the uppercase/tracked
    style (NAVIGATE, SESSIONS, RECENT SESSIONS) doesn't match the approved
@@ -3513,10 +2738,12 @@ a.kanban-tracker-link:focus-visible { text-decoration: underline; }
 .group-head:hover .group-more, .group-more:focus-visible { opacity: 1; }
 .group-rows { display: flex; flex-direction: column; gap: 1px; margin-top: 2px; }
 
-/* ---- Rows: a status SHAPE, then ONE line — the title, ellipsised — with the
-   state word small and dim at the right. ctx% and the @window id stay in the
-   row's .ar-sub (CMX-230 / CMX-417) but only surface on hover, or when the
-   context is running hot; the relative time lives in the tooltip. */
+/* ---- Rows (CMX-121, drawn by the React sidebar island since CMX-276): a status
+   SHAPE, then ONE line. The TITLE has the width: it grows first and the metadata
+   (.ar-meta: icon chips for orchestrator / PR / judging, context % from 50%)
+   shrinks long before it does. No state word on the face: the dot's shape carries
+   it, its aria-label and the row's tooltip say it. The @window id (CMX-417) only
+   shows on hover; the relative time lives in the tooltip. */
 .agent-row.rich { align-items: center; gap: 9px; padding: 6px 8px 6px 10px; }
 #sidebar-agents { gap: 1px; }
 /* 10px status dot — matches the collapsed rail (body.sidebar-collapsed .agent-row.rich
@@ -3524,20 +2751,24 @@ a.kanban-tracker-link:focus-visible { text-decoration: underline; }
    base still holds for the wall pane dots and term pills. */
 .agent-row.rich .term-status-dot { flex: 0 0 auto; width: 10px; height: 10px; }
 .agent-row.rich.active::before { height: 16px; }
-.agent-row.rich .ar-main { flex-direction: row; align-items: baseline; gap: 8px; }
-.agent-row.rich .agent-row-name { flex: 1 1 auto; min-width: 0; font-size: 12.5px; }
-.agent-row.rich .ar-sub { flex: 0 0 auto; font-size: 10.5px; gap: 0; opacity: 0.85; }
-.agent-row.rich .ar-state { font-weight: 500; text-transform: none; }
-.agent-row.rich .ar-more { display: none; white-space: nowrap; }
-.agent-row.rich .ar-ctx-part.hot,
+/* longhands, so the shrink weights read the same in every engine (and in jsdom's cascade) */
+.agent-row.rich .agent-row-name { flex-grow: 1; flex-shrink: 1; flex-basis: auto; min-width: 0; font-size: 12.5px; }
+/* CMX-278 + CMX-331: a long press (.show-full) shows the whole title, wrapped. A hover does
+   not: it would grow the row and shift every row below, so the row's tooltip carries it. */
+.agent-row.rich.show-full .agent-row-name { white-space: normal; overflow-wrap: anywhere; }
+.agent-row.rich .ar-meta {
+    flex-grow: 0; flex-shrink: 1000; flex-basis: auto; min-width: 0; overflow: hidden; display: inline-flex; align-items: center; gap: 6px;
+    font-size: 10.5px; color: var(--text-dim); white-space: nowrap;
+}
+.agent-row.rich .ar-meta:empty { display: none; }
+.agent-row.rich .ar-meta > [data-meta] { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 3px; }
+.agent-row.rich .ar-meta-text { font-variant-numeric: tabular-nums; }
+.agent-row.rich .ar-more { display: none; }
 .agent-row.rich:hover .ar-more,
 .agent-row.rich:focus-within .ar-more { display: inline; }
-.agent-row.rich .ar-ago { display: none; }
-/* An idle row is the common case — its word stays out of the way. */
-.agent-row.rich .ar-state.idle { opacity: 0.7; }
 .agent-row.rich.archived { opacity: 0.55; }
-/* CMX-85: the Alt fast-switch number, shown only while Alt is held (nav.js
-   _paintAltNums inserts it, Alt up removes it) — like the Claude desktop app's
+/* CMX-85: the Alt fast-switch number, shown only while Alt is held (the React
+   sidebar island draws it, CMX-276), like the Claude desktop app's
    Ctrl-held numbers. Over the row's right edge, so the row never reflows. */
 .agent-row .ar-altnum {
     position: absolute; right: 8px; top: 50%; transform: translateY(-50%);
@@ -3564,13 +2795,8 @@ a.kanban-tracker-link:focus-visible { text-decoration: underline; }
 .agent-row.rich.session-row { cursor: default; }
 /* The ONE Archived section sits at the bottom, a little apart from the folders. */
 .side-group.side-archived { margin-top: 8px; }
-/* "Show archived (N)" — the way into Status ▸ All, where the Archived section shows. */
-.side-archived-toggle {
-    align-self: flex-start; margin: 10px 0 2px 10px; padding: 2px 0; border: 0; background: none;
-    color: var(--text-dim); font: inherit; font-size: 11px; cursor: pointer;
-}
-.side-archived-toggle:hover { color: var(--text); text-decoration: underline; }
 /* CMX-66: the VIEW menu's button on the Sessions header (the desktop's sliders icon). */
+.side-view-slot { display: contents; }
 .side-view-btn {
     display: inline-flex; align-items: center; justify-content: center;
     width: 24px; height: 24px; padding: 0; margin: -4px -6px -4px 0; border: 0; border-radius: 6px;
@@ -3579,51 +2805,64 @@ a.kanban-tracker-link:focus-visible { text-decoration: underline; }
 }
 .side-view-btn:hover { background: var(--surface); color: var(--text); }
 .side-view-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
-/* The view menu: a submenu row reads `Label ......... value >`; a choice shows ✓ at the
-   right. A submenu is a second page of the same popover (‹ back on top), never a hover
-   flyout, so a phone reaches it by tap. Fits a 390px screen (max-width below). */
+/* The view menu (the kit's Menu, CMX-277): a submenu row reads `Label ......... value >`; a
+   choice shows a check at the right. A submenu is a second page of the same menu (‹ back on
+   top), never a hover flyout, so a phone reaches it by tap. Fits a 390px screen. */
 .side-menu.view-menu { min-width: 232px; max-width: calc(100vw - 24px); }
-.side-menu .vm-item, .side-menu .vm-back { display: flex; align-items: center; gap: 8px; min-height: 30px; }
-.side-menu .vm-label { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.side-menu .vm-val { flex: 0 0 auto; color: var(--text-dim); font-size: 0.92em; }
-.side-menu .vm-chev { flex: 0 0 auto; display: inline-flex; color: var(--text-dim); }
-.side-menu .vm-chev.back { transform: rotate(180deg); }
-.side-menu .vm-back { color: var(--text-dim); font-weight: 600; }
-.side-menu .vm-check { flex: 0 0 auto; color: var(--accent); font-weight: 700; }
-.side-menu .vm-group { cursor: default; }
-.side-menu .vm-mini {
-    flex: 0 0 auto; padding: 2px 6px; border: 1px solid var(--border); border-radius: 5px;
-    background: transparent; color: var(--text-dim); font: inherit; font-size: 11px; cursor: pointer;
-}
-.side-menu .vm-mini:hover { color: var(--text); border-color: var(--text-dim); }
+.side-menu .ov-item { gap: 8px; min-height: 30px; }
+.overflow-menu .ov-label { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.overflow-menu .ov-val { flex: 0 0 auto; color: var(--text-dim); font-size: 0.92em; }
+.overflow-menu .ov-chev, .overflow-menu .ov-check { flex: 0 0 auto; display: inline-flex; color: var(--text-dim); }
+.overflow-menu .ov-chev.back { transform: rotate(180deg); }
+.overflow-menu .ov-back { color: var(--text-dim); font-weight: 600; }
+.overflow-menu .ov-check { color: var(--accent); }
+.overflow-menu .popover-item[data-highlighted] :is(.ov-val, .ov-chev, .ov-check) { color: inherit; }
 /* A dispatched run's PR badge (View ▸ Show PR status): `#N`, its state as a word in the
    tooltip and as a border style — not hue alone. */
 .agent-row.rich .ar-pr {
-    margin-left: 6px; padding: 0 5px; border: 1px solid var(--border); border-radius: 999px;
+    padding: 0 5px; border: 1px solid var(--border); border-radius: 999px;
     font-size: 10px; font-variant-numeric: tabular-nums; color: var(--text-dim);
 }
 .agent-row.rich .ar-pr.draft { border-style: dashed; }
 .agent-row.rich .ar-pr.merged { border-color: var(--accent); color: var(--text); }
 .agent-row.rich .ar-pr.closed { text-decoration: line-through; }
-/* CMX-76: the orchestrator's row badge — the word "orchestrator", outlined like the PR
-   badge (no hue cue: the operator is red-weak). */
-.agent-row.rich .ar-orch {
-    margin-left: 6px; padding: 0 5px; border: 1px solid var(--border); border-radius: 999px;
-    font-size: 10px; color: var(--text-dim); white-space: nowrap;
-}
+/* CMX-76: the orchestrator's row badge, a crown since CMX-121 (its tooltip and accessible
+   name say "Orchestrator"; no hue cue: the operator is red-weak). */
+.agent-row.rich .ar-orch { color: var(--text); }
+/* CMX-330: a plain shell's cwd (`~/projects/x`) gives way before the title, then ellipsizes. */
+.agent-row.rich .ar-meta > .ar-cwd { flex-shrink: 1; min-width: 0; overflow: hidden; }
+.agent-row.rich .ar-cwd .ar-meta-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 /* Show empty groups: a folder header with no matching session keeps its `+`. */
 .side-group.empty .group-rows { display: none; }
 .side-group.flat { margin-top: 4px; }
 /* A compact menu, dividers between action groups (.popover-sep). */
 .side-menu { min-width: 168px; }
 .side-menu .popover-item { padding: 6px 10px; }
-.side-menu .popover-item.disabled { opacity: 0.45; cursor: default; }
-.side-menu .popover-item.disabled:hover { background: transparent; color: inherit; }
 /* Judging (a dispatched run's judge is testing it) — a diamond, its own
    silhouette next to working's dot, waiting's triangle, idle's ring, done's check. */
 .term-status-dot.judging {
     border-radius: 1px; clip-path: polygon(50% 0, 100% 50%, 50% 100%, 0 50%);
     background: var(--ok-sky); box-shadow: none;
+}
+/* CMX-137: a DISPATCHED run's progress icons (sidebar, collapsed rail, minimized bar),
+   after Linear's: working = HALF-filled circle (◐), judging / awaiting review = ¾-filled
+   (◕). The SHAPE carries it; Okabe-Ito bluish-green (not violet, which collapses into
+   blue for a red-weak eye) is only a second cue. Same box as every state. Done / waiting
+   keep the shared check / triangle; working keeps the shared pulse, tinted. */
+.term-status-dot.dispatched.working,
+.term-status-dot.dispatched.judging {
+    border-radius: 50%; clip-path: none; background-color: transparent;
+    border: 1.5px solid var(--ok-green);
+}
+.term-status-dot.dispatched.working {
+    background-image: conic-gradient(var(--ok-green) 0 50%, transparent 0);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok-green) 22%, transparent);
+}
+.term-status-dot.dispatched.judging {
+    background-image: conic-gradient(var(--ok-green) 0 75%, transparent 0);
+}
+@media (prefers-reduced-motion: reduce) {
+    .term-status-dot.dispatched.working { animation: none; }
 }
 
 /* Window-type cue (recent/dispatcher rows only — CMX-377 round 2 dropped it
@@ -3699,23 +2938,13 @@ a.kanban-tracker-link:focus-visible { text-decoration: underline; }
 .ar-ctx.warn { color: var(--yellow); background: color-mix(in srgb, var(--yellow) 14%, transparent); }
 .ar-ctx.danger { color: var(--red); background: color-mix(in srgb, var(--red) 14%, transparent); }
 .ar-sub { display: flex; align-items: baseline; gap: 5px; min-width: 0; font-size: var(--card-font-size); line-height: var(--card-line-height); color: var(--text-dim); }
-/* CMX-377 round 2: the state word stays dim (inherits .ar-sub's colour) in
-   every state — the shape (.term-status-dot) carries the state, colour is
-   never the only cue AND is no longer a second, redundant cue here either. */
-.ar-state { flex: 0 0 auto; font-weight: 600; text-transform: capitalize; }
 /* CMX-417: the row's tmux window id ("idle · 74% ctx · @32") — the same dim,
    monospace `@N` the pane footer's .gs-wid shows, never shrunk or wrapped. */
 .ar-wid { flex: 0 0 auto; font-family: var(--font); font-size: 0.95em; white-space: nowrap; opacity: 0.85; }
 /* CMX-377: recent-sessions rows still use .ar-recap for their cwd sub-line
-   (nav.js renderRecentSessions) — the live agent row's OWN recap/ai_title
-   lines are gone (folded into the row's title tooltip; see .ar-ago below). */
+   (features/sidebar's Recent) — the live agent row's OWN recap/ai_title
+   lines are gone (folded into the row's title tooltip). */
 .ar-recap { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; opacity: 0.85; }
-/* CMX-377: the row's right-aligned relative time (mockup's `{{r.ago}}`) — a
-   ROW-level sibling of .ar-main, not part of it, so it sits at the row's far
-   right (comes after .ar-main's flex: 1 in source order). Vertical offset
-   matches the status dot's own margin-top so it lines up with the row's
-   first line, not its vertical center. */
-.ar-ago { flex: 0 0 auto; margin-top: 4px; font-size: var(--card-font-size); color: var(--text-dim); opacity: 0.75; white-space: nowrap; }
 
 .side-badges { display: flex; gap: 4px; }
 .badge {
@@ -3759,13 +2988,18 @@ a.kanban-tracker-link:focus-visible { text-decoration: underline; }
     body.sidebar-collapsed .group-head,
     body.sidebar-collapsed .triage-head,
     body.sidebar-collapsed .agent-row .ar-main,
+    body.sidebar-collapsed .agent-row.rich .agent-row-name,
+    body.sidebar-collapsed .agent-row.rich .ar-meta,
+    body.sidebar-collapsed .agent-row .row-unarchive,
     body.sidebar-collapsed .agent-row .recent-resume,
     body.sidebar-collapsed .agent-row .recent-dismiss,
-    body.sidebar-collapsed .agent-row .row-more,
-    body.sidebar-collapsed .side-archived-toggle { display: none; }
+    body.sidebar-collapsed .recent-toggle-dispatcher,
+    body.sidebar-collapsed .agent-row .row-more { display: none; }
 
     /* The section heads are gone, so a rule stands in for the section break. */
     body.sidebar-collapsed .side-section { margin-bottom: 10px; }
+    body.sidebar-collapsed .sidebar-resize { display: none; }
+    body.sidebar-collapsed .side-section + .side-recent-slot > .side-section,
     body.sidebar-collapsed .side-section + .side-section {
         margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border);
     }
@@ -3785,13 +3019,6 @@ a.kanban-tracker-link:focus-visible { text-decoration: underline; }
 }
 
 /* --- Command palette (⌘K) --- */
-/* .pt-kbd: the small "⌘K" hint badge, now inside the primary menu's "Jump to…"
-   row (index.html #primary-menu) — its own dedicated .palette-trigger topbar
-   button folded away in CMX-109 / CMX-108 Part A re-filed. */
-.pt-kbd {
-    font-size: 10px; font-weight: 600; color: var(--text-dim);
-    border: 1px solid var(--border); border-radius: 5px; padding: 0 5px; line-height: 16px;
-}
 
 .palette-overlay {
     position: fixed; inset: 0; z-index: 200;
@@ -3806,7 +3033,11 @@ a.kanban-tracker-link:focus-visible { text-decoration: underline; }
     background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
     box-shadow: 0 20px 60px -10px rgba(0, 0, 0, 0.7);
     animation: palette-in 0.13s ease-out;
+    position: relative;
 }
+/* CMX-306: the palette's close button, in the input row's corner (a phone has no Esc). */
+.palette-close { top: 4px; right: 4px; }
+.palette-input { padding-right: 52px; }
 @keyframes palette-in { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: translateY(0); } }
 .palette-input {
     flex: 0 0 auto; font: inherit; font-size: 15px; color: var(--text);
@@ -3818,6 +3049,8 @@ a.kanban-tracker-link:focus-visible { text-decoration: underline; }
 .palette-item {
     display: flex; align-items: center; gap: 11px; padding: 9px 12px;
     border-radius: 8px; cursor: pointer;
+    /* a real button (CMX-221) drawn as a row */
+    width: 100%; border: 0; background: none; color: inherit; font: inherit; text-align: left;
 }
 .palette-item.sel { background: color-mix(in srgb, var(--accent) 16%, transparent); }
 /* CMX-116: separates the "open panes, floated to the top" section (empty
@@ -3891,31 +3124,6 @@ a.kanban-tracker-link:focus-visible { text-decoration: underline; }
     color: var(--text-dim); font-size: 11px;
 }
 
-/* --- Generic centered-modal "sheet" (CMX-288) ---
-   .palette-overlay is already the shared backdrop for two modals (#palette,
-   #shortcuts-overlay) — dim+blur, fixed, flex-centered, no per-modal copy
-   needed. Neither of those two fit the Decisions inbox: .palette is shaped
-   for a fuzzy-search input+list+footer, .shortcuts-sheet for a static
-   multi-column cheatsheet. .modal-sheet is the third shape — a plain
-   header (title + close button) over a scrollable body — for any content
-   that's neither of those. Reuse THIS (backdrop + .modal-sheet), not a new
-   bespoke overlay, for the next centered modal (e.g. a tabbed settings
-   modal folding in #settings-drawer). */
-.modal-sheet {
-    width: 480px; max-width: 92vw; max-height: 80vh;
-    display: flex; flex-direction: column; overflow: hidden;
-    background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
-    box-shadow: 0 20px 60px -10px rgba(0, 0, 0, 0.7);
-    animation: palette-in 0.13s ease-out;
-}
-.modal-sheet-head {
-    display: flex; align-items: center; gap: 10px; padding: 14px 16px;
-    border-bottom: 1px solid var(--border); flex: 0 0 auto;
-}
-.modal-sheet-head .popover-title { font-weight: 700; font-size: 14px; color: var(--text); flex: 1 1 auto; }
-.modal-sheet-head .icon-btn { flex: 0 0 auto; }
-.modal-sheet-body { flex: 1 1 auto; overflow-y: auto; padding: 14px 16px; }
-
 /* --- Canvas ---
    CMX-377 round 2: explicit column+row, not auto-placement — the leftover
    `grid-row: 2` from the removed topbar row shoved the canvas below the
@@ -3941,7 +3149,10 @@ a.kanban-tracker-link:focus-visible { text-decoration: underline; }
 .settings-modal {
     position: fixed; top: 50%; left: 50%;
     transform: translate(-50%, -50%) scale(0.97);
-    width: min(760px, 94vw); max-height: 86vh;
+    /* CMX-310: a FIXED height, never sized by its content: centred on `top: 50%`, a
+       content-sized dialog grew and shrank on every tab switch or search keystroke and
+       its head and rail jumped with it. The panel (.settings-tabpanels) scrolls inside. */
+    width: min(760px, 94vw); height: min(640px, 86vh); max-height: 86vh;
     background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
     box-shadow: 0 20px 60px rgba(0, 0, 0, 0.35);
     opacity: 0; pointer-events: none; transition: opacity 0.15s ease, transform 0.15s ease;
@@ -3968,10 +3179,12 @@ a.kanban-tracker-link:focus-visible { text-decoration: underline; }
 .settings-tab {
     padding: 8px 10px; border-radius: 7px; font-size: 12.5px; color: var(--text-dim);
     cursor: pointer; user-select: none; transition: background 0.13s ease, color 0.13s ease;
+    /* a real button (CMX-221): drawn as the rail's row, not a .btn */
+    background: none; border: 0; font-family: inherit; text-align: left;
 }
 .settings-tab:hover { background: var(--bg); color: var(--text); }
 .settings-tab.active { background: color-mix(in srgb, var(--accent) 13%, transparent); color: var(--accent); font-weight: 600; }
-.settings-tabpanels { flex: 1 1 auto; min-width: 0; overflow-y: auto; padding: 14px; }
+.settings-tabpanels { flex: 1 1 auto; min-width: 0; min-height: 0; overflow-y: auto; padding: 14px; }
 .settings-tabpanel { display: none; flex-direction: column; gap: 12px; }
 .settings-tabpanel.active { display: flex; }
 /* margin-top:auto pins the footer to the bottom of the flex column without giving
@@ -3997,15 +3210,16 @@ a.kanban-tracker-link:focus-visible { text-decoration: underline; }
 .settings-tabpanels code.s-cmd .s-cmd-arg { white-space: nowrap; }
 /* CMX-396: search across every tab. While a query is active (.searching) every
    panel with a hit shows at once, each under its tab's name, and the rest of
-   the markup is only hidden by nav.js's .s-search-hide — never re-rendered. */
+   the markup is only hidden by the search's [data-s-hide] (features/settings
+   lib/search.ts) — never re-rendered. */
 .settings-search { flex: 0 0 auto; padding: 10px 16px; border-bottom: 1px solid var(--border); }
-.settings-search-input { width: 100%; box-sizing: border-box; }
-.settings-search-empty { margin: 8px 0 0; font-size: 12.5px; color: var(--text-dim); }
+.settings-search .s-input { width: 100%; box-sizing: border-box; }
+.settings-search-empty { margin: 0; font-size: 12.5px; color: var(--text-dim); }
 .settings-search-empty[hidden] { display: none; }
 .settings-modal.searching .settings-tabpanel { display: none; }
-.settings-modal.searching .settings-tabpanel.s-search-hit { display: flex; }
-.settings-modal.searching .settings-tabpanel.s-search-hit + .settings-tabpanel.s-search-hit { margin-top: 18px; }
-.settings-tabpanel .s-search-hide { display: none; }
+.settings-modal.searching .settings-tabpanel[data-s-hit] { display: flex; }
+.settings-modal.searching .settings-tabpanel[data-s-hit] + .settings-tabpanel[data-s-hit] { margin-top: 18px; }
+.settings-tabpanel [data-s-hide] { display: none; }
 .settings-search-group {
     margin: 0; font-size: 12px; font-weight: 600; color: var(--text-dim);
 }
@@ -4019,7 +3233,8 @@ a.kanban-tracker-link:focus-visible { text-decoration: underline; }
 @media (max-width: 640px) {
     .settings-modal {
         top: 4vh; left: 3vw; transform: translate(0, 0) scale(0.97);
-        width: 94vw; max-height: 92vh;
+        /* CMX-310: dvh where supported, so a phone's URL bar never clips the footer */
+        width: 94vw; height: 92vh; height: 92dvh; max-height: 92vh; max-height: 92dvh;
     }
     .settings-modal.open { transform: translate(0, 0) scale(1); }
 }
@@ -4043,7 +3258,19 @@ a.kanban-tracker-link:focus-visible { text-decoration: underline; }
        right-aligned wrapped lines were the "ragged indent". */
     .settings-modal .s-status-detail { flex-basis: 100%; text-align: left; }
     .settings-modal .cost-table th, .settings-modal .cost-table td { padding-left: 6px; padding-right: 6px; }
+    /* A narrow modal stacks each knob: its label (and badges) above its control. */
+    .settings-modal .field-row { grid-template-columns: minmax(0, 1fr) auto; }
+    .settings-modal .field-label { grid-column: 1 / -1; }
+    .settings-modal .field-control { grid-column: 1; }
+    .settings-modal .field-unit { grid-column: 2; }
+    .settings-modal .field-hint { grid-column: 1 / -1; }
 }
+/* Settings' knobs (CMX-221): a select or a text field may shrink to the row, never push it
+   wide ("bypassPermissions · no prompts at all", a long workflow path). */
+.settings-modal .field-control .ui-select { min-width: 0; max-width: 100%; overflow: hidden; }
+.settings-modal .field-control .ui-select > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.settings-modal .s-stepper { display: inline-flex; align-items: center; gap: 6px; }
+.settings-modal .s-relay { overflow-wrap: anywhere; font-size: 11px; }
 .settings-tabs.fade-end {
     -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 32px), transparent);
     mask-image: linear-gradient(to right, #000 calc(100% - 32px), transparent);
@@ -4092,7 +3319,6 @@ a.kanban-tracker-link:focus-visible { text-decoration: underline; }
     margin-bottom: 8px;
 }
 .s-row:last-child { margin-bottom: 0; }
-.s-rowlabel { color: var(--text); font-size: 12px; }
 /* CMX-57: a select sizes to its LONGEST option ("bypassPermissions · ⚠ no prompts
    at all"), and a flex item never shrinks below its content unless told
    min-width: 0 — so at phone width it pushed the row past the card. It may now
@@ -4124,13 +3350,6 @@ a.kanban-tracker-link:focus-visible { text-decoration: underline; }
    (workflow paths, a branch name) keep the free-text .s-input's full width. */
 .s-dispatch-rows .s-input.s-num { flex: 0 1 90px; text-align: right; }
 .s-dispatch-rows .s-input:disabled, .s-dispatch-rows .s-select:disabled { opacity: 0.55; cursor: not-allowed; }
-.s-rowunit { color: var(--text-dim); font-size: 11px; min-width: 44px; }
-.s-badge {
-    font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em;
-    padding: 3px 9px; border-radius: 999px; border: 1px solid var(--border);
-}
-.s-badge.on { color: var(--green); border-color: var(--green); }
-.s-badge.off { color: var(--text-dim); }
 
 /* Live "Connections & Status" surface — READ-ONLY status rows.
    Colorblind-safe: the ●/○ glyph + the state word carry the state; colour is a
@@ -4249,12 +3468,25 @@ a.kanban-tracker-link:focus-visible { text-decoration: underline; }
 .grid-stack-item-content.pane-flash, .term-pane.pane-flash { animation: pane-flash-kf 1.1s ease; }
 .launch-row.lr-gone .lr-icon { color: var(--red); }
 .launch-row.lr-gone .lr-label { color: var(--text-dim); text-decoration: line-through; }
+/* CMX-219: the menu's rows are real buttons (shared/ui ItemButton): UA chrome off, a plain
+   full-width row. A launch row's own button (.lr-main) fills it beside the action icons. */
+.launch-menu button.popover-item, .popover.ui-floating > button.popover-item {
+    display: block; width: 100%; text-align: left; font: inherit; font-size: 12px;
+    border: 0; background: none; color: var(--text); line-height: 1.3;
+}
+.launch-menu button.popover-item:hover, .popover.ui-floating > button.popover-item:hover { background: var(--accent); color: var(--on-accent); }
+/* CMX-327: `.launch-menu .launch-row button.lr-main` outranks `.launch-menu button.popover-item` above
+   (display: block put the icon and the name on two lines) and its hover fill. */
+.launch-menu .launch-row button.lr-main { display: flex; align-items: center; gap: 9px; flex: 1; min-width: 0; padding: 0; }
+.launch-menu .launch-row button.lr-main:hover { background: none; color: inherit; }
+.launch-row .lr-icon svg, .launch-row .lr-actions svg { display: block; }
 
 /* --- Agent detail --- */
 .detail-head { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
-.detail-back { cursor: pointer; color: var(--text-dim); }
-.detail-back:hover { color: var(--accent); }
+.detail-back { cursor: pointer; color: var(--text-dim); background: none; border: 0; padding: 0; font: inherit; }
+.detail-back:hover { color: var(--accent); background: none; }
 .detail-title { font-size: 15px; font-weight: 700; }
+.detail-recap-head { margin-top: 16px; }
 .detail-grid { display: grid; grid-template-columns: 130px 1fr; gap: 6px 14px; margin-bottom: 16px; }
 .detail-grid .k { color: var(--text-dim); }
 .detail-recap {
@@ -4298,12 +3530,13 @@ a.kanban-tracker-link:focus-visible { text-decoration: underline; }
         position: fixed;
         top: 0; left: 0; bottom: 0;
         width: 264px; max-width: 82vw;
-        z-index: 45;
+        z-index: var(--z-drawer);
         transform: translateX(-100%);
         transition: transform 0.18s ease;
         padding-left: env(safe-area-inset-left);
     }
     .sidebar.open { transform: translateX(0); box-shadow: 0 10px 48px rgba(0,0,0,0.6); }
+    .sidebar-resize { display: none; }
     .sidebar-head { padding-top: max(12px, env(safe-area-inset-top)); }
     .sidebar-foot { padding-bottom: max(10px, env(safe-area-inset-bottom)); }
 
@@ -4318,59 +3551,237 @@ a.kanban-tracker-link:focus-visible { text-decoration: underline; }
        own toggle button sitting right behind it. */
     .mobile-menu-fab { display: inline-flex; }
     body.sidebar-open .mobile-menu-fab { display: none; }
-    /* CMX-386: its "+" sibling opens #new-menu with the drawer closed. It
-       hides with the ☰ while the drawer is open — the drawer's own "New
-       session" button is right there, and the "+" would float over it. */
-    .mobile-new-fab { display: inline-flex; }
-    body.sidebar-open .mobile-new-fab { display: none; }
-    /* ...and the menu it opens (anchored under it by openNewMenu, clamped to
-       the 8px left edge) never runs off the right: a long nowrap project label
+    /* CMX-313: with a pane open the pane's title bar carries the opener
+       (.gs-head-menu), so the floating one steps aside. The phone "+" is gone
+       (CMX-386 → CMX-313): New session is the drawer's own button. */
+    body:has(#panel-terminals.active .gs-head-menu) .mobile-menu-fab { display: none; }
+    /* CMX-315: the Work view's title bar (.work-bar) carries the opener too,
+       and starts at the screen's top edge (no clearance for the floating one). */
+    body:has(#panel-work.active .work-bar) .mobile-menu-fab { display: none; }
+    .canvas:has(#panel-work.active .work-bar) { padding-top: 0; }
+    /* The safety pills leave the bar's + and ⋯ alone: bottom right, over the list.
+       Not with the drawer open: there they would cover its footer (the gear). */
+    body:has(#panel-work.active .work-bar):not(.sidebar-open) .safety-float {
+        top: auto; bottom: max(14px, env(safe-area-inset-bottom));
+    }
+    /* ONE title bar, the pane's (CMX-313) look: ☰, the project over its
+       counts, + and ⋯. Sticky at the canvas's top; --work-bar-h is its height,
+       which the Rows group heads stick under. */
+    #panel-work { --work-bar-h: calc(max(6px, env(safe-area-inset-top)) + 51px); }
+    .work-bar {
+        position: sticky; top: 0; z-index: 5;
+        display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto; align-items: center; gap: 8px;
+        margin: 0 -14px; box-sizing: border-box; min-height: var(--work-bar-h);
+        padding: max(6px, env(safe-area-inset-top)) 12px 6px;
+        background: var(--bg); border-bottom: 1px solid var(--border); font-family: var(--ui-font);
+    }
+    .work-bar-btn {
+        display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto;
+        width: 44px; height: 44px; padding: 0; box-sizing: border-box; border-radius: 50%; cursor: pointer;
+        background: var(--surface); border: 1px solid var(--border); color: var(--text);
+    }
+    .work-bar-btn:hover { border-color: var(--accent); color: var(--accent); }
+    .work-bar-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+    .work-bar-title {
+        display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 1px; min-width: 0;
+        min-height: 44px; padding: 2px 4px; border: 0; background: none; color: var(--text); cursor: pointer; font-family: inherit;
+    }
+    .work-bar-name { display: inline-flex; align-items: center; gap: 4px; max-width: 100%; font-size: 16px; font-weight: 600; }
+    .work-bar-project, .work-bar-sub { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .work-bar-name svg { flex: 0 0 auto; }
+    .work-bar-sub { max-width: 100%; font-size: 12px; color: var(--text-dim); }
+    /* Board | Runs | Schedules: one full-width segmented control under the bar. */
+    .work-phone-seg { padding: 10px 0; }
+    .work-phone-seg .work-seg {
+        display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); width: 100%; box-sizing: border-box;
+        padding: 3px; border-radius: 10px; background: var(--surface);
+    }
+    .work-phone-seg .work-seg-btn { min-height: 34px; border-radius: 8px; font-size: 14px; }
+    .work-phone-seg .work-seg-btn + .work-seg-btn { border-left: 0; }
+    .work-phone-seg .work-seg-btn.active { box-shadow: none; background: color-mix(in srgb, var(--text) 14%, var(--surface)); }
+    /* The launch menu never runs off the right: a long nowrap project label
        would otherwise size the popover past a 390px screen. */
     .launch-menu { max-width: calc(100vw - 16px); }
 }
 
-/* ---- Mobile agent switcher (pill strip) ----
-   Replaces the dropdown on phones with a scrollable row of tappable agent pills
-   (status dot + label, active highlighted). Desktop never shows it. */
-.term-switcher { display: none; }
-
-@media (max-width: 768px) {
-    /* Dropdown is replaced by the pill strip; the empty toolbar above collapses. */
-    #term-agent { display: none !important; }
-
-    /* The terminals toolbar (.term-toolbar) has no visible control on a phone,
-       but it still renders as an EMPTY row whose 12px bottom margin sets where
-       the agent pills sit. A `display: none` here used to say otherwise — it
-       never applied (the row's inline style beat it), and CMX-414 moving that
-       style into the stylesheet would have switched it on and shifted the
-       pills (CMX-386/404) up 12px. Dropped: phone geometry is unchanged. */
-
-    /* Scrollable agent-pill strip. (Starting a share moved to the primary menu
-       in the sidebar foot, so the row no longer carries its own 🔗 trigger.) */
-    .term-switcher {
-        display: flex;
-        gap: 6px;
-        overflow-x: auto;
-        -webkit-overflow-scrolling: touch;
-        scrollbar-width: none;
-        margin-bottom: 8px;
-        padding-bottom: 2px;
-    }
-    .term-switcher::-webkit-scrollbar { display: none; }
-
-    .term-pill {
-        flex: 0 0 auto;
-        display: inline-flex; align-items: center; gap: 6px;
-        max-width: 168px;
-        background: var(--surface); border: 1px solid var(--border); color: var(--text-dim);
-        border-radius: 16px; padding: 7px 13px; font-size: 12px; line-height: 1;
-        cursor: pointer; white-space: nowrap;
-    }
-    .term-pill .term-pill-label { overflow: hidden; text-overflow: ellipsis; }
-    .term-pill.active { border-color: var(--accent); color: var(--text); background: var(--bg); }
-    /* The status dot inside a pill keeps its colour from _colorTermDots. */
-    .term-pill .term-status-dot { flex: 0 0 auto; }
+/* ---- CMX-315: the Work view's compact card, Rows row and phone sheets ----
+   The compact card (features/work Compact.tsx) is the shared card the desktop
+   follow-up reuses: the title (2 lines), one meta line (id in mono, PR, the
+   state with its icon), one flags line, a 2-line note. Orange (Okabe-Ito, red-
+   weak safe) is ONLY a real warning (risk high, rework, CI failing) and always
+   sits on a word: removing every colour here loses no information. */
+.wcard {
+    display: flex; flex-direction: column; gap: 8px; padding: 14px; cursor: pointer;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+    font-family: var(--ui-font); color: var(--text);
 }
+.wcard:focus-visible, .wrow:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.wcard-head { display: flex; gap: 8px; align-items: flex-start; }
+.wcard-title {
+    flex: 1 1 auto; min-width: 0; font-size: 15px; line-height: 1.35; font-weight: 600;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.wcard-meta, .wcard-flags { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; font-size: 13px; color: var(--text-dim); }
+.wcard-id, .wrow-id { font-family: var(--font); color: var(--accent); }
+.wcard-pr, .wrow-pr { font-family: var(--font); }
+.wcard-state, .wcard-flag { display: inline-flex; align-items: center; gap: 4px; }
+.wcard-state { color: var(--text); }
+.wcard-flag.warn, .wrow-flag.warn { color: var(--ok-orange); font-weight: 600; }
+.wcard-note {
+    font-size: 13px; line-height: 1.4; color: var(--text-dim);
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.wcard-note svg { vertical-align: -2px; }
+.wcard-menu { flex: 0 0 auto; display: inline-flex; }
+.wcard-menu-btn {
+    width: 36px; height: 44px; margin: -10px -8px -8px 0; padding: 0; border: 0; background: none;
+    color: var(--text-dim); display: inline-flex; align-items: center; justify-content: center; cursor: pointer;
+}
+.wcard-menu-btn:hover, .wcard-menu-btn[aria-expanded="true"] { color: var(--accent); }
+/* An action in flight. Not .wcard-running: that is a running card's own class (wcard-<status>). */
+.wcard-busy { font-size: 12px; color: var(--text-dim); }
+.wcard-error { font-size: 12px; color: var(--red); }
+.wcard-overflow-menu .wcard-branch-item .ov-label { font-family: var(--font); font-size: 12px; overflow-wrap: anywhere; }
+
+/* Rows: one list grouped by status, each group's head sticky under the bar. */
+.wrows { margin: 0 -14px; }
+.wrows-head {
+    position: sticky; top: var(--work-bar-h, 0px); z-index: 2;
+    display: flex; align-items: center; gap: 8px; padding: 14px 16px 6px; cursor: pointer;
+    background: var(--bg); color: var(--text-dim);
+    font: 600 12px var(--ui-font); letter-spacing: 0.06em; text-transform: uppercase;
+}
+.wrows-label { flex: 1 1 auto; min-width: 0; }
+.wrows-count { font-family: var(--font); }
+.wrows-caret { transform: rotate(90deg); transition: transform 0.15s; }
+.wrows-group.folded .wrows-caret { transform: none; }
+.wrow {
+    display: flex; align-items: center; gap: 10px; min-height: 44px; padding: 10px 8px 10px 16px;
+    border-bottom: 1px solid var(--border); cursor: pointer; font-family: var(--ui-font); color: var(--text);
+}
+.wrow-main { flex: 1 1 auto; min-width: 0; }
+.wrow-title { font-size: 15px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.wrow-meta { display: flex; gap: 12px; margin-top: 3px; font-size: 12px; color: var(--text-dim); min-width: 0; }
+.wrow-flag { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wrow .wcard-menu-btn { margin: 0; }
+
+/* The phone sheets: the project switcher and Work options (bottom sheets). */
+.work-sheet { padding-left: 0; padding-right: 0; }
+.work-sheet .ss-hd { padding: 0 16px 8px; font-size: 16px; }
+.wproj-search { padding: 0 16px 10px; }
+.wproj-search .s-input { width: 100%; box-sizing: border-box; min-height: 40px; font-size: 16px; }
+.wproj-list { max-height: 60vh; overflow-y: auto; }
+.wproj-list .ui-radio-group { display: flex; flex-direction: column; }
+.ui-radio-opt.wproj-row {
+    align-items: center; gap: 14px; min-height: 56px; box-sizing: border-box; padding: 6px 20px;
+    border: 0; border-bottom: 1px solid var(--border); border-radius: 0;
+}
+.wproj-row:has([data-state="checked"]) { background: color-mix(in srgb, var(--accent) 18%, var(--surface)); }
+.wproj-row:has([data-state="checked"]) .wproj-name { font-weight: 600; }
+.wproj-row .ui-radio-text { flex: 1 1 auto; min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 10px; }
+.wproj-name { font-size: 16px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wproj-counts { grid-column: 1; font-size: 12px; color: var(--text-dim); }
+.wproj-needs { grid-column: 2; grid-row: 1 / span 2; align-self: center; font-size: 12px; font-weight: 600; color: var(--ok-orange); }
+.wproj-none { padding: 12px 20px; margin: 0; color: var(--text-dim); font-size: 13px; }
+.wopt-head { margin: 4px 0 0; padding: 4px 20px 6px; font: 600 12px var(--ui-font); letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-dim); }
+.wopt-layout { display: flex; gap: 8px; padding: 4px 20px 12px; }
+.wopt-layout-btn {
+    min-height: 36px; padding: 0 14px; border-radius: 18px; border: 1px solid var(--border);
+    background: transparent; color: var(--text-dim); font: 14px var(--ui-font); cursor: pointer;
+}
+.wopt-layout-btn.active { border-color: var(--accent); color: var(--text); font-weight: 600; background: color-mix(in srgb, var(--accent) 18%, var(--surface)); }
+.wopt-sep { height: 1px; background: var(--border); margin: 6px 0; }
+.popover-item.wopt-item {
+    display: flex; align-items: center; gap: 14px; width: 100%; min-height: 52px; padding: 0 20px;
+    font-size: 16px; text-align: left; border-radius: 0; background: transparent;
+}
+.popover-item.wopt-item:hover { background: color-mix(in srgb, var(--text) 8%, var(--surface)); }
+.wopt-label { flex: 1 1 auto; min-width: 0; }
+.wopt-hint { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 400; color: var(--text-dim); }
+.popover-item.wopt-warn { color: var(--ok-orange); font-weight: 600; }
+.work-confirm-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+
+/* ---- CMX-316: the desktop Work view (Liav's mockup, 10-23) ----
+   ONE header row: the project switcher (the project and a chevron over its
+   counts and dispatch state), the segmented Board | Runs | Schedules, then
+   Pause dispatch (a quiet outline), New task (the one primary button) and ⋯. */
+.work-head {
+    display: flex; align-items: center; gap: 16px; min-width: 0;
+    margin: 0 0 16px; padding: 0 0 14px; border-bottom: 1px solid var(--border); font-family: var(--ui-font);
+}
+/* The safety pills float in the top-right corner: the row ends short of them while one shows
+   (DeskHead measures them into --work-head-float). */
+#panel-work.active .work-head { padding-right: var(--work-head-float, 0px); }
+.work-head-title {
+    display: flex; flex-direction: column; align-items: flex-start; gap: 1px; min-width: 0; max-width: 360px; flex: 0 0 auto;
+    margin-left: -8px; padding: 4px 8px; border: 0; border-radius: 8px; background: none; color: var(--text); cursor: pointer; text-align: left; font-family: inherit;
+}
+.work-head-title:hover, .work-head-title[aria-expanded="true"] { background: var(--surface); }
+.work-head-name { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; font-size: 18px; font-weight: 600; }
+.work-head-name svg { flex: 0 0 auto; }
+.work-head-project, .work-head-sub { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.work-head-sub { max-width: 100%; font-size: 12px; color: var(--text-dim); }
+.work-head .work-seg {
+    flex: 0 1 300px; min-width: 216px; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); box-sizing: border-box;
+    padding: 3px; border-radius: 10px; background: var(--surface);
+}
+.work-head .work-seg-btn { height: 30px; padding: 0 10px; border-radius: 8px; font-size: 13px; }
+.work-head .work-seg-btn + .work-seg-btn { border-left: 0; }
+.work-head .work-seg-btn.active { box-shadow: none; background: color-mix(in srgb, var(--text) 14%, var(--surface)); }
+.work-head-spacer { flex: 1 1 auto; }
+.work-head .btn { display: inline-flex; align-items: center; gap: 6px; height: 34px; white-space: nowrap; flex: 0 0 auto; }
+/* Pause dispatch: an outline that reads the state; held, it reads Resume in the warn look. */
+.work-head .work-head-hold:not(.btn-warn) { background: transparent; }
+.work-head .work-head-new:disabled { opacity: 0.5; cursor: not-allowed; }
+.work-head-more {
+    flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; width: 34px; height: 34px; padding: 0;
+    border: 1px solid var(--border); border-radius: 8px; background: transparent; color: var(--text); cursor: pointer;
+}
+.work-head-more:hover, .work-head-more[aria-expanded="true"] { border-color: var(--accent); color: var(--accent); }
+.popover-item.wmenu-warn { color: var(--ok-orange); font-weight: 600; }
+/* The switcher: the phone sheet's list in a dropdown under the title. */
+.popover.work-switcher { width: 320px; padding: 8px 0; }
+.work-switcher .wproj-search { padding: 0 10px 8px; }
+.work-switcher .wproj-search .s-input { min-height: 34px; font-size: 13px; }
+.work-switcher .wproj-list { max-height: min(60vh, 440px); }
+.work-switcher .ui-radio-opt.wproj-row { min-height: 44px; padding: 4px 14px; border-bottom: 0; }
+.work-switcher .wproj-name { font-size: 14px; }
+.work-switcher .wproj-none { padding: 8px 14px; }
+
+/* The compact card on the desktop board: a 14px title, as the mockup. */
+.kanban-col .wcard { gap: 7px; padding: 12px 14px; }
+.kanban-col .wcard-title { font-size: 14px; }
+.kanban-col .wcard-meta, .kanban-col .wcard-flags, .kanban-col .wcard-note { font-size: 12px; }
+.kanban-col .wcard-menu-btn { width: 28px; height: 28px; margin: -4px -6px 0 0; }
+
+/* Rows on the desktop: a table, grouped by status; a column head sorts. */
+.wtable-wrap { overflow-x: auto; }
+.wtable { width: 100%; border-collapse: collapse; font: 13px var(--ui-font); color: var(--text); }
+.wtable-th { padding: 0; text-align: left; border-bottom: 1px solid var(--border); white-space: nowrap; }
+.wtable-sort {
+    display: inline-flex; align-items: center; gap: 4px; width: 100%; padding: 8px 10px; border: 0; background: none;
+    color: var(--text-dim); font: 600 12px var(--ui-font); letter-spacing: 0.06em; text-transform: uppercase; cursor: pointer;
+}
+.wtable-sort:hover, .wtable-sort:focus-visible, .wtable-th[aria-sort="ascending"] .wtable-sort, .wtable-th[aria-sort="descending"] .wtable-sort { color: var(--text); }
+.wtable-group-head th { padding: 0; text-align: left; }
+.wtable-group-btn {
+    display: flex; align-items: center; gap: 8px; width: 100%; padding: 16px 10px 6px; border: 0; background: none; cursor: pointer;
+    color: var(--text-dim); font: 600 12px var(--ui-font); letter-spacing: 0.06em; text-transform: uppercase; text-align: left;
+}
+.wtable-group-btn:hover, .wtable-group-btn:focus-visible { color: var(--text); }
+.wtable-group.folded .wrows-caret { transform: none; }
+.wtable-row { cursor: pointer; border-bottom: 1px solid var(--border); }
+.wtable-row:hover { background: var(--surface); }
+.wtable-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.wtable-row td { padding: 8px 10px; vertical-align: middle; white-space: nowrap; color: var(--text-dim); }
+.wtable-row .wtable-title { width: 100%; max-width: 0; color: var(--text); white-space: normal; }
+.wtable-title-text { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wtable-row td.wtable-id { font-family: var(--font); color: var(--accent); }
+.wtable-row td.wtable-pr, .wtable-row td.wtable-age { font-family: var(--font); }
+.wtable-row td.wtable-state { color: var(--text); }
+.wtable-row td.warn { color: var(--ok-orange); font-weight: 600; }
+.wtable-row td.wtable-menu { width: 36px; padding: 0 4px; }
+.wtable-menu .wcard-menu-btn { margin: 0; width: 32px; height: 32px; }
 
 /* ---- Mobile keybar v2 (Moshi-style accessory row) ----
    A persistent, horizontally-scrollable key row pinned to the bottom (above the
@@ -4383,68 +3794,67 @@ a.kanban-tracker-link:focus-visible { text-decoration: underline; }
     /* The persistent v2 bar replaces the old collapsible keybar on phones. */
     #term-bar { display: none !important; }
 
-    /* CMX-130: the pane header is back — a prior pass hid it outright reasoning
-       the agent name/status already live in the switcher pills, but losing it
-       also loses the only place the header's dot/menu (Share/Orchestrator/Pin)
-       live on phones. Keep it, just shorter (tighter padding/font) than the
-       desktop bar. See CMX-133 below for what happens to the window-control
-       keys (drag/min/max/kill) themselves. */
-    .gs-head { padding: 2px 8px; font-size: 11px; }
-    /* CMX-146 hid the dim ai-title subtitle here (single mobile pane was tight
-       on vertical space); un-hidden per Liav's 2026-07-25 call — it already
-       truncates to one line via the base rule above (overflow/ellipsis/
-       nowrap), just trimmed a touch smaller than .gs-head's 11px so it reads
-       as clearly secondary without growing the compact header. */
-    .pane-subtitle { display: block; font-size: 9.5px; }
-    /* CMX-133: drag/minimize genuinely don't apply to the forced single pane,
-       but × kill is the only way to tear a session down on phones (no wall,
-       no overflow-menu equivalent) — keep just that button. */
-    .gs-keys { display: flex; }
-    /* Maximize doesn't apply either (there's nothing else on the wall to
-       overlay over) — replaced by ONE mobile-only fullscreen toggle instead
-       (.gs-mobile-full-btn, revealed just below): it grows the pane to
-       100dvh and hides the surrounding chrome, tap again to restore. */
-    .gs-min-btn, .gs-max-btn { display: none; }
-    .gs-mobile-full-btn { display: inline-flex; }
+    /* CMX-313 (Liav, 10-23): the phone pane looks like the Claude app. ONE
+       title bar, the pane's own header (PaneHead's `.gs-head-bar`): the
+       drawer's round hamburger on the left, the title over its subtitle in the
+       middle, the status chip and ⋯ on the right. Close lives in the ⋯ menu
+       (easy to hit by accident in a bar), and there is no maximize: the pane is
+       always full. The title is centred in the room between the two sides and
+       ellipsises; the right side is capped, so a long UNSANDBOXED banner or
+       facepile cannot squeeze the title out. The bar's top padding is the
+       notch's safe area, so its background runs under the status bar. */
+    .gs-head.gs-head-bar {
+        display: grid; grid-template-columns: auto minmax(0, 1fr) auto;
+        align-items: center; gap: 8px; height: auto; min-height: 52px; box-sizing: border-box;
+        padding: max(6px, env(safe-area-inset-top)) max(10px, env(safe-area-inset-right)) 6px max(10px, env(safe-area-inset-left));
+        font-size: 14px; color: var(--text);
+    }
+    .gs-head-bar .gs-label {
+        flex-direction: column; align-items: center; gap: 1px; text-align: center; max-width: 100%;
+    }
+    .gs-head-bar .pane-title { max-width: 100%; font-weight: 600; }
+    .gs-head-bar .gs-label .pane-subtitle { flex: 0 0 auto; max-width: 100%; font-size: 11.5px; }
+    .gs-head-bar .pane-subtitle.pane-cwd::before { content: none; }
+    .gs-head-end { display: flex; align-items: center; justify-content: flex-end; gap: 6px; min-width: 0; max-width: 45vw; }
+    .gs-head-end .gs-unsafe-banner { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    /* The round buttons and the chip: the Claude app's 40px pills, a filled
+       disc a step lighter than the bar so each reads as a button. */
+    .gs-head-menu, .gs-head-bar .gs-menu-btn, .gs-status-chip {
+        display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto;
+        width: 40px; height: 40px; padding: 0; box-sizing: border-box; border-radius: 50%;
+        background: color-mix(in srgb, var(--text) 10%, var(--surface)); border: 1px solid var(--border); color: var(--text);
+    }
+    .gs-head-menu { cursor: pointer; }
+    .gs-head-menu svg, .gs-head-bar .gs-menu-btn svg { width: 18px; height: 18px; display: block; }
+    .gs-head-menu:hover { border-color: var(--accent); color: var(--accent); }
 
-    /* term-mobile-full: body class toggled by chela.termMobileFull (bound to
-       .gs-mobile-full-btn above). Hides the INFORMATIONAL chrome around the
-       single pane — the agent-pill switcher above it and the pane's own
-       context bar — so the pane's height rule (below) can claim nearly the
-       whole screen. Two things deliberately stay: the compact .gs-head (with
-       its collapse toggle + × kill — the only way back OUT of fullscreen), and
-       the keybar (Liav, 2026-07-25), because it is not clutter but the mobile
-       INPUT METHOD: Esc/Tab/Ctrl/arrows/Paste are unreachable without it, and
-       fullscreen is exactly when you're working in the terminal. */
-    body.term-mobile-full .term-switcher,
-    body.term-mobile-full .term-ctx-bar { display: none !important; }
-    /* True overlay, not just a tall box: the pane normally sits inside
-       .canvas's own top padding (CMX-377: clearance for the floating
-       .mobile-menu-fab/.safety-float, no topbar to measure against any more),
-       so a bare `height:100dvh` overshoots the viewport and pushes the
-       terminal's bottom rows under the fold. Pin it to the viewport (fixed +
-       top/left/right:0) so the height below is measured against the whole
-       screen instead. Subtract the keybar's FULL footprint (--term-keybar-h +
-       the safe-area inset its own bottom padding carries — same CMX-130
-       reasoning as the non-fullscreen rule above) so the fixed bar sits past
-       the pane instead of painting over the terminal's bottom row. z-index
-       100 clears the floating fab/safety cluster (46/47); the pane no longer
-       overlaps the keybar (35) geometrically, so their z-order is moot, and
-       both stay under modals (200). */
-    body.term-mobile-full .term-single .term-pane {
+    /* The pane: full width and full height between the screen's top edge (the
+       bar pads the safe area) and the keybar. No margin, border, radius, focus
+       ring or waiting glow: the status chip says waiting, and the terminal gets
+       the room. Pinned to the viewport (fixed) because the pane sits inside
+       .canvas's padding (60px clears the floating opener on the other views).
+       The height subtracts the keybar's FULL footprint (--term-keybar-h + the
+       safe-area inset its own bottom padding carries, CMX-130) and the soft
+       keyboard (--kb-occluded, published by pin.ts from VisualViewport: dvh
+       does not track the keyboard, so without it the line you type into hides
+       behind it). The keybar, the footer and the context bar stay (Liav,
+       2026-07-25 and 10-19). z-index 30: under the keybar (35), the drawer's
+       scrim and drawer (40/45, the hamburger opens it OVER the pane), the
+       safety float (47) and modals (200). The pane fills the screen, so the
+       page has nothing to scroll and a touch-drag needs no side gutter. */
+    .term-single .term-pane {
         position: fixed;
         top: 0; left: 0; right: 0;
-        /* --kb-occluded (published by _kbPin from VisualViewport) is how much
-           the SOFTWARE KEYBOARD covers — 0 when it's closed. dvh does not track
-           it, so without this the terminal's input line hides behind the
-           keyboard exactly when you're typing into it. */
         height: calc(100dvh - var(--term-keybar-h, 0px) - env(safe-area-inset-bottom) - var(--kb-occluded, 0px));
-        z-index: 100;
+        z-index: 30;
+        border: 0; border-radius: 0; box-shadow: none;
     }
-    /* .term-frame normally reserves --term-ctx-bar-h of bottom margin for the
-       now-hidden context bar (see the base .term-frame rule) — zero it here
-       so that space isn't left as a dead strip under the terminal. */
-    body.term-mobile-full .term-single .term-pane .term-frame { margin-bottom: 0; }
+    .term-single .term-pane::before { box-shadow: none; }
+    /* The safety pills float under the bar, never over its ⋯: the bar is its
+       40px buttons + its padding (the safe area or 6px, and 6px), at least 52px. */
+    body:has(#panel-terminals.active .gs-head-bar) .safety-float {
+        top: calc(max(52px, max(6px, env(safe-area-inset-top)) + 46px) + 8px);
+    }
     /* CMX-102: keyboard OPEN → the pane's height is MEASURED by _kbPin/_kbFitPane
        (terminals.js) so its box ends exactly at the keybar's top edge. The calc()
        rules above can't do that: they subtract a fixed list of chrome constants
@@ -4459,7 +3869,7 @@ a.kanban-tracker-link:focus-visible { text-decoration: underline; }
        Liav's 2026-07-25 call brings them back — the mobile single pane has room
        for the bottom bar now, and branch/context% are worth having. We DON'T
        re-hide them here: they fall through to the desktop `.gs-branch/.gs-ctx`
-       rules + the `hidden` attribute that _applyTermContext toggles by data
+       rules + the `hidden` attribute the footer (features/tilefoot) sets by data
        presence (so an empty/context-less pane still shows nothing). The №
        pane-number chip is gone everywhere since CMX-85. */
 
@@ -4540,170 +3950,23 @@ a.kanban-tracker-link:focus-visible { text-decoration: underline; }
     to   { opacity: 1; transform: translateY(0); }
 }
 
-/* ---------------------------------------------------------------------------
- * Knowledge (OKF viewer) — glance / browse / concept / search / graph.
- * ------------------------------------------------------------------------- */
-.kn-loading, .kn-dim { color: var(--text-dim); font-size: 12px; padding: 8px 0; }
-.kn-section-title { font-size: 13px; font-weight: 600; margin: 18px 0 8px; }
-.kn-section-title:first-child { margin-top: 4px; }
-.kn-sub { font-size: 11px; font-weight: 600; color: var(--text-dim);
-    text-transform: uppercase; letter-spacing: .04em; margin: 4px 0 8px; }
-
-/* type chips (counts) */
-.kn-chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 6px; }
-.kn-chip { background: var(--surface); border: 1px solid var(--border);
-    color: var(--text); border-radius: 999px; padding: 4px 12px; font-size: 12px;
-    cursor: pointer; font-family: var(--ui-font); }
-.kn-chip:hover { border-color: var(--accent); }
-.kn-chip-n { color: var(--accent); font-weight: 700; margin-right: 4px; }
-
-.kn-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin-bottom: 6px; }
-@media (max-width: 720px) { .kn-cols { grid-template-columns: 1fr; } }
-
-/* concept cards (rows in glance / browse / search / backlinks) */
-.kn-card { display: flex; align-items: center; gap: 8px; padding: 8px 10px;
-    border: 1px solid var(--border); border-radius: 8px; background: var(--surface);
-    margin-bottom: 6px; cursor: pointer; }
-.kn-card:hover { border-color: var(--accent); }
-.kn-card-title { font-weight: 600; font-size: 13px; white-space: nowrap; }
-.kn-card-desc { color: var(--text-dim); font-size: 12px; overflow: hidden;
-    text-overflow: ellipsis; white-space: nowrap; flex: 1; }
-.kn-card-ts { margin-left: auto; color: var(--text-dim); font-size: 11px; flex-shrink: 0; }
-.kn-snippet { color: var(--text-dim); font-size: 11px; width: 100%; margin-top: 4px;
-    border-left: 2px solid var(--border); padding-left: 8px; }
-
-.kn-dir { margin-bottom: 14px; }
-.kn-dir-head { font-size: 12px; font-weight: 600; color: var(--text); margin: 8px 0 6px;
-    text-transform: lowercase; }
-.kn-dir-head .kn-dim { padding: 0; margin-left: 4px; }
-
-.kn-log :is(h1,h2) { font-size: 12px; margin: 10px 0 4px; color: var(--text-dim); }
-.kn-log :is(ul) { margin: 0 0 6px; padding-left: 16px; }
-.kn-log li { font-size: 12px; margin: 2px 0; }
-
-/* type badges + graph node colours */
-.kn-badge { font-size: 10px; font-weight: 700; text-transform: uppercase;
-    letter-spacing: .03em; padding: 2px 7px; border-radius: 5px; flex-shrink: 0;
-    border: 1px solid transparent; }
-.kn-badge-agent   { color: var(--green);  border-color: var(--green);  background: color-mix(in srgb, var(--green) 12%, transparent); }
-.kn-badge-run     { color: var(--accent); border-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
-.kn-badge-sched   { color: var(--yellow); border-color: var(--yellow); background: color-mix(in srgb, var(--yellow) 12%, transparent); }
-.kn-badge-project { color: #a371f7; border-color: #a371f7; background: color-mix(in srgb, #a371f7 14%, transparent); }
-.kn-badge-other   { color: var(--text-dim); border-color: var(--border); background: var(--surface); }
-
-/* concept detail */
-.kn-back { color: var(--accent); cursor: pointer; font-size: 12px; display: inline-block; margin-bottom: 12px; }
-.kn-back:hover { text-decoration: underline; }
-.kn-head-card { border: 1px solid var(--border); border-radius: 10px;
-    background: var(--surface); padding: 14px 16px; margin-bottom: 16px; }
-.kn-head-top { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-.kn-title { font-size: 18px; margin: 0; font-weight: 700; }
-.kn-resource { display: inline-block; margin-top: 8px; color: var(--accent);
-    font-size: 12px; word-break: break-all; }
-.kn-tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
-.kn-tag { font-size: 11px; color: var(--text-dim); border: 1px solid var(--border);
-    border-radius: 999px; padding: 1px 9px; }
-
-.kn-body { font-size: 13px; line-height: 1.6; max-width: 760px; }
-.kn-body :is(.kn-mh) { font-size: 14px; font-weight: 700; margin: 16px 0 6px; }
-.kn-body p { margin: 6px 0; }
-.kn-body :is(.kn-ul, .kn-ol) { margin: 6px 0; padding-left: 20px; }
-.kn-body li { margin: 3px 0; }
-.kn-body blockquote { border-left: 3px solid var(--border); margin: 8px 0;
-    padding: 2px 0 2px 12px; color: var(--text-dim); }
-.kn-body code { background: var(--bg); border: 1px solid var(--border);
-    border-radius: 4px; padding: 1px 5px; font-size: 12px; }
-.kn-body .kn-code { background: var(--bg); border: 1px solid var(--border);
-    border-radius: 8px; padding: 10px 12px; overflow-x: auto; }
-.kn-body .kn-code code { background: none; border: none; padding: 0; }
-.kn-link { color: var(--accent); cursor: pointer; }
-.kn-link:hover { text-decoration: underline; }
-
-.kn-panel { margin-top: 20px; border-top: 1px solid var(--border); padding-top: 14px; }
-.kn-raw { margin-top: 18px; }
-.kn-raw summary { cursor: pointer; color: var(--text-dim); font-size: 12px; }
-.kn-raw-tbl { width: 100%; max-width: 760px; margin-top: 8px; border-collapse: collapse; font-size: 12px; }
-.kn-raw-tbl td { border: 1px solid var(--border); padding: 4px 8px; vertical-align: top; }
-.kn-raw-k { color: var(--text-dim); white-space: nowrap; width: 1%; }
-
-/* graph — sigma.js (WebGL) canvas, sized container (sigma sizes itself off it) */
-.kn-graph-wrap { border: 1px solid var(--border); border-radius: 10px;
-    background: var(--surface); padding: 8px; }
-.kn-graph-canvas { width: 100%; height: 520px; position: relative; }
-.kn-graph-error { padding: 16px 0; }
-
-/* Knowledge glance — digest + sessions feed + project chips */
-.kn-digest { font-size: 13px; color: var(--text); margin: 2px 0 18px;
-    padding-bottom: 12px; border-bottom: 1px solid var(--border); }
-.kn-feed-row { display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px;
-    border: 1px solid var(--border); border-radius: 8px; background: var(--surface);
-    margin-bottom: 8px; cursor: pointer; }
-.kn-feed-row:hover { border-color: var(--accent); }
-.kn-feed-main { flex: 1; min-width: 0; }
-.kn-feed-top { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.kn-feed-arrow { color: var(--text-dim); }
-.kn-feed-proj { color: var(--accent); font-size: 12px; cursor: pointer; }
-.kn-feed-proj:hover { text-decoration: underline; }
-.kn-feed-top .kn-card-ts { margin-left: auto; }
-.kn-feed-desc { color: var(--text-dim); font-size: 12px; margin-top: 3px;
-    overflow: hidden; text-overflow: ellipsis; display: -webkit-box;
-    -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
-.kn-pr { flex-shrink: 0; align-self: center; color: var(--accent); font-size: 11px;
-    font-weight: 600; border: 1px solid var(--border); border-radius: 6px;
-    padding: 2px 8px; text-decoration: none; }
-.kn-pr:hover { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
-.kn-pchips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 6px; }
-.kn-pchip { display: inline-flex; align-items: baseline; gap: 8px; background: var(--surface);
-    border: 1px solid var(--border); border-radius: 8px; padding: 7px 12px; cursor: pointer;
-    font-family: var(--ui-font); color: var(--text); }
-.kn-pchip:hover { border-color: #a371f7; }
-.kn-pchip-name { font-weight: 600; font-size: 13px; }
-.kn-pchip .kn-dim { padding: 0; font-size: 11px; }
-.kn-browse { margin-top: 20px; border-top: 1px solid var(--border); padding-top: 12px; }
-.kn-browse > summary { cursor: pointer; color: var(--text-dim); font-size: 12px;
-    font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
-.kn-browse[open] > summary { margin-bottom: 10px; }
-
-/* Personas — the declared persona layer (judge · critic · orchestrator), read-only. */
-.personas-intro { color: var(--text-dim); font-size: 13px; line-height: 1.5;
-    margin: 4px 0 16px; max-width: 720px; }
-.personas-intro strong { color: var(--text); }
-.personas-list { display: grid; gap: 14px;
-    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); }
-.persona-card { background: var(--surface); border: 1px solid var(--border);
-    border-radius: 8px; padding: 14px 16px; }
-.persona-head { display: flex; align-items: center; justify-content: space-between;
-    gap: 8px; margin-bottom: 8px; }
-.persona-title { font-weight: 600; font-size: 14px; }
-.persona-state { font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 999px;
-    text-transform: uppercase; letter-spacing: .03em; border: 1px solid var(--border);
-    color: var(--text-dim); }
-.persona-state.on { color: var(--accent); border-color: var(--accent); }
-.persona-state.dormant { color: var(--text-dim); }
-.persona-summary { color: var(--text-dim); font-size: 12.5px; line-height: 1.5;
-    margin-bottom: 12px; }
-.persona-rows { display: grid; gap: 6px; }
-.persona-row { display: grid; grid-template-columns: 108px 1fr; gap: 10px;
-    font-size: 12px; align-items: baseline; }
-.persona-row-key { color: var(--text-dim); text-transform: uppercase; font-size: 10.5px;
-    letter-spacing: .04em; font-weight: 600; }
-.persona-row-val { color: var(--text); line-height: 1.45; }
-.persona-docs { margin-top: 12px; display: flex; flex-wrap: wrap; gap: 6px; }
-.persona-doc { font-size: 10.5px; color: var(--text-dim); background: var(--bg);
-    border: 1px solid var(--border); border-radius: 4px; padding: 2px 6px; }
-
-/* Decisions — the durable, owner-independent log (decisions.js), now a
-   centered modal (index.html #decisions-menu, a `.palette-overlay` +
-   `.modal-sheet`, opened off #btn-decisions; cmx-106 first shipped this
+/* Decisions — the durable, owner-independent log (frontend/src/features/
+   decisions), a centered dialog (the kit's Dialog, .modal.modal-decisions,
+   opened off #btn-decisions; cmx-106 first shipped this
    inside the Personas panel, cmx-107 relocated it into an always-visible
    sidebar section, CMX-171 moved it into a topbar popover so the sidebar
    stops permanently spending a section on it, CMX-288 moved it again off
    that anchored popover — measured spanning the dashboard's full width and
    occluding the whole Wall — into this modal). Rows reuse the Feed's
-   .feed-row/.feed-cls-*/.feed-glyph classes verbatim (feed.js), so a decision
-   reads identically whether you meet it here or in the Feed — but the modal
-   is far narrower than the Feed's canvas, so the row grid is overridden
-   below into a stacked, wrapping layout. */
+   .feed-row, .feed-cls-<class> and .feed-glyph classes verbatim, so a decision reads in
+   the Feed's visual language — but the modal is far narrower than the Feed's
+   canvas was, so the row grid is overridden below into a stacked, wrapping
+   layout. The dialog is width-capped and its body is the one scroll area. */
+.modal.modal-decisions {
+    position: relative; width: 480px; max-width: 92vw; max-height: 80vh;
+    display: flex; flex-direction: column; overflow: hidden;
+}
+.modal-decisions .decisions-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
 .decisions-chip { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
     padding: 6px 10px; border-radius: 8px; border: 1px solid var(--border);
     background: var(--surface); font-size: 11.5px; margin-bottom: 10px; }
@@ -4717,24 +3980,18 @@ a.kanban-tracker-link:focus-visible { text-decoration: underline; }
 .decisions-chip-who { color: var(--text); font-weight: 600; }
 .decisions-chip-queued { color: var(--text-dim); }
 .decisions-chip-why { color: var(--text-dim); width: 100%; }
-/* The dangling/gone re-register control (decisions.js's _reregisterHtml) —
+/* The dangling/gone re-register control (the chip's Reregister) —
    the fix for an address self-heal cannot reach (a reboot, not a renumbering:
    chela/inbox.py's resolve_heal only covers the latter). Deliberately NOT a
    dismiss: it stays on screen until the address is actually fixed, one click
    away, rather than offering to hide a real undeliverable-queue condition. */
 .decisions-chip-reregister { display: flex; align-items: center; gap: 6px; width: 100%; }
-.decisions-chip-rereg-select { flex: 1 1 auto; min-width: 0; font-size: 11px; }
-.decisions-chip-rereg-btn { flex: 0 0 auto; font-size: 11px; padding: 3px 8px;
-    border-radius: 6px; border: 1px solid var(--ok-vermillion); background: transparent;
-    color: var(--ok-vermillion); cursor: pointer; }
-.decisions-chip-rereg-btn:hover { background: var(--ok-vermillion); color: var(--bg); }
-.decisions-chip-rereg-btn:disabled { opacity: 0.5; cursor: default; background: transparent;
-    color: var(--ok-vermillion); }
+.decisions-chip-reregister .ui-select { flex: 1 1 auto; min-width: 0; font-size: 11px; }
+.decisions-chip-reregister .btn { flex: 0 0 auto; }
 .decisions-chip-rereg-empty { color: var(--text-dim); font-style: italic; width: 100%; }
-/* CMX-178: the search box that filters the list below (decisions.js's
-   setDecisionsQuery). Full-width, same input styling as everywhere else in
-   the app (input[type="text"] above) — just spaced to sit under the chip. */
-.decisions-search { width: 100%; box-sizing: border-box; margin-bottom: 8px; }
+/* CMX-178: the search box that filters the list below. Full-width, the kit's
+   input styling — just spaced to sit under the chip. */
+.decisions-body > .s-input { width: 100%; box-sizing: border-box; margin-bottom: 8px; }
 /* Scope line under an ACTIVE decisions search: "3 of 120 loaded". Dim and small —
    it qualifies the result set (the popover filters a bounded buffer, not all
    history), it is not itself a result. Hidden when the box is empty. */
@@ -4749,9 +4006,8 @@ a.kanban-tracker-link:focus-visible { text-decoration: underline; }
     display: flex; flex-wrap: wrap; align-items: baseline; column-gap: 8px; row-gap: 2px;
     padding: 6px 10px; font-size: 11px;
 }
-.decisions-list .feed-seq { display: none; }
 .decisions-list .feed-summary { flex: 1 1 100%; font-size: 12px; }
-/* CMX-178: a row whose payload names a task_id (decisions.js's
+/* CMX-178: a row whose payload names a task_id (model.ts's
    itemFromDecisionPayload) click-throughs to the task-detail modal — cursor
    + hover are the only affordance needed, the row's content is unchanged. */
 .decisions-list .feed-row-clickable { cursor: pointer; }
@@ -4798,6 +4054,14 @@ a.kanban-tracker-link:focus-visible { text-decoration: underline; }
     max-width: calc(100vw - 32px);
 }
 .update-banner[hidden] { display: none; }
+/* CMX-95: the dismiss ✕ matches the Reload button beside it instead of the toolbar-sized
+   .icon-btn (38px, 17px glyph) — scoped here, .icon-btn itself is untouched. Two classes
+   outrank the ≤768px `.icon-btn` bump. min-width/min-height keep the WCAG 2.5.8 24×24
+   CSS-px target on phones while the box shrinks visually. */
+.update-banner .icon-btn {
+    width: auto; height: 24px; min-width: 24px; min-height: 24px;
+    padding: 0 6px; font-size: 14px; border-radius: 5px;
+}
 
 /* Cost tab → Usage view (CMX-38; see usage.js). */
 .usage-limits { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin-bottom: 14px; }
@@ -4822,3 +4086,87 @@ a.kanban-tracker-link:focus-visible { text-decoration: underline; }
 .usage-roots { display: grid; grid-template-columns: max-content 1fr; gap: 2px 10px; font-size: 11.5px; margin: 0; }
 .usage-roots dt { color: var(--text-dim); }
 .usage-roots dd { margin: 0; font-family: var(--mono, monospace); overflow-wrap: anywhere; }
+
+/* ---- UI kit (CMX-218, FRONTEND_PORT_PLAN.md P04) ----
+   The React kit in frontend/src/shared/ui reuses the classes above (.modal, .popover,
+   .popover-item, .tap-tip, .run-toast, .badge-*, .s-input, .s-select, .tab); these are the
+   few it adds. Colours are tokens only, so every body[data-theme] palette carries over. */
+.btn-primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 600; }
+.btn-primary:hover { background: color-mix(in srgb, var(--accent) 85%, var(--text)); color: var(--on-accent); }
+.btn-ghost { background: transparent; border-color: transparent; color: var(--text-dim); }
+.btn-ghost:hover { background: var(--border); color: var(--text); }
+.btn-sm { padding: 2px 8px; font-size: 11px; min-height: 24px; }
+.btn-md { padding: 5px 12px; font-size: 12px; min-height: 28px; }
+.btn:disabled { opacity: 0.55; cursor: not-allowed; }
+/* CMX-306: the overlay layer. Every Dialog and Sheet of the kit is a .ui-overlay, ONE layer
+   over the phone drawer (--z-drawer) and the safety float (47), under the floating layer
+   (.popover.ui-floating, 210) so a Select in a Dialog opens above it. The variants' own
+   classes set other values (the Settings scrim is the drawer's 40), so this rule comes
+   after them. */
+:root { --z-drawer: 45; --z-overlay: 200; }
+.ui-overlay { z-index: var(--z-overlay); }
+/* Its close button: a 44px target on a touch screen, where it is the way out (no Esc). */
+@media (pointer: coarse), (max-width: 768px) {
+    .ui-close { min-width: 44px; min-height: 44px; display: inline-flex; align-items: center; justify-content: center; }
+    .modal > h3 { padding-right: 40px; }
+}
+/* Radix positions a wrapper around the floating box (and copies the box's z-index onto it);
+   the box itself must not be fixed too. Above .modal-overlay (200): a Select in a Dialog. */
+.popover.ui-floating, .tap-tip.ui-floating { position: static; }
+.popover.ui-floating { z-index: 210; max-height: min(70vh, var(--radix-popper-available-height, 70vh)); }
+.popover-item[data-highlighted] { background: var(--accent); color: var(--on-accent); outline: none; }
+.popover-item[data-disabled], .popover-item[data-disabled]:hover { opacity: 0.5; cursor: default; background: transparent; color: inherit; }
+.ui-select { display: inline-flex; align-items: center; gap: 6px; }
+.section-header { display: flex; align-items: center; gap: 8px; margin: 0 0 10px; }
+.section-header h4 {
+    flex: 1 1 auto; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em;
+    color: var(--text); margin: 0; padding-left: 9px; position: relative;
+}
+.section-header h4::before {
+    content: ''; position: absolute; left: 0; top: 1px; bottom: 1px; width: 3px;
+    border-radius: 2px; background: var(--accent);
+}
+/* FieldRow: label | control | unit. The label track is a FIXED width, so every control in
+   a section starts at the same x whatever its label says (a long label wraps, it never
+   pushes the control), and the unit sits right after its control instead of floating to
+   the row's far end. */
+.field-row {
+    display: grid; grid-template-columns: 11rem minmax(0, max-content) minmax(0, 1fr);
+    align-items: center; column-gap: 10px; row-gap: 2px; margin-bottom: 8px;
+}
+.field-row:last-child { margin-bottom: 0; }
+.field-label { grid-column: 1; color: var(--text); font-size: 12px; overflow-wrap: anywhere; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.field-control { grid-column: 2; min-width: 0; display: flex; }
+.field-control .s-input { flex: 0 1 18rem; }
+.field-control .s-input.s-num { flex: 0 1 90px; text-align: right; }
+.field-control :disabled { opacity: 0.55; cursor: not-allowed; }
+.field-unit { grid-column: 3; color: var(--text-dim); font-size: 11px; }
+.field-hint { grid-column: 2 / -1; color: var(--text-dim); font-size: 11px; margin: 0; }
+.field-locked { display: inline-flex; }
+.ui-toggle {
+    position: relative; width: 34px; height: 20px; padding: 0; border-radius: 999px;
+    background: var(--border); border: 1px solid var(--border); flex: 0 0 auto;
+}
+.ui-toggle[data-state="checked"] { background: var(--accent); border-color: var(--accent); }
+.ui-toggle-thumb {
+    display: block; width: 14px; height: 14px; border-radius: 50%; background: var(--text);
+    transform: translateX(2px); transition: transform 0.12s;
+}
+.ui-toggle[data-state="checked"] .ui-toggle-thumb { background: var(--on-accent); transform: translateX(16px); }
+/* RadioGroup: each option a bordered row, the radio then its label and hint. */
+.ui-radio-opt {
+    display: flex; gap: 10px; align-items: flex-start; cursor: pointer;
+    padding: 10px; border: 1px solid var(--border); border-radius: 8px;
+}
+.ui-radio-opt.ui-radio-disabled { cursor: not-allowed; opacity: 0.7; }
+.ui-radio {
+    flex: 0 0 auto; width: 16px; height: 16px; margin-top: 1px; padding: 0; border-radius: 50%;
+    border: 1.5px solid var(--text-dim); background: none; display: grid; place-items: center;
+}
+.ui-radio[data-state="checked"] { border-color: var(--accent); }
+.ui-radio:disabled { cursor: not-allowed; }
+.ui-radio-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); }
+.ui-radio-text { display: flex; flex-direction: column; gap: 3px; font-size: 12.5px; }
+/* CopyField: a readonly value with its Copy button. */
+.ui-copy { display: flex; gap: 6px; flex: 1 1 auto; min-width: 0; }
+.ui-copy .ui-copy-in { flex: 1 1 auto; min-width: 0; }

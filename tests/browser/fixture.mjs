@@ -19,12 +19,23 @@ const TEMPLATE = join(ROOT, 'chela', 'dashboard', 'templates', 'index.html');
 
 export const ORIGIN = 'http://chela.test';
 
+// The phone's drawer opener (CMX-313): the floating ☰ with no pane open, the pane title
+// bar's hamburger with one open, the Work view's title bar's on Work (CMX-315). Exactly one
+// is visible at a time.
+export const DRAWER_OPENER = '#btn-menu-mobile:visible, #term-stage.term-single .gs-head-menu:visible, #panel-work.active .work-bar-menu:visible';
+/** Click the phone's visible drawer opener from inside the page (for page.evaluate callers). */
+export const OPEN_DRAWER_IN_PAGE = () => {
+    const el = [...document.querySelectorAll('#btn-menu-mobile, #term-stage.term-single .gs-head-menu, #panel-work.active .work-bar-menu')]
+        .find(b => b.getClientRects().length && getComputedStyle(b).display !== 'none');
+    el.click();
+};
+
 // One agent per status state. The sidebar row and the pane header each derive
 // the state through their OWN real code (nav.js / terminals.js tileState) from
 // these same fields, so matching marks are a fact about the product, not the
 // fixture. @2 is shared so `.safety-float`'s kill-switch pill is on screen.
 // ai_title on EVERY agent: it is what renders the pane header's dim subtitle
-// (terminals.js paneHead), and a fixture without one never draws the subtitle at
+// (features/panehead PaneHead), and a fixture without one never draws the subtitle at
 // all — so a guard on "title and subtitle share one line" had nothing to measure
 // (judge on #545, round 1: flex-direction:column on .gs-grip survived).
 export const AGENTS = [
@@ -51,10 +62,18 @@ export const ASSET_VERSION = 'f1x7ure0000a';
 // blocks (js_helpers/template_ifs.mjs) plus the CMX-426 asset expressions; anything else is a loud error rather than a
 // silently mis-rendered shell.
 export function renderShell() {
-    const flags = { terminals_enabled: true, wall_tile_dispatched: false };
+    const flags = { terminals_enabled: true, wall_tile_dispatched: false, app_src: true, app_css: true };
+    // CMX-215: app.py's app_src, the page's one module script (the built bundle), and (CMX-248)
+    // app_css, its stylesheet, from the committed Vite manifest as Flask reads them.
+    const main = JSON.parse(readFileSync(join(STATIC, 'app', 'manifest.json'), 'utf8'))['src/main.tsx'];
     const html = readFileSync(TEMPLATE, 'utf8')
+        .replace(/\{\{\s*app_src\s*\}\}/g, `static/v/${ASSET_VERSION}/app/${main.file}`)
+        .replace(/\{\{\s*app_css\s*\}\}/g, `static/v/${ASSET_VERSION}/app/${main.css[0]}`)
         .replace(/\{\{\s*asset_path\('([^']+)'\)\s*\}\}/g, (_, rel) => `static/v/${ASSET_VERSION}/${rel}`)
-        .replace(/\{\{\s*asset_version\|tojson\s*\}\}/g, JSON.stringify(ASSET_VERSION));
+        .replace(/\{\{\s*boot\|tojson\s*\}\}/g, JSON.stringify({
+            assetVersion: ASSET_VERSION, terminalsEnabled: flags.terminals_enabled,
+            wallTileDispatched: flags.wall_tile_dispatched,
+        }));
     const rendered = renderTemplateIfs(html, flags);
     if (/\{%|\{\{/.test(rendered)) throw new Error('renderShell: unrendered Jinja left in templates/index.html');
     return rendered;
@@ -98,7 +117,7 @@ export async function routeFixture(context, api = {}) {
     function sidebarLayout(req) {
         if (req.method() !== 'POST') return { layout };
         const body = req.postDataJSON() || {};
-        const fields = Object.fromEntries(['order', 'custom', 'view'].filter(f => f in body).map(f => [f, body[f]]));
+        const fields = Object.fromEntries(['order', 'custom', 'view', 'width'].filter(f => f in body).map(f => [f, body[f]]));
         const empty = { order: [], custom: { groups: [], assign: {} }, view: {} };
         if (body.import === true) {
             const imported = layout === null && Object.keys(fields).length > 0;
@@ -161,12 +180,13 @@ export const DID_NOT_RUN = 'browser suite DID NOT RUN';
 /** Launch Chromium. Returns `{ browser }`, or `{ why }` when it cannot. A
  * missing browser is treated exactly the way tests/test_js_suites.py treats a
  * missing node or jsdom: under CHELA_REQUIRE_JS_TESTS it THROWS (the suite
- * file fails), never a silent green; otherwise every test skips with `why`. */
-export async function launchChromium() {
+ * file fails), never a silent green; otherwise every test skips with `why`.
+ * `options` go to playwright's `chromium.launch` (e.g. extra `args`). */
+export async function launchChromium(options = {}) {
     let why;
     try {
         const { chromium } = await import('playwright');
-        return { browser: await chromium.launch() };
+        return { browser: await chromium.launch(options) };
     } catch (e) {
         why = e.code === 'ERR_MODULE_NOT_FOUND'
             ? 'the playwright package is not installed — run `pnpm install`'

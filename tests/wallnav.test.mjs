@@ -99,43 +99,36 @@
 // itself is a live-browser fact belonging in the PR, not a jsdom guard for a layout
 // question jsdom cannot see.
 //
-// Run: node --test tests/wallnav.test.mjs (pytest runs it via tests/test_js_suites.py;
+// Run: pnpm exec vitest run tests/wallnav.test.mjs (pytest runs it via tests/test_js_suites.py;
 // it needs `pnpm install` for jsdom — CHELA_REQUIRE_JS_TESTS makes a missing jsdom a FAILURE.)
-import { before, beforeEach, test } from 'node:test';
+import { beforeAll, beforeEach, test } from 'vitest';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { JSDOM } from 'jsdom';   // needs `pnpm install` — tests/test_js_suites.py enforces it
 import { cssForViewport, shapeSignature, DESKTOP } from './js_helpers/css_viewport.mjs';
+import { closePalette, flush, mountIslands, paletteOpen, searchPalette } from './js_helpers/dashboard_dom.mjs';
 
 const CSS = readFileSync(
     join(dirname(fileURLToPath(import.meta.url)), '..', 'chela', 'dashboard', 'static', 'style.css'), 'utf8');
 
 // The terminals panel, as index.html emits it (only the ids terminals.js / nav.js
-// reach for) — grid presets + lock sit directly on the toolbar, inline (no Layout menu).
+// reach for) — grid presets + lock sit directly on the toolbar, inline (no Layout menu):
+// the walltoolbar island draws them into its slot (CMX-242).
 const PANEL = `
 <div class="panel" id="panel-terminals">
   <button id="term-mode-single"></button>
   <button id="term-mode-wall"></button>
   <select id="term-agent"></select>
-  <span id="term-wall-grid">
-    <span id="term-grid-presets"></span>
-    <button id="term-lock-btn" onclick="chela.toggleWallLock(this)"></button>
-  </span>
+  <span class="island-slot" id="wall-toolbar-island"></span>
   <button id="term-new-shell"></button>
-  <div id="term-switcher"></div>
   <div id="term-stage"></div>
   <div id="term-min-dock"></div>
   <div id="sidebar-agents"></div>
   <div id="term-bar" class="kb-collapsed"><button class="kb-toggle" id="kb-toggle"></button><div class="kb-body" id="kb-body"></div></div>
 </div>
-<div class="palette-overlay" id="palette">
-  <div class="palette">
-    <input id="palette-input">
-    <div id="palette-list"></div>
-  </div>
-</div>`;
+<div id="overlays-island"></div>`;
 
 const AGENTS = [
     { name: 'alpha', window_id: '@1', online: true },
@@ -155,7 +148,7 @@ let CTX = [];
 function fakeFetch(url, opts) {
     const path = String(url);
     // CMX-117 property 16 (the orchestrator ring) drives real subscribe/release
-    // round-trips through window.chela.orchestratorBtnClick — echo back whatever
+    // round-trips through the pane menu's Orchestrator row — echo back whatever
     // wid the POST body named, the same contract chela/dashboard/app.py's real
     // routes have (orchestrator.js only applies a response with `ok: true`).
     if (path.endsWith('/api/orchestrator/subscribe') && opts && opts.body) {
@@ -219,12 +212,11 @@ function fakeGridStack() {
     };
 }
 
-let terminals, util;
+let terminals, agentsStore, viewStore, wall;
 
-before(async () => {
+beforeAll(async () => {
     const dom = new JSDOM(`<!doctype html><html><body>${PANEL}</body></html>`,
         { url: 'http://localhost:5005/', pretendToBeVisual: true });
-    dom.window.TERMINALS_ENABLED = true;
     for (const k of ['window', 'document', 'localStorage', 'navigator', 'HTMLElement',
         'Element', 'Node', 'Event', 'MouseEvent', 'KeyboardEvent', 'CustomEvent',
         'getComputedStyle', 'requestAnimationFrame', 'cancelAnimationFrame']) {
@@ -236,6 +228,9 @@ before(async () => {
     }
     globalThis.GridStack = fakeGridStack();
     globalThis.fetch = fakeFetch;
+    // The pane header's ⋯ menu is Radix's (CMX-241): its popper and modal layer need these.
+    globalThis.ResizeObserver = class { observe() {} unobserve() {} disconnect() {} };
+    globalThis.MutationObserver = dom.window.MutationObserver;
     dom.window.document.elementFromPoint = () => null;
     dom.window.Element.prototype.scrollIntoView = () => {};   // jsdom has no layout engine
     dom.window.HTMLCanvasElement.prototype.getContext = () => new Proxy({}, {
@@ -251,19 +246,22 @@ before(async () => {
     // Browser-faithful import order (main.js is the entry; nav <-> main is a cycle —
     // import anything else first and nav.js's `let`s are in their TDZ).
     globalThis.setInterval = () => 0;
-    await import('../chela/dashboard/static/js/main.js');
-    util = await import('../chela/dashboard/static/js/util.js');
-    terminals = await import('../chela/dashboard/static/js/terminals.js');
-    util.setCurrentTab('terminals');
-    util.setAgentsCache(AGENTS);
+    await mountIslands(dom.window);   // CMX-276: the sidebar island draws #sidebar-agents
+    (await import('../chela/dashboard/frontend/src/boot.ts')).start();
+    ({ agents: agentsStore } = await import('../chela/dashboard/frontend/src/shared/store/agents.ts'));
+    ({ view: viewStore } = await import('../chela/dashboard/frontend/src/shared/store/view.ts'));
+    terminals = await import('../chela/dashboard/frontend/src/features/wall/index.ts');
+    wall = await import('../chela/dashboard/frontend/src/shared/store/wall.ts');
+    viewStore.set('terminals');
+    agentsStore.set(AGENTS);
     await terminals.renderTerminals();
     // CMX-85: Alt+N targets the sidebar's rows — draw them.
-    (await import('../chela/dashboard/static/js/nav.js')).renderSidebarAgents(AGENTS);
+    (await import('../chela/dashboard/frontend/src/features/sidebar/controller.ts')).renderSidebarAgents(AGENTS);
 });
 
-beforeEach(() => {
+beforeEach(async () => {
     // No pane overflow menu should carry over open between tests.
-    document.querySelectorAll('.pane-overflow-menu').forEach(m => { m.hidden = true; });
+    await closeMenus();
     // focusPaneByWid's flash clears itself after 1100ms, but tests only wait 120ms —
     // without this a later test's flashed(wid) assertion could pass on a PRIOR
     // test's leftover flash instead of its own dispatch (a vacuous pass).
@@ -271,6 +269,36 @@ beforeEach(() => {
 });
 
 const tile = wid => document.querySelector(`#term-stage .grid-stack-item[gs-id="${wid}"]`);
+// Radix opens and closes across a few turns (passive effects, then its own setTimeout(0)
+// that arms the outside-press listener): let them all land.
+const tick = async () => { for (let i = 0; i < 4; i++) await new Promise(resolve => setTimeout(resolve, 0)); };
+// CMX-241: the pane's ⋯ menu is the kit's Menu (Radix), portaled to <body> only while open.
+// Open it the way the keyboard does (Enter on the trigger), or the way a click does (a
+// primary-button pointerdown on the trigger).
+const openMenu = async wid => {
+    const trigger = tile(wid).querySelector('.gs-menu-btn');
+    // Enter TOGGLES: on an open menu it would close it
+    if (trigger.getAttribute('aria-expanded') !== 'true') {
+        trigger.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+        await tick();
+    }
+    return document.querySelector('.pane-overflow-menu');
+};
+const pressMenu = async wid => {
+    tile(wid).querySelector('.gs-menu-btn').dispatchEvent(new window.MouseEvent('pointerdown', { bubbles: true, button: 0 }));
+    await tick();
+};
+async function closeMenus() {
+    document.querySelectorAll('.pane-overflow-menu').forEach(m =>
+        m.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true })));
+    await tick();
+}
+// Pick a row of `wid`'s menu (opening it first), as a click does.
+const pickRow = async (wid, sel) => {
+    const row = (await openMenu(wid)).querySelector(sel);
+    row.click();
+    await tick(); await tick();
+};
 // The window id of the Nth sidebar row as drawn — what Alt+N opens (CMX-85).
 const rowWid = n => {
     const row = document.querySelectorAll('#sidebar-agents .agent-row[data-agent]')[n - 1];
@@ -286,33 +314,26 @@ const geom = wid => {
 // split it back apart into a standalone "⋯" (.gs-menu-btn) beside a plain status
 // dot (.gs-dot)). Wire/Share/Orchestrator/Pin live behind the "⋯", not loose in
 // the header — and stay the SAME real buttons, just moved.
-test('a pane\'s "⋯" menu is hidden by default, and opening it reveals Wire/Share/Orchestrator/Pin', () => {
+test('a pane\'s "⋯" menu is closed by default, and opening it reveals Wire/Share/Orchestrator/Pin', async () => {
     const wid = '@1';
     const badge = tile(wid).querySelector('.gs-menu-btn');
-    const menu = tile(wid).querySelector('.pane-overflow-menu');
     assert.ok(badge, 'every wall tile gets a menu trigger');
-    assert.ok(menu, 'every wall tile gets an overflow menu');
-    assert.equal(menu.hidden, true, 'starts closed');
+    assert.equal(document.querySelector('.pane-overflow-menu'), null, 'starts closed');
     assert.equal(badge.getAttribute('aria-expanded'), 'false');
-    // The trigger itself must be wired to togglePaneOverflow — jsdom doesn't execute
-    // inline onclick attributes without runScripts:"dangerously" (not set here), so
-    // calling togglePaneOverflow directly below would still pass even if this wiring
-    // were stripped from the markup. Assert the wiring as a source fact instead.
-    assert.match(badge.getAttribute('onclick'), /chela\.togglePaneOverflow\(event,\s*this\)/,
-        'the "⋯" must carry the togglePaneOverflow onclick itself — it IS the menu trigger, ' +
-        'not a menu that merely opens when the handler happens to be invoked directly');
 
-    window.chela.togglePaneOverflow({ stopPropagation() {} }, badge);
-    assert.equal(menu.hidden, false, 'opens on click');
+    const menu = await openMenu(wid);
+    assert.ok(menu, 'the trigger opens the pane\'s menu');
     assert.equal(badge.getAttribute('aria-expanded'), 'true');
     // The controls the header used to show inline now live INSIDE this pane's menu.
     assert.ok(menu.querySelector('.gs-port'), 'wire port is inside the menu');
     assert.ok(menu.querySelector('.gs-share-btn'), 'share toggle is inside the menu');
     assert.ok(menu.querySelector('.gs-orch-btn'), 'orchestrator toggle is inside the menu');
     assert.ok(menu.querySelector('.gs-pin-btn'), 'pin toggle is inside the menu');
+    assert.equal(tile(wid).querySelector('.gs-port, .gs-share-btn, .gs-orch-btn, .gs-pin-btn'), null,
+        'none of them sits loose in the header');
 
-    window.chela.togglePaneOverflow({ stopPropagation() {} }, badge);
-    assert.equal(menu.hidden, true, 'closes on a second click');
+    await closeMenus();
+    assert.equal(document.querySelector('.pane-overflow-menu'), null, 'Escape closes it');
     assert.equal(badge.getAttribute('aria-expanded'), 'false');
 });
 
@@ -320,11 +341,9 @@ test('a pane\'s "⋯" menu is hidden by default, and opening it reveals Wire/Sha
 // #primary-menu, not the icon-only strip cmx-111 shipped: a vertical list of
 // `.popover-item.ov-item` rows, each a lucide icon PLUS a text label, still wired to
 // the same state-bearing buttons.
-test('the "⋯" overflow renders a labeled vertical list, like the topbar #primary-menu — not an icon-only strip', () => {
+test('the "⋯" overflow renders a labeled vertical list, like the topbar #primary-menu — not an icon-only strip', async () => {
     const wid = '@3';
-    const badge = tile(wid).querySelector('.gs-menu-btn');
-    const menu = tile(wid).querySelector('.pane-overflow-menu');
-    window.chela.togglePaneOverflow({ stopPropagation() {} }, badge);
+    const menu = await openMenu(wid);
 
     // Reuses the topbar's exact classes, not a bespoke lookalike.
     assert.ok(menu.classList.contains('overflow-menu'),
@@ -337,44 +356,40 @@ test('the "⋯" overflow renders a labeled vertical list, like the topbar #prima
         assert.ok(row.textContent.trim().length > 0, 'every row must carry a non-empty text label, not just an icon');
     });
 
-    // The state-bearing elements are the SAME rows (restyled in place), not a
-    // decorative wrapper around a still-hidden original button — a relabel that
-    // dropped the real element (breaking _updateShareBtns/_updateOrchBtns/the pin
-    // toggle's DOM queries) would fail here.
+    // The state-bearing classes are on the rows themselves (presence-owner.js finds the
+    // Share row's count by them).
     const share = menu.querySelector('.gs-share-btn.popover-item.ov-item');
     const orch = menu.querySelector('.gs-orch-btn.popover-item.ov-item');
     const pinRow = menu.querySelector('.gs-pin-btn.popover-item.ov-item');
-    assert.ok(share, 'the Share row must still BE .gs-share-btn (the state-bearing element)');
-    assert.ok(orch, 'the Orchestrator row must still BE .gs-orch-btn (the state-bearing element)');
-    assert.ok(pinRow, 'the Pin row must still BE .gs-pin-btn (the state-bearing element)');
+    assert.ok(share, 'the Share row must BE .gs-share-btn');
+    assert.ok(orch, 'the Orchestrator row must BE .gs-orch-btn');
+    assert.ok(pinRow, 'the Pin row must BE .gs-pin-btn');
     assert.equal(share.getAttribute('data-wid'), wid);
     assert.equal(orch.getAttribute('data-wid'), wid);
 
-    // Toggling still flips aria-pressed/`.on` on the right element (the relabel must
-    // not have broken the wiring _updateShareBtns/_updateOrchBtns/termPinToggle rely on).
-    assert.equal(pinRow.getAttribute('aria-pressed'), 'false');
-    window.chela.termPinToggle(pinRow, wid);
-    assert.equal(pinRow.getAttribute('aria-pressed'), 'true', 'pin row still toggles aria-pressed on itself');
-    assert.ok(pinRow.classList.contains('on'), 'pin row still gets the `.on` state class');
-    window.chela.termPinToggle(pinRow, wid);   // leave state as found for later tests
-    assert.equal(pinRow.getAttribute('aria-pressed'), 'false');
-
-    window.chela.togglePaneOverflow({ stopPropagation() {} }, badge);
+    // Picking Pin flips its checked state and `.on` on the row itself.
+    assert.equal(pinRow.getAttribute('aria-checked'), 'false');
+    await pickRow(wid, '.gs-pin-btn');
+    const on = (await openMenu(wid)).querySelector('.gs-pin-btn');
+    assert.equal(on.getAttribute('aria-checked'), 'true', 'the Pin row reads checked once picked');
+    assert.ok(on.classList.contains('on'), 'the Pin row gets the `.on` state class');
+    await closeMenus();
+    await pickRow(wid, '.gs-pin-btn');   // leave state as found for later tests
+    assert.equal((await openMenu(wid)).querySelector('.gs-pin-btn').getAttribute('aria-checked'), 'false');
+    await closeMenus();
 });
 
-// 1b — Only one pane's overflow is open at a time (opening a second closes the first).
-test('opening one pane\'s "⋯" overflow closes any other pane\'s open overflow', () => {
-    const btn1 = tile('@1').querySelector('.gs-menu-btn');
-    const btn2 = tile('@2').querySelector('.gs-menu-btn');
-    const menu1 = tile('@1').querySelector('.pane-overflow-menu');
-    const menu2 = tile('@2').querySelector('.pane-overflow-menu');
+// 1b — Only one pane's overflow is open at a time (pressing a second's trigger closes the first).
+test('opening one pane\'s "⋯" overflow closes any other pane\'s open overflow', async () => {
+    await pressMenu('@1');
+    assert.equal(tile('@1').querySelector('.gs-menu-btn').getAttribute('aria-expanded'), 'true');
 
-    window.chela.togglePaneOverflow({ stopPropagation() {} }, btn1);
-    assert.equal(menu1.hidden, false);
-
-    window.chela.togglePaneOverflow({ stopPropagation() {} }, btn2);
-    assert.equal(menu2.hidden, false, 'the second pane\'s menu opens');
-    assert.equal(menu1.hidden, true, 'the first pane\'s menu must close — only one open at a time');
+    await pressMenu('@2');
+    assert.equal(tile('@2').querySelector('.gs-menu-btn').getAttribute('aria-expanded'), 'true', 'the second pane\'s menu opens');
+    assert.equal(tile('@1').querySelector('.gs-menu-btn').getAttribute('aria-expanded'), 'false',
+        'the first pane\'s menu must close — only one open at a time');
+    assert.equal(document.querySelectorAll('.pane-overflow-menu').length, 1);
+    await closeMenus();
 });
 
 // 2 — THE TOOLBAR REVERT. No Layout menu: the grid presets + lock are directly on the
@@ -395,20 +410,18 @@ test('the wall toolbar has no Layout menu — grid presets and lock are inline',
 });
 
 // 3 — THE PIN. Reflowing the wall must never touch a pinned pane's geometry.
-test('a pinned pane keeps its exact geometry through a grid-preset reflow', () => {
+test('a pinned pane keeps its exact geometry through a grid-preset reflow', async () => {
     const PINNED = '@2', OTHER = '@1';
-    const pinBtn = tile(PINNED).querySelector('.gs-pin-btn');
-    assert.ok(pinBtn, 'every wall tile gets a pin button');
-    assert.equal(pinBtn.getAttribute('aria-pressed'), 'false');
+    assert.ok((await openMenu(PINNED)).querySelector('.gs-pin-btn'), 'every wall tile gets a pin row');
+    await closeMenus();
 
-    window.chela.termPinToggle(pinBtn, PINNED);
-    assert.equal(pinBtn.getAttribute('aria-pressed'), 'true', 'toggled on');
+    await pickRow(PINNED, '.gs-pin-btn');
     assert.ok(tile(PINNED).classList.contains('pane-pinned'), 'tile wears the pinned class');
     assert.ok(JSON.parse(localStorage.getItem('pc_wall_pinned') || '[]').includes(PINNED),
         'the pin is persisted so a reload remembers it');
 
     const before = { pinned: geom(PINNED), other: geom(OTHER) };
-    window.chela.applyGridLayout(1, 1);   // single-column stack: guaranteed to move OTHER
+    wall.setWallPreset({ cols: 1, rows: 1 });   // single-column stack: guaranteed to move OTHER
 
     assert.equal(geom(PINNED), before.pinned,
         'a pinned pane must come out of a grid-preset reflow with the SAME x/y/w/h');
@@ -418,10 +431,10 @@ test('a pinned pane keeps its exact geometry through a grid-preset reflow', () =
 
     // Unpin and confirm the next reflow reaches it again — the exemption isn't sticky
     // past the toggle.
-    window.chela.termPinToggle(pinBtn, PINNED);
-    assert.equal(pinBtn.getAttribute('aria-pressed'), 'false');
+    await pickRow(PINNED, '.gs-pin-btn');
     assert.ok(!tile(PINNED).classList.contains('pane-pinned'));
-    window.chela.applyGridLayout(3, 1);
+    assert.ok(!JSON.parse(localStorage.getItem('pc_wall_pinned') || '[]').includes(PINNED));
+    wall.setWallPreset({ cols: 3, rows: 1 });
     assert.notEqual(geom(PINNED), before.pinned, 'once unpinned, a reflow may move it again');
 });
 
@@ -445,13 +458,13 @@ test('a pinned pane keeps its exact geometry through a grid-preset reflow', () =
 // toggle line); re-adding ONLY the toggle line below leaves the CSS-side
 // test green but reddens this one on its own.
 test('CMX-268: a grid-preset click never adds body.wall-density-airy — the density treatment was reverted, not just its CSS', () => {
-    window.chela.applyGridLayout(1, 1);   // 1-up: used to be the airiest density
+    wall.setWallPreset({ cols: 1, rows: 1 });   // 1-up: used to be the airiest density
     assert.ok(!document.body.classList.contains('wall-density-airy'),
-        'applyGridLayout(1,1) added wall-density-airy — the reverted density toggle is back');
+        'the 1-column preset added wall-density-airy — the reverted density toggle is back');
 
-    window.chela.applyGridLayout(2, 1);   // 2-up: the boundary, and the shipped default preset
+    wall.setWallPreset({ cols: 2, rows: 1 });   // 2-up: the boundary, and the shipped default preset
     assert.ok(!document.body.classList.contains('wall-density-airy'),
-        'applyGridLayout(2,1) added wall-density-airy — the reverted density toggle is back');
+        'the 2-column preset added wall-density-airy — the reverted density toggle is back');
 });
 
 // 4 — THE KEYBOARD SWITCHER. Alt+N opens the Nth visible SIDEBAR row's session (CMX-85
@@ -541,7 +554,7 @@ test('holding Alt inside a pane\'s own document shows the sidebar numbers; relea
 test('Alt+N from the single-terminal view switches to the wall and focuses that row\'s pane', async () => {
     const flashed = wid => tile(wid) && tile(wid).querySelector('.grid-stack-item-content').classList.contains('pane-flash');
     try {
-        window.chela.setTermMode('single');
+        terminals.setTermMode('single');
         await new Promise(r => setTimeout(r, 120));   // let the in-flight renderTerminals settle
         assert.equal(document.getElementById('term-stage').className, 'term-single',
             'fixture: setTermMode("single") must actually leave the wall, or this test is vacuous');
@@ -553,7 +566,7 @@ test('Alt+N from the single-terminal view switches to the wall and focuses that 
         assert.equal(terminals.isWallVisible(), true, 'Alt+N from the single view must bring the wall back');
         assert.ok(flashed(rowWid(2)), 'Alt+2 from the single view must focus the 2nd sidebar row\'s pane on the wall');
     } finally {
-        window.chela.setTermMode('wall');
+        terminals.setTermMode('wall');
         await new Promise(r => setTimeout(r, 120));
     }
 });
@@ -616,20 +629,20 @@ test('the iframe alt-switch listener is registered in the CAPTURE phase and stop
 // not Alt+N, is now the PRIMARY switcher — it must be reachable no matter where focus
 // is. Same iframe-side injection property 6/8 proved necessary for Alt+N, generalized
 // (not forked) to also carry this shortcut.
-test('Ctrl+K fired inside a focused pane\'s own iframe document opens the command palette', () => {
+test('Ctrl+K fired inside a focused pane\'s own iframe document opens the command palette', async () => {
     const ifr = tile('@1').querySelector('iframe.term-frame');
     assert.ok(ifr, 'the pane must have a real ttyd iframe, or this test is vacuous');
     ifr.dispatchEvent(new window.Event('load'));   // (re)wires the generalized iframe-side listener
 
-    assert.equal(document.getElementById('palette').classList.contains('open'), false,
-        'the palette must start closed, or this test is vacuous');
+    assert.equal(await paletteOpen(), false, 'the palette must start closed, or this test is vacuous');
 
     ifr.contentDocument.dispatchEvent(
         new window.KeyboardEvent('keydown', { key: 'k', ctrlKey: true, bubbles: true }));
+    await flush();
 
-    assert.equal(document.getElementById('palette').classList.contains('open'), true,
-        'Ctrl+K fired inside the pane\'s own document must open the palette');
-    window.chela.closePalette();
+    assert.equal(await paletteOpen(), true, 'Ctrl+K fired inside the pane\'s own document must open the palette');
+    assert.ok(document.getElementById('palette-list'), 'the open palette is not drawn');
+    await closePalette();
 });
 
 // 9b — same wiring discipline as property 8, for the SAME injector (not a duplicate
@@ -670,8 +683,8 @@ test('the iframe listener also registers Ctrl+K in the CAPTURE phase and stops p
 // unminimized wall panes lead the list in wall order, followed by a non-selectable
 // divider, then the normal views/projects/actions — and a pane already shown up top is
 // not ALSO repeated further down as a duplicate "session ·" row.
-test('an empty-query palette floats live wall panes to the top, in wall order, before a divider', () => {
-    window.chela.openPalette();
+test('an empty-query palette floats live wall panes to the top, in wall order, before a divider', async () => {
+    await searchPalette();
     const rows = Array.from(document.getElementById('palette-list').children);
 
     const paneRows = rows.slice(0, 3);
@@ -693,39 +706,38 @@ test('an empty-query palette floats live wall panes to the top, in wall order, b
     assert.equal(titles.filter(t => t === 'alpha').length, 1,
         'a pane already floated to the top must not ALSO repeat as a duplicate "session" row below the divider');
 
-    window.chela.closePalette();
+    await closePalette();
 });
 
 // 10b — ATTENTION-FIRST WITHIN THE PANES SECTION. A pane waiting on the human bubbles
 // ahead of idle peers even though it trails them in wall order — the sidebar's own
 // status word/rank, reused so the two never disagree about what needs you.
-test('a pane that wants the human floats ahead of idle panes, still inside the panes section', () => {
-    util.setAgentsCache([
+test('a pane that wants the human floats ahead of idle panes, still inside the panes section', async () => {
+    agentsStore.set([
         { name: 'alpha', window_id: '@1', online: true },
         { name: 'bravo', window_id: '@2', online: true, session_status: 'waiting' },
         { name: 'charlie', window_id: '@3', online: true },
     ]);
-    window.chela.openPalette();
+    await searchPalette();
     const paneRows = Array.from(document.getElementById('palette-list').children).slice(0, 3);
     assert.deepEqual(paneRows.map(r => r.querySelector('.pi-title').textContent), ['bravo', 'alpha', 'charlie'],
         'bravo (waiting on the human) must float ahead of idle alpha/charlie despite trailing them in wall order');
-    window.chela.closePalette();
-    util.setAgentsCache(AGENTS);   // restore for any test that runs after this one
+    await closePalette();
+    agentsStore.set(AGENTS);   // restore for any test that runs after this one
 });
 
 // 10c — TYPING ESCAPES THE "PANES ONLY" TRAP. A non-empty query drops the panes-first
 // section entirely and falls back to the normal fuzzy match over everything a query
 // would have matched before this feature existed — a view must still be reachable by
 // name once the user types.
-test('typing a query drops the panes-first section and fuzzy-matches everything, views included', () => {
-    window.chela.openPalette();
-    window.chela._renderPalette('wall');   // "Wall" is a real registered view label
+test('typing a query drops the panes-first section and fuzzy-matches everything, views included', async () => {
+    await searchPalette('wall');   // "Wall" is a real registered view label
     const rows = Array.from(document.getElementById('palette-list').children);
     assert.ok(rows.every(r => !r.classList.contains('palette-divider')),
         'a non-empty query must not render the panes-first divider');
     assert.ok(rows.some(r => r.querySelector('.pi-sub') && r.querySelector('.pi-sub').textContent === 'view'),
         'a view must still be reachable by fuzzy search once the user types — a query must never trap you in panes-only');
-    window.chela.closePalette();
+    await closePalette();
 });
 
 // ─── The four RENDERED-CSS visual cues have NO jsdom guard, by design ─────────────────
@@ -755,12 +767,14 @@ test('typing a query drops the panes-first section and fuzzy-matches everything,
 // STATIC source-text fact: the higher-specificity form must exist, and a bare
 // lower-specificity form (which the popover-item rule can still outrank
 // regardless of source order) must be gone.
-test('the pane-menu ON-state fill rules repeat the `.pane-overflow-menu button` prefix so they outrank the popover-item base rule', () => {
+test('the pane-menu ON-state fill rules repeat the `.pane-overflow-menu` prefix so they outrank the popover-item base rule', () => {
+    // CMX-241: the rows are the kit Menu's items (Radix), not <button>s, so the prefix is
+    // `.pane-overflow-menu .X.on` (0,3,0) over the base `.pane-overflow-menu .popover-item` (0,2,0).
     ['gs-share-btn', 'gs-orch-btn', 'gs-pin-btn'].forEach(cls => {
-        const strong = new RegExp(String.raw`^\.pane-overflow-menu\s+button\.${cls}\.on\s*\{[^}]*background:`, 'm');
+        const strong = new RegExp(String.raw`^\.pane-overflow-menu\s+\.${cls}\.on\s*\{[^}]*background:`, 'm');
         assert.ok(strong.test(CSS),
-            `.pane-overflow-menu button.${cls}.on { background: ... } must exist — higher specificity ` +
-            '(0,3,1) than .pane-overflow-menu button.popover-item (0,2,1)');
+            `.pane-overflow-menu .${cls}.on { background: ... } must exist — higher specificity ` +
+            '(0,3,0) than .pane-overflow-menu .popover-item (0,2,0)');
 
         const bare = new RegExp(String.raw`^\.${cls}\.on\s*\{[^}]*background:`, 'm');
         assert.ok(!bare.test(CSS),
@@ -781,8 +795,10 @@ test('the pane-menu ON-state fill rules repeat the `.pane-overflow-menu button` 
     // genuinely prove — unlike the rule's rendered WIDTH, a cascade fact that belongs with the
     // manual-verify cues above (a higher-specificity override could collapse it and no source
     // parse would rank that correctly).
-    assert.match(CSS, /^\.pane-overflow-menu\s+button\.popover-item\s*\{/m,
-        'the base row rule `.pane-overflow-menu button.popover-item { ... }` must exist (rescoped off .gs-keys)');
+    assert.match(CSS, /^\.pane-overflow-menu\s+\.popover-item\s*\{/m,
+        'the base row rule `.pane-overflow-menu .popover-item { ... }` must exist (rescoped off .gs-keys)');
+    assert.doesNotMatch(CSS, /\.pane-overflow-menu\s+button\./,
+        'a `.pane-overflow-menu button.` rule matches nothing: the rows are not buttons (CMX-241)');
     assert.doesNotMatch(CSS, /^\.gs-keys\s+button\.popover-item\s*\{/m,
         'a stale `.gs-keys button.popover-item` base rule must not exist — .gs-keys no longer wraps the menu');
 });
@@ -1036,7 +1052,7 @@ test('the header dot is painted by live status (working vs idle carry different 
 // Round 1's _colorTermDots only ever assigned three classes (busy/waiting/idle →
 // working/waiting/idle) — the pane header dot could never become 'done' at all, no
 // matter how finished the pane was, because the function it was painted by didn't
-// know that state existed. tileState() (wallmodel.js) is the one source that DOES —
+// know that state existed. tileState() (wallmodel.ts) is the one source that DOES —
 // it is what the pane's OWN `.gs-state` pill already draws from — so _colorTermDots
 // now reads it too. Drives a real termTick() with a finished (idle + open PR) agent
 // and reads the dot's class back, the same technique test 12 uses for working/idle.
@@ -1070,7 +1086,7 @@ test("CMX-377: the header dot reaches the 'done' class for a finished pane, not 
 // header still calling it "busy" while the sidebar calls it "working", or the pane
 // header never reaching "done" at all — test 12a-2's regression) fails here.
 test('CMX-377: sidebar row and pane header dot use the SAME class for each of the 4 states', async () => {
-    const nav = await import('../chela/dashboard/static/js/nav.js');
+    const sidebar = await import('../chela/dashboard/frontend/src/features/sidebar/controller.ts');
 
     // A throwaway sidebar host — renderSidebarAgents only ever needs #sidebar-agents
     // to exist; it is not part of the shared PANEL fixture the wall tests mount.
@@ -1092,7 +1108,7 @@ test('CMX-377: sidebar row and pane header dot use the SAME class for each of th
     ];
 
     for (const c of CASES) {
-        nav.renderSidebarAgents([c.row]);
+        sidebar.renderSidebarAgents([c.row]);
         const sideDot = host.querySelector('.term-status-dot');
         assert.ok(sideDot, `${c.label}: sidebar row did not render a .term-status-dot`);
         const sideCls = ['working', 'waiting', 'idle', 'done'].find(k => sideDot.classList.contains(k));
@@ -1247,7 +1263,9 @@ test('branch + context render inside the bottom .term-ctx-bar, and the live poll
     assert.equal(ctxChip.hidden, false, 'the live poll must reveal the context chip in its new home');
     assert.equal(ctxChip.textContent, '42% · 84.0K/200K');
     assert.equal(branchChip.hidden, false);
-    assert.equal(branchChip.textContent, '⎇ cmx-117');
+    // CMX-242: the branch glyph is a Lucide icon now (no emoji in the UI), beside the name.
+    assert.equal(branchChip.textContent, 'cmx-117');
+    assert.ok(branchChip.querySelector('svg.gs-branch-icon'), 'the branch chip lost its icon');
 
     CTX = [];   // leave the fixture as other tests expect it (real shape: an array)
     await terminals.termTick();
@@ -1353,17 +1371,19 @@ test('the header dot gains a ring iff its pane owns the decisions inbox, in lock
     // CMX-32: the ring rides the dot's unclipped wrapper, not the dot (see 16b).
     const ownerBadge = tile(owner).querySelector('.gs-dot-ring');
     const otherBadge = tile(other).querySelector('.gs-dot-ring');
-    const orchBtn = tile(owner).querySelector('.gs-orch-btn');
     assert.equal(ownerBadge.classList.contains('gs-dot-orch'), false, 'sanity: nobody owns the slot yet');
 
-    await window.chela.orchestratorBtnClick(orchBtn, owner);
+    await pickRow(owner, '.gs-orch-btn');
     assert.equal(ownerBadge.classList.contains('gs-dot-orch'), true,
-        'subscribing must add the ring — the same onOrchestratorChange signal the menu row repaints from');
-    assert.equal(orchBtn.classList.contains('on'), true, 'sanity: the menu row agrees it is now owned');
+        'subscribing must add the ring — the same orchestrator store the menu row draws from');
+    const row = (await openMenu(owner)).querySelector('.gs-orch-btn');
+    assert.equal(row.classList.contains('on'), true, 'sanity: the menu row agrees it is now owned');
+    assert.equal(row.getAttribute('aria-checked'), 'true');
+    await closeMenus();
     assert.equal(otherBadge.classList.contains('gs-dot-orch'), false,
         'ownership is exclusive — a non-owning pane\'s dot must never also show the ring');
 
-    await window.chela.orchestratorBtnClick(orchBtn, owner);   // release, leave state as found
+    await pickRow(owner, '.gs-orch-btn');   // release, leave state as found
     assert.equal(ownerBadge.classList.contains('gs-dot-orch'), false, 'releasing must remove the ring');
 });
 
@@ -1378,14 +1398,14 @@ test('the header dot gains a ring iff its pane owns the decisions inbox, in lock
 // `.gs-dot-orch` must resolve a solid outline, must contain the status dot, and
 // neither it nor any ancestor may carry a clip-path. Put the ring back on the dot
 // and `done`/`waiting` go red here.
-test('CMX-32: the orchestrator ring resolves visible, unclipped, for working, waiting, idle AND done', async (t) => {
+test('CMX-32: the orchestrator ring resolves visible, unclipped, for working, waiting, idle AND done', async () => {
     const owner = '@2';
     const agent = AGENTS[1];
-    const orchBtn = tile(owner).querySelector('.gs-orch-btn');
-    // The button TOGGLES — read its `.on` first, so a prior test that failed before
+    const owns = () => tile(owner).querySelector('.gs-dot-ring').classList.contains('gs-dot-orch');
+    // The row TOGGLES — read the ring first, so a prior test that failed before
     // releasing can't turn this subscribe into a release.
-    if (!orchBtn.classList.contains('on')) await window.chela.orchestratorBtnClick(orchBtn, owner);
-    assert.ok(orchBtn.classList.contains('on'), `sanity: ${owner} should own the decisions inbox now`);
+    if (!owns()) await pickRow(owner, '.gs-orch-btn');
+    assert.ok(owns(), `sanity: ${owner} should own the decisions inbox now`);
     const CASES = {
         working: { session_status: 'busy' },
         waiting: { needs_human: true },
@@ -1393,9 +1413,13 @@ test('CMX-32: the orchestrator ring resolves visible, unclipped, for working, wa
         done: { session_status: 'idle', pr: { url: 'https://github.com/x/y/pull/1', state: 'open' } },
     };
     const css = cssForViewport(CSS, DESKTOP);
+    // Every state runs even after one fails, so a regression names EVERY state it breaks.
+    const broken = [];
+    const eachState = async (state, fn) => {
+        try { await fn(); } catch (e) { broken.push(`${state}: ${e.message}`); }
+    };
     try {
-        // One subtest per state, so a regression names EVERY state it breaks.
-        for (const [state, fields] of Object.entries(CASES)) await t.test(state, async () => {
+        for (const [state, fields] of Object.entries(CASES)) await eachState(state, async () => {
             Object.assign(agent, { session_status: undefined, pr: undefined, needs_human: undefined }, fields);
             await terminals.termTick();
             const dot = tile(owner).querySelector('.gs-dot');
@@ -1422,10 +1446,11 @@ test('CMX-32: the orchestrator ring resolves visible, unclipped, for working, wa
                     'on the ring\'s path — it clips the outline away (CMX-32)');
             }
         });
+        assert.deepEqual(broken, [], 'the orchestrator ring breaks in these states');
     } finally {
         Object.assign(agent, { session_status: undefined, pr: undefined, needs_human: undefined });
         await terminals.termTick();
-        if (orchBtn.classList.contains('on')) await window.chela.orchestratorBtnClick(orchBtn, owner);   // release
+        if (owns()) await pickRow(owner, '.gs-orch-btn');   // release
     }
 });
 
@@ -1440,20 +1465,19 @@ test('CMX-32: the orchestrator ring resolves visible, unclipped, for working, wa
 // the NEXT unrelated document click. This asserts what jsdom CAN prove; the "no
 // shrink" finding itself is a live-browser fact, stated in the PR, not a jsdom guard
 // for a layout question jsdom cannot see.
-test('starting a wire from the badge menu closes the menu immediately, and Escape fully cleans up — CMX-117 F', () => {
+test('starting a wire from the badge menu closes the menu immediately, and Escape fully cleans up — CMX-117 F', async () => {
     const wid = '@1';
-    const badge = tile(wid).querySelector('.gs-menu-btn');
-    const menu = tile(wid).querySelector('.pane-overflow-menu');
     const gsEl = document.querySelector('.grid-stack');
     const stage = document.getElementById('term-stage');
 
-    window.chela.togglePaneOverflow({ stopPropagation() {} }, badge);
-    assert.equal(menu.hidden, false, 'sanity: the menu is open before the drag starts');
+    const menu = await openMenu(wid);
+    assert.ok(menu, 'sanity: the menu is open before the drag starts');
 
-    const port = menu.querySelector('.gs-port');
-    window.chela.wireDragStart({ preventDefault() {}, stopPropagation() {} }, port, wid);
+    // The press on the Wire row is what starts the gesture (PaneHead's onMouseDown).
+    menu.querySelector('.gs-port').dispatchEvent(new window.MouseEvent('mousedown', { bubbles: true, buttons: 1, clientX: 5, clientY: 5 }));
+    await tick();
 
-    assert.equal(menu.hidden, true, 'the popover must close the instant the wire gesture starts');
+    assert.equal(document.querySelector('.pane-overflow-menu'), null, 'the menu must close the instant the wire gesture starts');
     assert.ok(gsEl.classList.contains('gs-dragging'), 'the grid enters the wire-drag state');
     assert.ok(stage.classList.contains('wire-live'), 'every tile sprouts a drop socket');
     assert.ok(stage.querySelector('.wire-overlay'), 'the wire SVG overlay is appended above the grid');
@@ -1481,7 +1505,7 @@ test('starting a wire from the badge menu closes the menu immediately, and Escap
 // is the fixed bar's measured footprint; the pane must subtract it. Static
 // source-text facts, same honest-scoping as the ctx-bar-h guards above — jsdom can't
 // resolve the rendered overlap itself.
-test('CMX-133: mobile keeps the pane header (shorter) instead of hiding it, and hides only the inapplicable window-control keys (not the × kill button)', () => {
+test('CMX-133/CMX-313: mobile keeps the pane header, and never hides its hamburger', () => {
     // A media-aware rule parser — source-text parsing, jsdom can't resolve the actual
     // cascade (see the honest-scoping note above the keybar-h test below), but tracking
     // the FULL nested @media stack per leaf rule rather than flattening it away. A
@@ -1548,7 +1572,7 @@ test('CMX-133: mobile keeps the pane header (shorter) instead of hiding it, and 
     // its rightmost compound is `*`, which never textually contains `.gs-win-ctl`,
     // yet it structurally matches that exact element (the real DOM's only child of
     // `.gs-keys`) and hides it — and everything inside it — same as a named rule
-    // would. Map each button class to its real ancestor chain (paneHead's actual
+    // would. Map each button class to its real ancestor chain (PaneHead's actual
     // markup: .gs-keys > .gs-win-ctl > the three buttons) so a wildcard descendant
     // selector rooted at any of those ancestors counts as targeting it too.
     const ANCESTORS = {
@@ -1621,81 +1645,21 @@ test('CMX-133: mobile keeps the pane header (shorter) instead of hiding it, and 
         '.gs-head must not be hidden on mobile — alone, via a more specific selector, or via a rule ' +
         'neutered by @media — the header\'s dot/menu (Share/Orchestrator/Pin) must stay reachable on phones');
 
-    // The shape-only regex this replaced (`padding: Npx Npx; font-size: Npx;`) never
-    // compared magnitudes to the desktop rule, so inflating the mobile numbers past
-    // desktop's satisfied it while making the "shorter" bar taller than desktop.
-    const gsHeadBlocks = rules.filter((r) => r.selector.split(',').map((s) => s.trim()).includes('.gs-head'));
-    assert.equal(gsHeadBlocks.length, 2,
-        'expected exactly one desktop .gs-head rule and one mobile override — found ' + gsHeadBlocks.length);
-    // CMX-230 tokenised .gs-head's desktop font-size onto :root's
-    // --wall-pane-font-size (a bare px literal there is exactly what that
-    // ticket's own type-scale guard now forbids — see
-    // tests/dashboard_scale_nav_a11y.test.mjs) — so a `font-size:` value here
-    // may be a literal Npx (the mobile override still is) OR a `var(--name)`
-    // reference, resolved against its :root declaration.
-    const rootTokenPx = (name) => {
-        const root = CSS.match(/:root\s*\{([^}]*)\}/);
-        assert.ok(root, ':root block not found');
-        const m = root[1].match(new RegExp('--' + name + ':\\s*([0-9.]+)px'));
-        assert.ok(m, `--${name} not declared as a px value on :root`);
-        return parseFloat(m[1]);
-    };
-    // CMX-377: the desktop rule moved from a padding-derived height to a FIXED
-    // `height: 40px` (the brief's own spec) — vertical padding is no longer a
-    // meaningful "how tall is the bar" proxy for it, so the desktop side reads
-    // `height` directly instead of padding's first number. Mobile keeps its
-    // own pre-existing padding-derived compact bar (CMX-133, untouched by this
-    // restyle) — its total is approximated as 2×vertical-padding + font-size
-    // (a single-line bar's content-box height), a reasonable proxy this file
-    // already used for the pre-CMX-377 desktop rule.
-    const fontSize = (body) => {
-        const fsLiteral = body.match(/font-size:\s*([0-9.]+)px/);
-        const fsVar = body.match(/font-size:\s*var\(--([\w-]+)\)/);
-        assert.ok(fsLiteral || fsVar, 'each .gs-head rule must declare font-size: Npx or font-size: var(--token)');
-        return fsLiteral ? parseFloat(fsLiteral[1]) : rootTokenPx(fsVar[1]);
-    };
-    const desktopHeight = (() => {
-        const m = gsHeadBlocks[0].body.match(/height:\s*([0-9.]+)px/);
-        assert.ok(m, 'the desktop .gs-head rule must declare a fixed height: Npx');
-        return parseFloat(m[1]);
-    })();
-    const desktopFs = fontSize(gsHeadBlocks[0].body);
-    const mobilePad = gsHeadBlocks[1].body.match(/padding:\s*([0-9.]+)px\s+([0-9.]+)px/);
-    assert.ok(mobilePad, 'the mobile .gs-head override must declare padding: Npx Npx');
-    const mobileFs = fontSize(gsHeadBlocks[1].body);
-    const mobileHeightEstimate = 2 * parseFloat(mobilePad[1]) + mobileFs;
-    assert.ok(mobileHeightEstimate < desktopHeight,
-        `the mobile .gs-head's estimated height (${mobileHeightEstimate}px, from its own padding+font-size) must ` +
-        `be smaller than desktop's fixed height (${desktopHeight}px) — this is the "shorter bar" the PR claims`);
-    assert.ok(mobileFs < desktopFs,
-        `the mobile .gs-head font-size (${mobileFs}px) must be smaller than desktop's (${desktopFs}px)`);
-
-    // CMX-133: `.gs-keys` — and its `.gs-win-ctl` wrapper, which is where min/max/kill
-    // actually live — must NOT be hidden on mobile any more, by any route. Hiding
-    // either one swallows the × kill button, the only way to tear a session down on
-    // phones, while leaving every individual-button assertion below satisfied.
-    assert.equal(hiddenOnMobile('gs-keys'), false,
-        '.gs-keys must not be hidden on mobile — directly, via a more specific descendant selector like ' +
-        '`.term-single .gs-keys`, or via a rule nested in a @media that never actually matches a phone — ' +
-        'any of those hides the × kill button along with the inapplicable drag/min/max controls');
-    assert.equal(hiddenOnMobile('gs-win-ctl'), false,
-        '.gs-win-ctl (the wrapper `.gs-keys` holds — min/max/kill all live inside it) must not be hidden ' +
-        'on mobile either; hiding the wrapper drops the × kill button while every `.gs-keys`/`.gs-min-btn`/' +
-        '`.gs-max-btn`/`.gs-kill-btn` assertion here stays satisfied');
-
-    // The individual window-control buttons that genuinely don't apply to a forced
-    // single pane (drag has nothing to drag onto, minimize has no dock, maximize is
-    // already full-screen) must still be hidden ON AN ACTUAL PHONE — but NOT gs-kill-btn.
-    assert.ok(hiddenOnMobile('gs-min-btn'), '.gs-min-btn must stay hidden on mobile — no dock to minimize to');
-    assert.ok(hiddenOnMobile('gs-max-btn'), '.gs-max-btn must stay hidden on mobile — already full-screen');
-    assert.equal(hiddenOnMobile('gs-kill-btn'), false,
-        '.gs-kill-btn must NOT be hidden on mobile — it is the only way to close/kill a session there');
+    // CMX-313 (Liav, 10-23) retired the compact phone header and its × (CMX-133): the phone's
+    // single pane now draws the Claude-app title bar (PaneHead `.gs-head-bar`), whose
+    // hamburger opens the drawer and whose ⋮ menu holds Close. No .gs-keys is rendered there
+    // at all, so the stylesheet no longer hides its buttons; what matters is that the
+    // hamburger is never hidden on a phone. The rendered layout is measured in
+    // tests/browser/phone_pane_titlebar.test.mjs.
+    assert.equal(hiddenOnMobile('gs-head-menu'), false,
+        '.gs-head-menu (the title bar\'s hamburger) must not be hidden on mobile — with the pane open it is ' +
+        'the only way into the drawer');
 });
 
 // 133-WIRING — the CSS guard above only proves the mobile stylesheet keeps `.gs-keys`
 // visible and never hides `.gs-kill-btn`; it says nothing about whether the mobile
 // header actually RENDERS a kill button in the first place. Every other DOM test in
-// this file builds WALL tiles (paneHead(wid, draggable=true) via buildWall) — none of
+// this file builds WALL tiles (PaneHead with wall=true via buildWall) — none of
 // them ever construct the single-pane header (draggable=false) that phones force
 // renderTerminals into. Gating `kill` on `draggable` (wall-only) would leave the CSS
 // un-hiding a button that is never there, and every guard above would stay green.
@@ -1707,31 +1671,29 @@ test('CMX-133: mobile keeps the pane header (shorter) instead of hiding it, and 
 // stay green. Stub matchMedia to report a PHONE width for the extent of this one
 // test, so `_isMobileTerm()` really is true while the header renders — the only way
 // to prove `kill` isn't gated on it.
-test('CMX-133: the single-pane header includes the × kill button on an ACTUAL phone (matchMedia stubbed to a phone width), not gated on draggable or _isMobileTerm()', async () => {
+test('CMX-313: the single-pane header on an ACTUAL phone (matchMedia stubbed to a phone width) is the title bar: hamburger, no ✕, no maximize', async () => {
     const origMatchMedia = window.matchMedia;
     window.matchMedia = (q) => ({
         media: q, matches: true, addEventListener() {}, removeEventListener() {},
         addListener() {}, removeListener() {},
     });
     try {
-        window.chela.setTermMode('single');
+        terminals.setTermMode('single');
         await new Promise((r) => setTimeout(r, 120));   // let the in-flight renderTerminals settle
         const stage = document.querySelector('#term-stage');
         assert.equal(stage.className, 'term-single',
             'setTermMode("single") must force the single-pane layout for this assertion to be meaningful');
         const head = stage.querySelector('.gs-head');
         assert.ok(head, 'single-pane mode must still render a pane header');
-        assert.ok(head.querySelector('.gs-kill-btn'),
-            'the single-pane header must include the × kill button on an ACTUAL phone (matchMedia stubbed ' +
-            'to report a phone-width match, so `_isMobileTerm()` is really true here) — gating it on ' +
-            '`draggable` (true only for wall tiles) or on `_isMobileTerm()` (this file\'s other guards never ' +
-            'exercise it, since every other test runs under the desktop-width matchMedia stub) silently ' +
-            'reproduces the exact CMX-133 bug: no × on any real phone');
+        assert.ok(head.classList.contains('gs-head-bar'), 'the phone single pane must draw the title bar');
+        assert.ok(head.querySelector('.gs-head-menu'), 'the phone title bar must carry the drawer\'s hamburger');
+        assert.equal(head.querySelector('.gs-kill-btn'), null, 'the phone title bar must not draw ✕ (Close is in ⋮)');
+        assert.equal(head.querySelector('.gs-max-btn'), null, 'the phone title bar must not draw maximize');
     } finally {
         // Restore the desktop-width stub and wall mode so any test appended after
         // this one sees the same environment every other test in this file expects.
         window.matchMedia = origMatchMedia;
-        window.chela.setTermMode('wall');
+        terminals.setTermMode('wall');
         await new Promise((r) => setTimeout(r, 120));
     }
 });
@@ -1827,9 +1789,9 @@ test('CMX-130: --term-keybar-h (declared on :root) is consumed by EXACT name in 
 const paneTitle = wid => tile(wid).querySelector('.gs-grip .pane-title').textContent;
 test('CMX-146: a pane\'s ai_title renders as a dim subtitle under the name, and only when present', () => {
     const withTitle = AGENTS.map(a => a.window_id === '@1' ? { ...a, ai_title: 'Fix the flaky wall test' } : a);
-    util.setAgentsCache(withTitle);
+    agentsStore.set(withTitle);
     try {
-        terminals._refreshPaneLabels();
+        terminals.refreshPaneLabels();
         const sub1 = tile('@1').querySelector('.gs-grip .pane-subtitle');
         assert.ok(sub1, '@1 carries an ai_title — its pane header must show a .pane-subtitle');
         assert.equal(paneTitle('@1'), 'Fix the flaky wall test', 'Claude\'s title leads the header');
@@ -1841,29 +1803,29 @@ test('CMX-146: a pane\'s ai_title renders as a dim subtitle under the name, and 
         assert.equal(tile('@2').querySelector('.gs-grip .pane-subtitle'), null,
             'a pane with no ai_title must render NO .pane-subtitle element');
     } finally {
-        util.setAgentsCache(AGENTS);
-        terminals._refreshPaneLabels();
+        agentsStore.set(AGENTS);
+        terminals.refreshPaneLabels();
     }
 });
 
-// A brand-new wid forces buildWall to construct its tile FRESH through paneHead
+// A brand-new wid forces buildWall to construct its tile FRESH through PaneHead
 // itself (the wall's `_termSig` is keyed on the wid set — see the comment on
 // `_displayLabel` above — so a new window always rebuilds, unlike an ai_title
 // change on an EXISTING wid, which only ever reaches the DOM through
 // `_refreshPaneLabels`, covered separately above). This is the only test in the
-// file that exercises paneHead's initial markup for the subtitle, not the
+// file that exercises PaneHead's first render for the subtitle, not the
 // refresh path — the two are genuinely different code paths in terminals.js.
-test('CMX-146: a NEW pane (never refreshed) still shows its ai_title from paneHead\'s own initial markup', async () => {
+test('CMX-146: a NEW pane (never refreshed) still shows its ai_title from PaneHead\'s first render', async () => {
     const withNewAgent = [...AGENTS, { name: 'delta', window_id: '@4', online: true, ai_title: 'Ship the delta feature' }];
     try {
-        util.setAgentsCache(withNewAgent);
+        agentsStore.set(withNewAgent);
         await terminals.renderTerminals();
         const sub = tile('@4').querySelector('.gs-grip .pane-subtitle');
-        assert.ok(sub, 'a freshly-built tile (via paneHead, not _refreshPaneLabels) must carry the subtitle');
+        assert.ok(sub, 'a freshly-built tile (via PaneHead, not _refreshPaneLabels) must carry the subtitle');
         assert.equal(paneTitle('@4'), 'Ship the delta feature');
         assert.equal(sub.textContent, 'delta');
     } finally {
-        util.setAgentsCache(AGENTS);
+        agentsStore.set(AGENTS);
         await terminals.renderTerminals();
         assert.equal(tile('@4'), null, 'the injected 4th pane must not leak into later tests');
     }
@@ -1874,10 +1836,10 @@ test('CMX-146: a NEW pane (never refreshed) still shows its ai_title from paneHe
 // title beats the window name, and with no title the header is the window name.
 test('CMX-62: pane header — manual name beats the title, the title beats the window name', () => {
     try {
-        util.setAgentsCache(AGENTS.map(a =>
+        agentsStore.set(AGENTS.map(a =>
             a.window_id === '@1' ? { ...a, manual_name: true, ai_title: 'Review the auth PR' }
                 : a.window_id === '@2' ? { ...a, ai_title: 'Open-MMO game on Windows PC' } : a));
-        terminals._refreshPaneLabels();
+        terminals.refreshPaneLabels();
         assert.equal(paneTitle('@1'), 'alpha', 'a manual name must beat Claude\'s title on the header');
         assert.equal(tile('@1').querySelector('.gs-grip .pane-subtitle').textContent, 'Review the auth PR',
             'with a manual name leading, Claude\'s title is the dim subtitle');
@@ -1889,17 +1851,17 @@ test('CMX-62: pane header — manual name beats the title, the title beats the w
         // A manual name whose ai_title says the same thing: nothing distinct to add,
         // so no subtitle repeating the header. And with both titles present the
         // ai_title — not the live session name — leads a non-manual header.
-        util.setAgentsCache(AGENTS.map(a =>
+        agentsStore.set(AGENTS.map(a =>
             a.window_id === '@1' ? { ...a, manual_name: true, ai_title: 'alpha' }
                 : a.window_id === '@2' ? { ...a, ai_title: 'Open-MMO game', session_name: 'stale session' } : a));
-        terminals._refreshPaneLabels();
+        terminals.refreshPaneLabels();
         assert.equal(paneTitle('@1'), 'alpha');
         assert.equal(tile('@1').querySelector('.gs-grip .pane-subtitle'), null,
             'a subtitle that only repeats the header must not render');
         assert.equal(paneTitle('@2'), 'Open-MMO game', 'ai_title must outrank the live session name');
     } finally {
-        util.setAgentsCache(AGENTS);
-        terminals._refreshPaneLabels();
+        agentsStore.set(AGENTS);
+        terminals.refreshPaneLabels();
     }
 });
 
@@ -1908,16 +1870,16 @@ test('CMX-146: _refreshPaneLabels tracks ai_title live — added, changed, and r
         // starts absent (restored AGENTS fixture carries no ai_title)
         assert.equal(tile('@3').querySelector('.gs-grip .pane-subtitle'), null);
 
-        util.setAgentsCache(AGENTS.map(a => a.window_id === '@3' ? { ...a, ai_title: 'Investigate flaky CI' } : a));
-        terminals._refreshPaneLabels();
+        agentsStore.set(AGENTS.map(a => a.window_id === '@3' ? { ...a, ai_title: 'Investigate flaky CI' } : a));
+        terminals.refreshPaneLabels();
         let sub = tile('@3').querySelector('.gs-grip .pane-subtitle');
         assert.ok(sub, 'a fresh ai_title must appear on the next refresh, no full rebuild required');
         assert.equal(paneTitle('@3'), 'Investigate flaky CI');
         assert.equal(sub.textContent, 'charlie');
 
         // a revised title (Claude re-titles as the conversation evolves) must replace it in place
-        util.setAgentsCache(AGENTS.map(a => a.window_id === '@3' ? { ...a, ai_title: 'Investigate and fix flaky CI' } : a));
-        terminals._refreshPaneLabels();
+        agentsStore.set(AGENTS.map(a => a.window_id === '@3' ? { ...a, ai_title: 'Investigate and fix flaky CI' } : a));
+        terminals.refreshPaneLabels();
         sub = tile('@3').querySelector('.gs-grip .pane-subtitle');
         assert.ok(sub, 'the subtitle element must still be there after a revision');
         assert.equal(paneTitle('@3'), 'Investigate and fix flaky CI');
@@ -1925,14 +1887,14 @@ test('CMX-146: _refreshPaneLabels tracks ai_title live — added, changed, and r
 
         // and it must be removed again once the field goes back to empty/absent — not left
         // stale, which would read as a title Claude never actually confirmed.
-        util.setAgentsCache(AGENTS);
-        terminals._refreshPaneLabels();
+        agentsStore.set(AGENTS);
+        terminals.refreshPaneLabels();
         assert.equal(tile('@3').querySelector('.gs-grip .pane-subtitle'), null,
             'the subtitle must be REMOVED once ai_title is gone, not left stale from the prior refresh');
         assert.equal(paneTitle('@3'), 'charlie', 'no title ⇒ the window name is the header again');
     } finally {
-        util.setAgentsCache(AGENTS);
-        terminals._refreshPaneLabels();
+        agentsStore.set(AGENTS);
+        terminals.refreshPaneLabels();
     }
 });
 
@@ -1945,7 +1907,7 @@ test('CMX-146: _refreshPaneLabels tracks ai_title live — added, changed, and r
 test('CMX-41: the rendered .gs-pr chip and Review bar claim "ready" only for a confirmed open, non-draft PR', async () => {
     const URL = 'https://github.com/acme/widgets/pull/613';
     const CASES = [
-        { state: 'open', draft: false, text: '⚑ #613', dim: false, review: true },
+        { state: 'open', draft: false, text: '#613', dim: false, review: true },
         { state: 'open', draft: true, text: '#613 draft', dim: true, review: false },
         { state: 'merged', draft: false, text: '#613 merged', dim: true, review: false },
         { state: 'closed', draft: false, text: '#613 closed', dim: true, review: false },
@@ -1967,8 +1929,9 @@ test('CMX-41: the rendered .gs-pr chip and Review bar claim "ready" only for a c
         assert.equal(chip.hidden, false, `${name}: a PR link is always shown as a chip`);
         assert.equal(chip.getAttribute('href'), URL, `${name}: the chip links to the PR`);
         assert.equal(chip.textContent, c.text, `${name}: the chip reads "${chip.textContent}"`);
-        assert.equal(chip.textContent.includes('⚑'), c.review,
-            `${name}: the ⚑ is earned only by a confirmed open, non-draft PR`);
+        // CMX-242: the flag is a Lucide icon (.gs-pr-flag), no longer a ⚑ in the text.
+        assert.equal(!!chip.querySelector('.gs-pr-flag'), c.review,
+            `${name}: the flag is earned only by a confirmed open, non-draft PR`);
         assert.equal(chip.classList.contains('gs-pr-dim'), c.dim, `${name}: dim class`);
         assert.equal(chip.title.includes('(state unknown)'), c.state !== 'open' && c.state !== 'merged' && c.state !== 'closed',
             `${name}: the tooltip says when the state is unknown — "${chip.title}"`);

@@ -75,7 +75,9 @@ def test_inventory_count_is_67():
     # CHELA_SHARE_SANDBOX_SUBSCRIPTION, then 61, until CMX-26 added CHELA_INBOX_HELD_ALERT_S
     # and CHELA_CLEAN_UNMERGED_ALERT_S, then 65, until CMX-86 added the four inbox notice
     # knobs, then 66, until CMX-110 added CHELA_SELFCHECK_ALERT_S, then 67, until CMX-103
-    # added CHELA_DASHBOARD_URL). A change
+    # added CHELA_DASHBOARD_URL, then 66, when CMX-266 retired CHELA_TERMINAL_TIMESTAMPS,
+    # then 67, until CMX-318 added CHELA_PARK_MAX_S).
+    # A change
     # here without a change to the doc's stated count is exactly the kind of drift this
     # file exists to catch — pinned as its own assertion so a future diff has to touch the
     # prose too.

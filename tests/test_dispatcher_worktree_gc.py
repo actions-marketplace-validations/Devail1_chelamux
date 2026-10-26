@@ -206,7 +206,7 @@ def test_closed_run_travels_ledger_api_and_board_from_one_real_tick(ticking, mon
 
     The judge's round-4 verdict landed three surviving mutations that each deleted the
     word `closed` from a different layer (the ledger's `_run_trial_outcome`, the API's
-    `recent` filter, kanban.js's flattener) — and the round-4 fix added three guards
+    `recent` filter, the board's flattener) — and the round-4 fix added three guards
     that each independently hand-wrote `status='closed'` as a literal directly into
     that layer's OWN input. Every one of those catches its own layer's mutation, but
     none of them proves a `closed` row ever ARRIVES at that layer for real; the judge's
@@ -223,9 +223,9 @@ def test_closed_run_travels_ledger_api_and_board_from_one_real_tick(ticking, mon
       1. the trial ledger (`dispatcher._run_trial_outcome`, fed the row `list_runs()`
          reads back from the DB `tick()` just wrote to)
       2. the `/api/dispatcher` HTTP payload (the real Flask route, reading the real DB)
-      3. the REAL `renderKanban()` DOM — fed the exact JSON layer 2 produced, via
-         `tests/js_helpers/assert_closed_run_lane.mjs` (same jsdom bootstrap as
-         `tests/kanban_flatten.test.mjs`)
+      3. the REAL Work board's DOM (features/work) — fed the exact JSON layer 2 produced, via
+         `tests/js_helpers/assert_closed_run_lane.mjs` (the shared jsdom bootstrap,
+         `tests/js_helpers/dashboard_dom.mjs`)
 
     Narrow any of the three production tuples/conditions back down (the judge's three
     mutations) and this goes red at the layer that lost `closed` — the row either never
@@ -250,6 +250,14 @@ def test_closed_run_travels_ledger_api_and_board_from_one_real_tick(ticking, mon
     # --- Layer 2: the real /api/dispatcher HTTP payload ---------------------------------
     from chela.dashboard import app as dash
 
+    # CMX-193: a closed run of a task still OPEN folds onto its open card, so the task
+    # leaves the tracker first (struck by a human) — its closed run is then its only card.
+    (repo / "TODO.md").write_text("- [x] alpha\n- [ ] beta\n")
+    # This board is the fixture's markdown workflow alone. The dashboard also auto-adds
+    # the checkout's own WORKFLOW.md (a Linear one), which would turn it into a mixed
+    # board on Linear's columns, where there is no Archived lane.
+    monkeypatch.setattr(dash, "_repo_root_workflow", lambda: None)
+
     client = dash.app.test_client()
     resp = client.get("/api/dispatcher")
     assert resp.status_code == 200
@@ -260,22 +268,26 @@ def test_closed_run_travels_ledger_api_and_board_from_one_real_tick(ticking, mon
     api_row = next(r for r in wf_entry["recent_runs"] if r["task_id"] == alpha)
     assert api_row["status"] == "closed"
 
-    # --- Layer 3: the real renderKanban() DOM, fed this exact payload -------------------
+    # --- Layer 3: the real Work board DOM, fed this exact payload -----------------------
     node = shutil.which("node")
     if not node:
         pytest.skip("node not available for the JS board-render layer")
-    if not (ROOT / "node_modules" / "jsdom").is_dir():
-        msg = "jsdom is not installed — the JS board-render layer DID NOT RUN. Run `pnpm install`."
+    if not (ROOT / "node_modules" / "jsdom").is_dir() or not (ROOT / "node_modules" / "vitest").is_dir():
+        msg = ("jsdom or vitest is not installed — the JS board-render layer DID NOT RUN. "
+               "Run `pnpm install`.")
         if os.environ.get("CHELA_REQUIRE_JS_TESTS"):
             pytest.fail(msg + " (CHELA_REQUIRE_JS_TESTS is set: a silent skip is not green)")
         pytest.skip(msg)
 
     payload_path = tmp_path / "api_dispatcher_payload.json"
     payload_path.write_text(json.dumps(data))
+    # CMX-217: through Vitest, which compiles the TypeScript the legacy graph imports.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("NODE_CHANNEL")}
+    env.update(CLOSED_RUN_PAYLOAD=str(payload_path), CLOSED_RUN_TASK=alpha)
     proc = subprocess.run(
-        [node, str(ROOT / "tests" / "js_helpers" / "assert_closed_run_lane.mjs"),
-         str(payload_path), alpha],
-        capture_output=True, timeout=60, cwd=str(ROOT),
+        [node, str(ROOT / "node_modules" / "vitest" / "vitest.mjs"), "run", "--config",
+         str(ROOT / "tests" / "js_helpers" / "closed_run_lane.config.mjs")],
+        capture_output=True, timeout=120, cwd=str(ROOT), env=env,
     )
     if proc.returncode != 0:
         pytest.fail(
@@ -414,14 +426,16 @@ def test_tick_does_not_restrike_or_reclaim_a_closed_unmerged_PRs_task(ticking, m
     assert n == 1  # one row for this task_id, forever — no duplicate spawned alongside it
 
 
-def test_tick_removes_the_worktree_when_the_tracker_line_is_struck_by_hand(ticking):
+def test_tick_removes_the_worktree_when_the_tracker_line_is_struck_by_hand(ticking, monkeypatch):
     """`row["task_id"] not in open_ids and status in REVIEW_STATUSES` → done: the other
-    `tick()` path that reaches `done` without a fresh `pr_state` read this tick."""
+    `tick()` path that reaches `done` without a fresh `pr_state` read this tick. The row
+    has no PR (🗂️⏸️ CMX-308: one whose PR is still open is held, not done)."""
     repo = ticking
     wf_path = repo / "WORKFLOW.md"
     alpha = next(t.id for t in _source(repo).list_open_tasks() if t.title == "alpha")
     worktrees_root = repo.parent / ".chela" / "worktrees"
-    wt_path = _seed_run_with_worktree(repo, wf_path, alpha, worktrees_root)
+    monkeypatch.setattr(dispatcher, "_read_pr_url", lambda *a, **k: None)
+    wt_path = _seed_run_with_worktree(repo, wf_path, alpha, worktrees_root, pr_url=None)
     assert wt_path.is_dir()
 
     # A human struck the line by hand — task_id leaves the tracker's open set.

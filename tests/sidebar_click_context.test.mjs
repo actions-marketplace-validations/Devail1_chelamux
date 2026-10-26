@@ -15,9 +15,9 @@
 // built out of a fake GridStack) alongside the REAL nav.js, so the behavior is asserted
 // against the SAME live module state the sidebar and wall themselves use.
 //
-// Run: node --test tests/sidebar_click_context.test.mjs (pytest runs it via
+// Run: pnpm exec vitest run tests/sidebar_click_context.test.mjs (pytest runs it via
 // tests/test_js_suites.py; needs `pnpm install` for jsdom.)
-import { before, beforeEach, test } from 'node:test';
+import { beforeAll, beforeEach, test } from 'vitest';
 import assert from 'node:assert/strict';
 import { JSDOM } from 'jsdom';
 
@@ -28,7 +28,6 @@ const PANEL = `
   <select id="term-agent"></select>
   <span id="term-wall-grid"><span id="term-grid-presets"></span><button id="term-lock-btn"></button></span>
   <button id="term-new-shell"></button>
-  <div id="term-switcher"></div>
   <div id="term-stage"></div>
   <div id="term-min-dock"></div>
   <div id="term-bar" class="kb-collapsed"><button class="kb-toggle" id="kb-toggle"></button><div class="kb-body" id="kb-body"></div></div>
@@ -73,12 +72,12 @@ function fakeGridStack() {
     return { init: () => grid };
 }
 
-let terminals, nav, util;
+let terminals, nav, agentsStore, viewStore, wall;
+const minimized = wid => wall.minimizedPanes.get().has(wid);
 
-before(async () => {
+beforeAll(async () => {
     const dom = new JSDOM(`<!doctype html><html><body>${PANEL}</body></html>`,
         { url: 'http://localhost:5005/', pretendToBeVisual: true });
-    dom.window.TERMINALS_ENABLED = true;
     for (const k of ['window', 'document', 'localStorage', 'navigator', 'HTMLElement',
         'Element', 'Node', 'Event', 'MouseEvent', 'KeyboardEvent', 'CustomEvent',
         'getComputedStyle', 'requestAnimationFrame', 'cancelAnimationFrame']) {
@@ -101,27 +100,29 @@ before(async () => {
     globalThis.window.chela = globalThis.window.chela || {};
     globalThis.setInterval = () => 0;
 
-    await import('../chela/dashboard/static/js/main.js');
-    util = await import('../chela/dashboard/static/js/util.js');
-    terminals = await import('../chela/dashboard/static/js/terminals.js');
-    nav = await import('../chela/dashboard/static/js/nav.js');
-    util.setAgentsCache(AGENTS);
+    (await import('../chela/dashboard/frontend/src/boot.ts')).start();
+    ({ agents: agentsStore } = await import('../chela/dashboard/frontend/src/shared/store/agents.ts'));
+    ({ view: viewStore } = await import('../chela/dashboard/frontend/src/shared/store/view.ts'));
+    terminals = await import('../chela/dashboard/frontend/src/features/wall/index.ts');
+    nav = await import('../chela/dashboard/frontend/src/features/shell/index.ts');
+    wall = await import('../chela/dashboard/frontend/src/shared/store/wall.ts');
+    agentsStore.set(AGENTS);
 });
 
 // Every test starts wall-visible with both panes open (not docked), on the terminals
 // tab, in wall mode — the baseline "on-wall" state each case then deviates from.
 beforeEach(async () => {
-    util.setCurrentTab('terminals');
-    window.chela.setTermMode('wall');
+    viewStore.set('terminals');
+    terminals.setTermMode('wall');
     await terminals.renderTerminals();
-    [HUMAN, WORKER].forEach(wid => { if (terminals._minimized.has(wid)) terminals._minimized.delete(wid); });
+    [HUMAN, WORKER].forEach(wid => wall.setMinimized(wid, false));
     await terminals.renderTerminals();
 });
 
 test('1. wall visible + pane open on it -> click MINIMIZES it', () => {
-    assert.ok(!terminals._minimized.has(HUMAN), 'setup: orchestrator must start open, not docked');
-    window.chela.selectAgent('orchestrator');
-    assert.ok(terminals._minimized.has(HUMAN),
+    assert.ok(!minimized(HUMAN), 'setup: orchestrator must start open, not docked');
+    nav.selectAgent('orchestrator');
+    assert.ok(minimized(HUMAN),
         'clicking an already-open pane while the wall is visible must dock it, not just re-focus it');
 });
 
@@ -131,28 +132,28 @@ test('1. wall visible + pane open on it -> click MINIMIZES it', () => {
 const settleFocus = () => new Promise(r => setTimeout(r, 120));
 
 test('2. wall visible + pane minimized -> click restores + focuses (unchanged)', async () => {
-    window.chela.termMinFor(document.querySelector(`#term-stage .grid-stack-item[gs-id="${WORKER}"] .gs-min-btn`));
-    assert.ok(terminals._minimized.has(WORKER), 'setup: worker must be docked before the click');
-    window.chela.selectAgent('cmx-139');
+    document.querySelector(`#term-stage .grid-stack-item[gs-id="${WORKER}"] .gs-min-btn`).click();
+    assert.ok(minimized(WORKER), 'setup: worker must be docked before the click');
+    nav.selectAgent('cmx-139');
     await settleFocus();
-    assert.ok(!terminals._minimized.has(WORKER),
+    assert.ok(!minimized(WORKER),
         'clicking a docked pane while the wall is visible must restore it');
 });
 
 test('3. not on the wall (another tab) -> click switches to the wall AND focuses, never minimizes', async () => {
-    util.setCurrentTab('agents');   // simulate being on a different tab
-    assert.ok(!terminals._minimized.has(HUMAN), 'setup: orchestrator is open on the wall underneath');
-    window.chela.selectAgent('orchestrator');
-    assert.equal(util.currentTab, 'terminals', 'the click must switch back to the wall tab');
+    viewStore.set('agents');   // simulate being on a different tab
+    assert.ok(!minimized(HUMAN), 'setup: orchestrator is open on the wall underneath');
+    nav.selectAgent('orchestrator');
+    assert.equal(viewStore.get(), 'terminals', 'the click must switch back to the wall tab');
     await settleFocus();
-    assert.ok(!terminals._minimized.has(HUMAN),
+    assert.ok(!minimized(HUMAN),
         'an open pane must be focused, NOT minimized, when the click is what brings the wall into view');
 });
 
 test('4. single-terminal mode -> click switches to wall mode, not just the tab', async () => {
-    window.chela.setTermMode('single');
+    terminals.setTermMode('single');
     assert.ok(!terminals.isWallVisible(), 'setup: single-terminal mode must not read as wall-visible');
-    window.chela.selectAgent('orchestrator');
+    nav.selectAgent('orchestrator');
     assert.ok(terminals.isWallVisible(),
         'clicking a row in single-terminal mode must switch the wall into (grid) wall mode');
     await settleFocus();

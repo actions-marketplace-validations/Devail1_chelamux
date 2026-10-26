@@ -125,8 +125,8 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-from chela import agent_manager, discovery, epoch, event_log, judge, messenger, notify, sessions, transcripts
-from chela import config, stall_alerts
+from chela import agent_manager, discovery, epoch, event_log, hooks, judge, messenger, notify, sessions, transcripts
+from chela import config, park, risktier, stall_alerts, suite_guard
 from chela.config import INBOX_ENABLED
 from chela.hold import human_duration
 from chela.tui_text import sanitize_prompt
@@ -248,7 +248,12 @@ def _empty() -> dict:
             # the latches of the notices that used to be missing: judge not started, hold
             # released, CI red, PR conflicting, agent stuck / marker unread.
             "expected_edges": {}, "review_wait": {}, "hold_seen": None, "hold_ended": None,
-            "ci_red_seen": {}, "conflict_seen": {}, "stuck": {}}
+            "ci_red_seen": {}, "conflict_seen": {}, "stuck": {},
+            # CMX-155: the event-log cursor of the classifier-denial scan, and the per-run
+            # cooldown latch of its notice (`denied_events`). CMX-184: the tool_use ids of the
+            # denials already judged, so the Mod's direct post and the event-log copy of ONE
+            # denial are one notice (`denied_keys`).
+            "denied_cursor": None, "denied_seen": {}, "denied_keys": {}}
 
 
 def _clear_address_alarm(store: dict) -> None:
@@ -1381,6 +1386,12 @@ def run_events(runs: list[dict], seen: dict[str, str],
         # different status, has never had the plain `run_review` event fire either.)
         prev_status = (prev_mark or "").split(":", 1)[0]
         was_already_awaiting_review = prev_status == "awaiting_review"
+        # ⚖️🔁 CMX-280: was THIS judge round already announced? Its verdict stays on the row
+        # through every later status change (needs_human → running → needs_human, measured
+        # on CMX-251 10-19), and each new `status:judge_state` mark re-fired the same old
+        # round's notice. A round is new only when the judge part of the mark changes —
+        # every fresh judgement passes through `running` first.
+        round_announced = bool(judge_state) and (prev_mark or "").partition(":")[2] == judge_state
         fresh[task_id] = mark
         if prev_mark == mark:
             continue                      # already announced at this status (+judge verdict)
@@ -1420,6 +1431,7 @@ def run_events(runs: list[dict], seen: dict[str, str],
                 f"{judge_state or 'never ran'!r}, no approved override) — {ref}"
                 f"{' · ' + snippet if snippet else ''}", payload, wid=wid))
         elif (judge_state == judge.J_CANNOT_VERIFY and status != "awaiting_review"
+              and not round_announced
               and not (status == "needs_human" and run.get("judge_unknown_final"))):
             # ⚖️🧱 CMX-19: ...except a final unknown the judge PARKED in `needs_human` itself
             # (`dispatcher.park_final_unknown`). That is not the CAS race — nothing moved
@@ -1449,7 +1461,7 @@ def run_events(runs: list[dict], seen: dict[str, str],
                 f"while it was working) — needs a human look"
                 f"{': ' + detail if detail else ''} — {ref}"
                 f"{' · ' + snippet if snippet else ''}", payload, wid=wid))
-        elif judge_state == judge.J_BLOCKED_RACE:
+        elif judge_state == judge.J_BLOCKED_RACE and not round_announced:
             # ⚖️🧊 CMX-239. The twin of the CANNOT_VERIFY branch above, for the CAS-refused
             # race on a BLOCKING verdict: the run left `awaiting_review` (a human merged it,
             # or CI got there first) WHILE the judge was mid-run, so `request_changes`'s CAS
@@ -1479,7 +1491,8 @@ def run_events(runs: list[dict], seen: dict[str, str],
                 f"(check whether this already shipped)"
                 f"{': ' + detail if detail else ''} — {ref}"
                 f"{' · ' + snippet if snippet else ''}", payload, wid=wid))
-        elif status == "awaiting_review" and judge_state in (judge.J_CLEAN, judge.J_CANNOT_VERIFY):
+        elif (status == "awaiting_review" and not round_announced
+              and judge_state in (*judge.MERGE_READY, judge.J_CANNOT_VERIFY)):
             # The judge settled while `status` sat still. This is the ONLY place either
             # verdict becomes visible to the orchestrator — `comment_body` already posted
             # it to the PR, but a PR comment is not a push, and CMX-195/196 both sat mute
@@ -1499,6 +1512,19 @@ def run_events(runs: list[dict], seen: dict[str, str],
                     "run_judge_clean",
                     f"⚖️ {label} — every guard held, clean and MERGEABLE — {ref}"
                     f"{' · ' + snippet if snippet else ''}", payload, wid=wid))
+            elif judge_state == judge.J_PROSE_ONLY:
+                out.append(_event(
+                    "run_judge_clean",
+                    # CMX-272: stamped is not merged — the PR is still OPEN until
+                    # `chela merge` lands it, so this must never read as DONE.
+                    f"📄 {label} — prose-only, no judge round needed — merge-ready on green "
+                    f"CI, land it with chela merge {task_id} — {ref}"
+                    f"{' · ' + snippet if snippet else ''}", payload, wid=wid))
+            elif judge_state == judge.J_STANDARD_NO_JUDGE:
+                out.append(_event(
+                    "run_judge_clean",
+                    f"🪜 {label} — standard tier, merge-ready on green CI (no judge round) — "
+                    f"{ref}{' · ' + snippet if snippet else ''}", payload, wid=wid))
             elif run.get("judge_retry_after"):
                 # ⚖️🌩️ CMX-379: the judge was reaped for a classifier outage, not for
                 # anything about the PR, and the dispatcher re-judges it on its own once the
@@ -1561,6 +1587,8 @@ def run_events(runs: list[dict], seen: dict[str, str],
             # PR are intact.
             reviews = _reviews(run)
             payload["rework_count"] = run.get("rework_count") or 0
+            payload["infra_restarts"] = run.get("infra_restarts") or 0      # CMX-192
+            payload["review_reworks"] = _review_reworks(run)
             payload["reviews"] = reviews
             payload["last_error"] = run.get("last_error")
             payload["worktree_path"] = run.get("worktree_path")
@@ -1571,7 +1599,9 @@ def run_events(runs: list[dict], seen: dict[str, str],
                 "run_needs_human",
                 # No parens, no `(s)`: the summary is sanitized before it is typed at a
                 # prompt (_event), and bracket punctuation comes back out mid-word.
-                f"📥 {label} NEEDS A HUMAN — reworks: {payload['rework_count']} · verdicts "
+                f"📥 {label} NEEDS A HUMAN — reworks: {payload['rework_count']} · review "
+                f"rounds: {payload['review_reworks']} · infra restarts: "
+                f"{payload['infra_restarts']} · verdicts "
                 f"on the row: {len(reviews)} · {reason} — {ref}"
                 f"{' · ' + snippet if snippet else ''}", payload, wid=wid))
         elif status == "changes_requested" and _rework_cap_reached(run):
@@ -1601,12 +1631,19 @@ def run_events(runs: list[dict], seen: dict[str, str],
             # The round that will ACTUALLY run (count after the respawn's bump), out of the
             # effective cap including human-granted rounds — never above it, because an
             # at-cap run never reaches this branch (CMX-58).
-            nxt = (f"rework {payload['rework_count'] + 1} of {_effective_rework_cap(run)}"
-                   if not run.get("last_error")
-                   else f"RETRY after: {str(run['last_error'])[:60]}")
+            # 🏗️🔁 CMX-192: numbered against the budget it actually spends — a review round
+            # against the rework cap, an infra restart (already counted) against its own.
+            # 🔀 CMX-294: a free conflict round leads with its own wording, never "sent back
+            # for rework" — that phrasing is the charged one.
+            retry = (f"RETRY after: {str(run['last_error'])[:60]}" if run.get("last_error")
+                     else "")
+            if _free_conflict_round(run):
+                lead = _conflict_round(run) + (f" — {retry}" if retry else "")
+            else:
+                lead = f"sent back for rework — {retry or _next_round(run)}"
             out.append(_event(
                 "run_changes_requested",
-                f"📥 {label} sent back for rework — {nxt} — the next dispatcher tick "
+                f"📥 {label} {lead} — the next dispatcher tick "
                 f"re-spawns it in its own worktree — {ref}"
                 f"{' · ' + snippet if snippet else ''}", payload, wid=wid))
         elif status == "failed":
@@ -1651,15 +1688,70 @@ def run_events(runs: list[dict], seen: dict[str, str],
 
 
 def _cap_fields(run: dict) -> dict:
-    """The three columns the dispatcher's cap check reads, tolerantly — this is fed a runs
+    """The columns the dispatcher's cap check reads, tolerantly — this is fed a runs
     snapshot (or a hand-built dict in a test), not a ``sqlite3.Row``."""
     return {"rework_count": run.get("rework_count") or 0,
-            "retry_count": run.get("retry_count") or 0, "risk": run.get("risk")}
+            "retry_count": run.get("retry_count") or 0, "risk": run.get("risk"),
+            "conflict_reworks": run.get("conflict_reworks") or 0,
+            # 🏗️🔁 CMX-192. `review_reworks` keeps its NULL: a pre-CMX-192 row reads as
+            # `rework_count` there, and a 0 here would hand it a fresh budget.
+            "infra_restarts": run.get("infra_restarts") or 0,
+            "review_reworks": run.get("review_reworks"),
+            "rework_cause": run.get("rework_cause")}
+
+
+def _review_reworks(run: dict) -> int:
+    from chela import dispatcher
+    return dispatcher.review_reworks(_cap_fields(run))
 
 
 def _effective_rework_cap(run: dict) -> int:
     from chela import dispatcher
     return dispatcher.effective_rework_cap(_cap_fields(run))
+
+
+def _next_round(run: dict) -> str:
+    """🏗️🔁 CMX-192. The round the next re-spawn spends, named by its budget."""
+    from chela import dispatcher
+    fields = _cap_fields(run)
+    if dispatcher.free_conflict_round(fields):
+        return _conflict_round(run)
+    if dispatcher.rework_cause(fields) == dispatcher.REWORK_CAUSE_INFRA:
+        return (f"infra restart {dispatcher.infra_restarts(fields)} of "
+                f"{dispatcher.infra_restart_cap(fields)}, not a review round")
+    return f"rework {dispatcher.review_reworks(fields) + 1} of {_effective_rework_cap(run)}"
+
+
+def _free_conflict_round(run: dict) -> bool:
+    from chela import dispatcher
+    return dispatcher.free_conflict_round(_cap_fields(run))
+
+
+def _conflict_round(run: dict) -> str:
+    """🔀 CMX-294. A free conflict round, named as one — never numbered as a charged rework:
+    "rework 4 of 4" read as the last chance on a round the PR comment calls not charged. The
+    round's own grant is not spent yet, so it is left out of the charged count."""
+    from chela import dispatcher
+    fields = _cap_fields(run)
+    free = fields["conflict_reworks"]
+    used = max(0, dispatcher.review_reworks(fields) - (free - 1))
+    # No parens or semicolons: the summary is sanitized before it is typed at a prompt.
+    return (f"🔀 sent back to merge {_base_branch(run)} — conflict round {free} of "
+            f"{dispatcher.MAX_FREE_CONFLICT_REWORKS}, not charged, reworks used {used} of "
+            f"{_effective_rework_cap(run) - free}")
+
+
+def _base_branch(run: dict) -> str:
+    """The run's workflow base branch, for a notice. Unreadable ⇒ a generic name, never a
+    guessed branch."""
+    from chela.workflow import load_workflow_cached
+    try:   # the cached loader keeps the last good config; one that never parsed is None
+        base = load_workflow_cached(run["workflow_path"]).workflow.get(
+            "workspace", "base_branch", default="master")
+    except Exception as e:  # noqa: BLE001 — a notice must not crash the inbox tick
+        log.warning("inbox: %s: could not read the base branch: %s", run.get("task_id"), e)
+        return "its base branch"
+    return str(base)
 
 
 def _rework_cap_reached(run: dict) -> bool:
@@ -1743,7 +1835,7 @@ MARKERS = {".chela-task-finished-request.json": "task-finished",
            ".chela-push-request.json": "push-request"}
 
 _CMX86_KINDS = ("run_judge_not_started", "run_ci_red", "run_pr_conflicting", "run_stuck",
-                "run_marker_unread", "run_selfcheck_long")
+                "run_marker_unread", "run_selfcheck_long", "run_park_overdue")
 
 
 def caller_is_orchestrator(store: dict | None = None) -> bool:
@@ -1830,6 +1922,73 @@ def _judge_not_started(run: dict) -> bool:
     return not (judge_sha and judge_sha == run.get("pr_head_sha"))
 
 
+# ⚖️🪜 CMX-312: the tiers whose head is stamped a no-judge verdict once CI is green
+# (`dispatcher._NO_JUDGE_VERDICTS`) — a review-wait notice about them never names a judge.
+NO_JUDGE_TIERS = (risktier.PROSE, risktier.STANDARD)
+# A red CI already has its own notice (`ci_red`, naming the job): the review wait stays quiet.
+CI_RED_WAIT = "CI is red"
+# `(workflow_path, head sha) -> tier`: a head's file list never changes, so it is read once.
+_TIER_CACHE: dict[tuple[str, str], str] = {}
+_TIER_CACHE_MAX = 512
+
+
+def _ci_wait(run: dict) -> str | None:
+    """CMX-312: what CI is doing while IT, not a judge, holds this run in review — ``None``
+    when CI is not the wait. No judge round starts on any tier before CI is green
+    (`dispatcher._judge_candidates`: checks ``passing``/``none``, or ``failing`` on a known
+    flake of this head). A ``pr_checks`` never read (``None``) names nothing."""
+    checks, head = run.get("pr_checks"), run.get("pr_head_sha")
+    if checks == "pending":
+        return "CI is still running"
+    if checks == "failing":
+        if head and run.get("ci_known_flake_sha") == head:
+            return None                        # red only on known flakes: the judge goes ahead
+        if (head and run.get("ci_rerun_sha") == head
+                and run.get("ci_rerun_state") in ("pending", "started")):
+            return "CI is re-running a flake"
+        return CI_RED_WAIT
+    if checks == "unknown":
+        return "CI could not be read"
+    return None
+
+
+def review_tiers(runs: list[dict]) -> dict[str, str]:
+    """``{task_id: risk tier}`` of every run :func:`judge_wait_events` may speak about — the
+    :mod:`chela.risktier` tier of its PR head, read exactly as the dispatcher's no-judge stamp
+    reads it (`dispatcher._stamp_prose_only`). I/O (git), so :func:`tick` calls it outside the
+    lock. A head whose files cannot be read is left out — it reads as a judged tier, never as
+    one that skips the judge — and is not cached, so the next tick tries again."""
+    from chela.workflow import load_workflow
+    out: dict[str, str] = {}
+    for run in runs:
+        task, sha, wf_path = run.get("task_id"), run.get("pr_head_sha"), run.get("workflow_path")
+        if (not (task and sha and wf_path) or run.get("status") != "awaiting_review"
+                or run.get("pr_state") in ("merged", "closed") or not _judge_not_started(run)):
+            continue
+        try:   # the workflow's own `merge.core`/`merge.always_human` can change the tier
+            key = (str(wf_path), str(sha), os.stat(wf_path).st_mtime_ns)
+        except OSError as e:
+            log.warning("inbox: %s: could not read the PR head's tier: %s", task, e)
+            continue
+        tier = _TIER_CACHE.get(key)
+        if tier is None:
+            try:
+                wf = load_workflow(wf_path)
+                files = judge._changed_files(
+                    wf.path.parent, wf.get("workspace", "base_branch", default="master"), sha)
+            except Exception as e:  # noqa: BLE001 — an unread tier is a judged tier, not a crash
+                log.warning("inbox: %s: could not read the PR head's tier: %s", task, e)
+                continue
+            if files is None:
+                continue
+            tier = risktier.classify(files, risktier.always_human(wf), risktier.core(wf))[0]
+            if len(_TIER_CACHE) >= _TIER_CACHE_MAX:
+                _TIER_CACHE.clear()
+            _TIER_CACHE[key] = tier
+        out[task] = tier
+    return out
+
+
 # What starts a judge round is the daemon's dispatch tick, not a command — `chela judge run`
 # is the judge AGENT's own tool (it needs the agent's `--experiments`). The one thing an
 # operator can check in a single command is the queue hold, which stops every new judge.
@@ -1863,7 +2022,8 @@ def _queued_wording(run: dict, ahead: list[dict], waited: float) -> str:
 
 def judge_wait_events(runs: list[dict], store: dict, now: float,
                       windows: dict[str, str] | None = None,
-                      now_epoch: str | None = None) -> list[dict]:
+                      now_epoch: str | None = None,
+                      tiers: dict[str, str] | None = None) -> list[dict]:
     """``run_judge_not_started`` — what the old "awaiting review" notice was ever worth.
 
     A run sitting in ``awaiting_review`` longer than ``config.judge_not_started_alert_s()``
@@ -1874,7 +2034,15 @@ def judge_wait_events(runs: list[dict], store: dict, now: float,
     not a stall. While queued it is silent for ``QUEUED_ALERT_FACTOR`` stall bounds and then
     says it is queued (behind whom, since when); the stall clock restarts from the last tick
     that saw it queued, so a slot freeing up gets the full threshold to start its judge.
+
+    CMX-312: a run whose CI is not green yet waits on CI, on every tier — no judge starts
+    before it is. That wait is said once, as CI (:func:`_ci_wait`), and the stall clock
+    restarts from the last tick that saw it, as it does for a queue. ``tiers``
+    (:func:`review_tiers`) names the head's risk tier: a PROSE or STANDARD head gets a no-judge
+    verdict, so it is never "queued for the judge" and its stall never asks about a judge.
+    A run with no tier there is treated as judged — the notice it has always had.
     """
+    tiers = tiers or {}
     prev: dict = store.get("review_wait") or {}
     nxt: dict = {}
     out: list[dict] = []
@@ -1889,36 +2057,70 @@ def judge_wait_events(runs: list[dict], store: dict, now: float,
         if not isinstance(entry, dict) or entry.get("head") != head:
             entry = None                          # a new head is a new wait
         if not _judge_not_started(run):
-            if entry and (entry.get("alerted") or entry.get("queued_alerted")):
+            if entry and (entry.get("alerted") or entry.get("queued_alerted")
+                          or entry.get("ci_alerted")):
                 nxt[task] = entry                 # said once for this head — keep it said
             continue
         entry = entry or {"head": head, "since": now, "alerted": False}
         nxt[task] = entry
         waited = now - entry["since"]
-        ahead = _judges_ahead(run, runs)
-        queued = len(ahead) >= config.judge_max_concurrent()
+        tier = tiers.get(task)
+        no_judge = tier in NO_JUDGE_TIERS
+        ci = _ci_wait(run)
+        ahead = [] if no_judge or ci else _judges_ahead(run, runs)
+        queued = len(ahead) >= config.judge_max_concurrent() if ahead else False
+        if ci:
+            entry["ci_wait_at"] = now
+            entry.setdefault("ci_since", now)
+        else:
+            entry.pop("ci_since", None)           # a later CI wait is measured afresh
         if queued:
             entry["queued_at"] = now
-        if entry["alerted"]:
+        check = " ".join(STALL_CHECK_ARGV)
+        if ci:                                    # CI is the wait, said once per head
+            waited = now - entry["ci_since"]
+            if (ci == CI_RED_WAIT or entry["alerted"] or entry.get("ci_alerted")
+                    or waited < threshold):
+                continue
+            entry["ci_alerted"] = True
+            waiting_on = "ci"
+            after = (f"{tier} tier, no judge round: it is merge-ready once CI is green"
+                     if no_judge else "its judge round starts once CI is green"
+                     if tier else "nothing else is waited on until CI is green")
+            summary = (f"⏳ {_label(run)} has waited {human_duration(waited)} in review on CI "
+                       f"— {ci} on {head[:7] or '?'} — {after} — {_ref(run)}")
+        elif entry["alerted"]:
             continue
-        if queued:                                # a queue is said once, and a stall after
+        elif queued:                              # a queue is said once, and a stall after
             if entry.get("queued_alerted") or waited < QUEUED_ALERT_FACTOR * threshold:
                 continue                          # it still gets its own notice
             entry["queued_alerted"] = True
+            waiting_on = "queue"
             summary = _queued_wording(run, ahead, waited)
         else:
-            if now - (entry.get("queued_at") or entry["since"]) < threshold:
+            if now - max(entry.get("queued_at") or 0, entry.get("ci_wait_at") or 0,
+                         entry["since"]) < threshold:
                 continue
             entry["alerted"] = True
-            check = " ".join(STALL_CHECK_ARGV)
-            summary = (f"⏳ {_label(run)} has waited {human_duration(waited)} in review and NO "
-                       f"judge round has started, with no judge running — the daemon starts "
-                       f"one on its next dispatch tick: is the queue held (`{check}`) or the "
-                       f"daemon down? Or review it yourself — {_ref(run)}")
+            if no_judge:
+                waiting_on = "verdict"
+                summary = (f"⏳ {_label(run)} has waited {human_duration(waited)} in review "
+                           f"with CI green and no merge-ready verdict on its head — {tier} "
+                           f"tier, no judge round: the daemon stamps its verdict on its next "
+                           f"dispatch tick: is the queue held (`{check}`) or the daemon "
+                           f"down? — {_ref(run)}")
+            else:
+                waiting_on = "judge"
+                summary = (f"⏳ {_label(run)} has waited {human_duration(waited)} in review "
+                           f"and NO judge round has started, with no judge running — the "
+                           f"daemon starts one on its next dispatch tick: is the queue held "
+                           f"(`{check}`) or the daemon down? Or review it yourself — "
+                           f"{_ref(run)}")
         out.append(_event(
             "run_judge_not_started", summary,
             _run_payload(run, judge_state=run.get("judge_state"), waited_s=int(waited),
-                         queued_behind=[r.get("task_id") for r in ahead] if queued else []),
+                         queued_behind=[r.get("task_id") for r in ahead] if queued else [],
+                         waiting_on=waiting_on, risk_tier=tier, pr_checks=run.get("pr_checks")),
             wid=run_wid(run, windows, now_epoch)))
     store["review_wait"] = nxt
     return out
@@ -2007,7 +2209,13 @@ def ci_red(run: dict, *, sha: str, failing: tuple[str, ...] | list[str],
     task = run.get("task_id")
     if not task or not sha:
         return False
-    jobs = ", ".join(failing) or "?"
+    jobs = ", ".join(f for f in (str(f).strip() for f in failing) if f)
+    if not jobs:
+        # ⛔ CMX-256: a red names its job. No name means whoever called this hit a rollup
+        # shape it did not classify — that is PENDING, not a notice saying "job ?".
+        log.warning("ci_red: %s on %s named no failing job — not announced as red",
+                    task, sha[:7])
+        return False
     line = first_failure_line(log_tail)
     rerun = f" — flake? `gh run rerun {run_ids[0]} --failed`" if run_ids else ""
     then = ("sent back for rework" if sent_back
@@ -2030,6 +2238,33 @@ def ci_red(run: dict, *, sha: str, failing: tuple[str, ...] | list[str],
         if sent_back:
             store["expected_edges"][task] = {"status": "changes_requested",
                                              "why": CI_RED_ECHO, "ts": time.time()}
+        store["queue"].append(event)
+    event_log.from_inbox(event)
+    return True
+
+
+def ci_flake(run: dict, *, sha: str, note: str, known: bool = False) -> bool:
+    """🔁 CMX-255 ``run_ci_flake`` — a red CI's one re-run of its failed jobs came back GREEN.
+    Said once per (run, head sha): the dispatcher calls this only on its own ``pending →
+    green`` transition of ``runs.ci_rerun_state``. Nothing was sent back for rework, and the
+    notice says so instead of the ``run_ci_red`` one it replaces."""
+    if not enabled():
+        return False
+    task = run.get("task_id")
+    if not task or not sha:
+        return False
+    try:
+        wid = run_wid(run, None, epoch.current())
+    except Exception:  # noqa: BLE001 — attribution is best-effort
+        wid = None
+    # 🧪 CMX-282 ``known``: still red after every re-run, but ONLY on registered flakes.
+    what = ("CI red only on known flakes" if known else "CI flake, re-run green")
+    event = _event(
+        "run_ci_known_flake" if known else "run_ci_flake",
+        f"🟡 {_label(run)} {what} on {sha[:7]} — {note} — NOT sent back for rework"
+        f"{', on to the judge' if known else ''} — {_ref(run)}",
+        _run_payload(run, ci_sha=sha, note=note), wid=wid)
+    with locked_store() as store:
         store["queue"].append(event)
     event_log.from_inbox(event)
     return True
@@ -2185,7 +2420,8 @@ def stuck_probes(runs: list[dict]) -> dict[str, dict]:
         if procs is None:
             procs = _selfcheck_scan()
         out[task] = {"activity": max(stamps) if stamps else None, "markers": markers,
-                     "selfcheck": _selfcheck_for(worktree, procs)}
+                     "selfcheck": _selfcheck_for(worktree, procs),
+                     "slot_wait": suite_guard.waits_in(worktree)}
     return out
 
 
@@ -2250,7 +2486,8 @@ def _selfcheck_round(running: float | None, ceiling: int) -> int | None:
 
 def stuck_events(runs: list[dict], store: dict, probes: dict[str, dict], now: float,
                  uptime: float | None = None, windows: dict[str, str] | None = None,
-                 now_epoch: str | None = None, daemon: str | None = None) -> list[dict]:
+                 now_epoch: str | None = None, daemon: str | None = None,
+                 held=None) -> list[dict]:
     """``run_stuck`` / ``run_marker_unread`` — a running agent that has gone quiet.
 
     * **stuck**: no new commit AND no transcript activity for ``config.stuck_agent_alert_s()``
@@ -2271,17 +2508,49 @@ def stuck_events(runs: list[dict], store: dict, probes: dict[str, dict], now: fl
     ``daemon`` is ``daemon_state``'s measured answer; with ``uptime`` it is rendered as
     "daemon up …", "no daemon running" (only when measured down) or "daemon state unknown"
     — never "down" for something nobody looked at.
+
+    CMX-214: while the queue is ``held`` (any ``chela dispatch --pause``), a quiet agent is
+    quiet on purpose — the operator paused it — so no ``run_stuck`` fires, and each held
+    tick restarts its clock: after ``--resume`` the agent gets the full quiet budget again.
     """
     prev: dict = store.get("stuck") or {}
     nxt: dict = {}
     out: list[dict] = []
     quiet_after, unread_after = config.stuck_agent_alert_s(), config.marker_unread_alert_s()
     up = _daemon_phrase(daemon, uptime)
+    runs_by_id = {r.get("task_id"): r for r in runs if r.get("task_id")}
     for run in runs:
         task = run.get("task_id")
         if not task or run.get("status") not in STUCK_RUN_STATES:
             continue
         entry = dict(prev.get(task) or {})
+        # Only the manual park is read here: a suite-slot wait (the other kind of park) is
+        # the probe's `slot_wait`, which the quiet check below already excuses.
+        parked = park.manual(run)
+        why = parked and park.overdue(parked, now, runs_by_id, config.park_max_s())
+        if parked and why:
+            # ⏸️ CMX-318: an outlived park is reported ONCE — and from then on it shields
+            # nothing: the run's quiet clock starts at that notice, so a hang behind a
+            # forgotten park is still caught (below) as STUCK a full quiet budget later.
+            if entry.get("park_overdue") != parked["at"]:
+                entry["park_overdue"] = parked["at"]
+                entry["active_at"] = now
+                wid = run_wid(run, windows, now_epoch)
+                age = now - parked["since"] if parked["since"] is not None else None
+                out.append(_event(
+                    "run_park_overdue",
+                    f"⏸️ {_label(run)} has been parked "
+                    f"{human_duration(age) if age is not None else 'for an unknown time'} "
+                    f"and {why} — reason: {parked['reason']} — `chela unpark {task}` or "
+                    f"re-park it — {up}",
+                    _run_payload(run, parked_at=parked["at"], parked_reason=parked["reason"],
+                                 parked_until=parked["until"], overdue=why), wid=wid))
+        elif parked:
+            entry["active_at"] = now
+            nxt[task] = entry
+            continue
+        else:
+            entry.pop("park_overdue", None)
         probe = probes.get(task)
         if probe is None:
             if entry:
@@ -2305,6 +2574,14 @@ def stuck_events(runs: list[dict], store: dict, probes: dict[str, dict], now: fl
                 wid=wid))
         entry["markers"] = said
         selfcheck = probe.get("selfcheck")
+        # 🧠 CMX-119: a run queued for a suite slot is waiting, not stuck and not slow — no
+        # notice while it waits, and the time it spent queued is not its running time.
+        slot_wait = probe.get("slot_wait") or {}
+        queued_since = slot_wait.get("waiting_since")
+        if queued_since is not None and not selfcheck:
+            entry["active_at"] = now
+            nxt[task] = entry
+            continue
         entry.pop("selfcheck_at", None)     # the pre-CMX-120 latch, keyed on a jittery float
         if not selfcheck:
             entry.pop("selfcheck", None)    # the self-check ended: the next one is news
@@ -2312,11 +2589,14 @@ def stuck_events(runs: list[dict], store: dict, probes: dict[str, dict], now: fl
             entry["active_at"] = now
             since, ceiling = selfcheck.get("since"), config.selfcheck_alert_s()
             running = now - since if since is not None else None
+            if running is not None:
+                running -= float(slot_wait.get("waited") or 0.0) + (
+                    now - queued_since if queued_since is not None else 0.0)
             latch = entry.get("selfcheck")
             if not _same_selfcheck(latch, selfcheck):
                 latch = None
                 entry.pop("selfcheck", None)
-            due = _selfcheck_round(running, ceiling)
+            due = None if queued_since is not None else _selfcheck_round(running, ceiling)
             if due is not None and (latch is None or due > latch.get("round", 0)):
                 entry["selfcheck"] = {"what": selfcheck.get("what"),
                                       "pid": selfcheck.get("pid"), "since": since,
@@ -2333,6 +2613,8 @@ def stuck_events(runs: list[dict], store: dict, probes: dict[str, dict], now: fl
                                                   else None)), wid=wid))
             nxt[task] = entry
             continue
+        if held:
+            entry["active_at"] = now
         stamps = [t for t in (probe.get("activity"), _parse_epoch(run.get("started_at")),
                               entry.get("active_at")) if t]
         activity = max(stamps) if stamps else None
@@ -2363,6 +2645,11 @@ def _cmx86_stale(kind: str, payload: dict, run: dict) -> str | None:
             return f"run is now {status!r}, not awaiting_review"
         if not _judge_not_started(run):
             return "a judge round has started"
+        ci = _ci_wait(run)
+        if payload.get("waiting_on") == "ci" and ci is None:
+            return "CI is no longer the wait"
+        if payload.get("waiting_on") in ("judge", "queue", "verdict") and ci:
+            return f"CI is the wait again ({ci})"
     elif kind == "run_ci_red":
         if status in ("done", "closed", "failed"):
             return f"run is now {status!r}"
@@ -2374,9 +2661,11 @@ def _cmx86_stale(kind: str, payload: dict, run: dict) -> str | None:
             return "PR is no longer CONFLICTING"
         if said_head and head and head != said_head:
             return "PR head moved since the conflict was seen"
-    elif (kind in ("run_stuck", "run_marker_unread", "run_selfcheck_long")
+    elif (kind in ("run_stuck", "run_marker_unread", "run_selfcheck_long", "run_park_overdue")
           and status not in STUCK_RUN_STATES):
         return f"run is now {status!r}, no longer running"
+    elif kind == "run_park_overdue" and run.get("parked_at") != payload.get("parked_at"):
+        return "the park it reported was lifted or replaced"
     return None
 
 
@@ -2439,7 +2728,7 @@ def stale_reason(event: dict, runs: list[dict],
     # correct "never stale" answer, not an oversight.
     if kind not in ("run_review", "run_failed", "run_needs_human", "run_changes_requested",
                      "run_judge_clean", "run_judge_cannot_verify", "run_judge_blocked_race",
-                     "run_reopened", *_CMX86_KINDS):
+                     "run_reopened", DENIED_KIND, *_CMX86_KINDS):
         return None
     payload = event.get("payload") or {}
     task_id = payload.get("task_id")
@@ -2489,6 +2778,8 @@ def stale_reason(event: dict, runs: list[dict],
             if judged_sha and live_sha and live_sha != judged_sha:
                 return (f"PR head moved past the judged commit ({judged_sha[:12]} -> "
                         f"{live_sha[:12]}) — the verdict no longer applies to the current head")
+    elif kind == DENIED_KIND and status not in STUCK_RUN_STATES:
+        return f"run is now {status!r} — the agent is no longer stopped on the denial"
     elif kind == "run_failed" and status != "failed":
         return f"run is now {status!r}, not failed"
     elif kind == "run_needs_human":
@@ -2908,7 +3199,7 @@ def _live_judge_heads(runs: list[dict], queue: list[dict]) -> dict[str, str]:
         if not task_id or run.get("status") != "awaiting_review":
             continue
         judge_state = run.get("judge_state") or ""
-        if judge_state in (judge.J_CLEAN, judge.J_CANNOT_VERIFY):
+        if judge_state in (*judge.MERGE_READY, judge.J_CANNOT_VERIFY):
             candidates.add(task_id)
     candidates.discard(None)
     if not candidates:
@@ -2925,6 +3216,143 @@ def _live_judge_heads(runs: list[dict], queue: list[dict]) -> dict[str, str]:
         if ci.head_sha:
             heads[task_id] = ci.head_sha
     return heads
+
+
+# --- classifier denials of dispatched agents (CMX-155) --------------------------------
+
+DENIED_KIND = "run_permission_denied"
+DENIED_COOLDOWN_S = 10 * 60   # at most one notice per run per this many seconds
+DENIED_KEY_TTL_S = 60 * 60    # how long a denial's tool_use id is remembered (CMX-184)
+DENIED_REASON_CHARS = 200
+WID_RE = re.compile(r"@\d+\Z")
+# what the Mod's direct post carries besides `wid` — the PermissionDenied hook's own fields
+DENIAL_FIELDS = ("session_id", "tool_name", "tool_input", "tool_use_id", "reason")
+
+
+def read_denials(store: dict, now: float) -> tuple[list[dict], dict]:
+    """New ``hook.permission_denied`` records since the store's cursor, and the next cursor.
+
+    I/O (the event log), so the caller runs it OUTSIDE the store lock. Like
+    :class:`chela.notify.DeniedWatch`: the first read only anchors at the log's tip — an
+    upgrade never replays old denials — and when the cursor cannot be honoured (``gap``: the
+    log's boot id moved) only records stamped since the previous read are returned.
+    """
+    cursor = store.get("denied_cursor")
+    if not isinstance(cursor, dict):
+        tip = event_log.tip()
+        return [], {"seq": tip["seq"], "boot": tip["boot_id"], "at": now}
+    batch = event_log.read(cursor.get("seq"), after_boot=cursor.get("boot"),
+                           types=[notify.DENIED_TYPE])
+    events = batch["events"]
+    if batch["gap"] is not None:
+        events = [e for e in events if (e.get("ts") or 0) >= (cursor.get("at") or 0)]
+    return events, {"seq": batch["next_seq"], "boot": batch["boot_id"], "at": now}
+
+
+def denied_events(denials: list[dict], runs: list[dict], store: dict, now: float,
+                  windows: dict[str, str] | None = None,
+                  now_epoch: str | None = None) -> list[dict]:
+    """``run_permission_denied`` — a dispatched agent was refused by its permission classifier.
+
+    The agent is stopped on the refusal and asks in prose; nothing else tells the orchestrator
+    until the 🧊 STUCK alarm, while the phone push (CMX-25) goes to the human. Only a denial
+    from the window of a ``claimed``/``running`` run counts: the orchestrator's own window
+    already sees its denials as tool results, and a human session keeps the phone push only.
+    One notice per run per :data:`DENIED_COOLDOWN_S` (``store["denied_seen"]``), so a looping
+    agent cannot flood the inbox.
+
+    CMX-184: ONE denial reaches here twice when the Mod is loaded beside ``plugin/`` — the Mod
+    files it directly (:func:`file_denial`), the shell hook through the event log. Its
+    ``tool_use_id`` (``store["denied_keys"]``, kept :data:`DENIED_KEY_TTL_S`) is the dedupe
+    key: a denial whose id was already judged is skipped whatever the cooldown says, so a copy
+    that arrives after the cooldown expired is still not a second notice.
+    """
+    orch = orchestrator_wid(store)
+    active: dict[str, dict] = {}
+    for run in runs:
+        if run.get("status") in STUCK_RUN_STATES and run.get("task_id"):
+            wid = run_wid(run, windows, now_epoch)
+            if wid:
+                active[wid] = run
+    seen: dict = {t: ts for t, ts in (store.get("denied_seen") or {}).items()
+                  if now - ts < DENIED_COOLDOWN_S}
+    keys: dict = {k: ts for k, ts in (store.get("denied_keys") or {}).items()
+                  if now - ts < DENIED_KEY_TTL_S}
+    out: list[dict] = []
+    for denial in denials:
+        wid = denial.get("wid")
+        run = active.get(wid) if wid and wid != orch else None
+        if run is None or epoch.is_dangling(denial.get("epoch"), now_epoch):
+            continue
+        payload = denial.get("payload") or {}
+        key = denial_key(payload)
+        if key:
+            if key in keys:
+                continue
+            keys[key] = now
+        task = run["task_id"]
+        if task in seen:
+            continue
+        seen[task] = now
+        tool, detail = notify.denied_detail(denial)
+        out.append(_event(
+            DENIED_KIND,
+            f"🔒 {task} · {wid} was blocked by its permission classifier: {tool} "
+            f"{detail} — the agent is stopped on it: hand the human a bang-prefixed command "
+            f"to run, or redirect the agent.",
+            _run_payload(run, tool=tool, detail=detail, denied_at=denial.get("ts"),
+                         reason=_one_line(payload.get("reason"), DENIED_REASON_CHARS),
+                         session_id=payload.get("session_id") or None, tool_use_id=key),
+            wid=wid))
+    store["denied_seen"] = seen
+    store["denied_keys"] = keys
+    return out
+
+
+def denial_key(payload: dict) -> str | None:
+    """The dedupe key of one denial: its ``tool_use_id``, or ``None`` when it carries none."""
+    key = payload.get("tool_use_id")
+    return key if isinstance(key, str) and key else None
+
+
+def _one_line(text, limit: int) -> str:
+    text = " ".join(str(text or "").split())
+    return text[:limit - 1] + "…" if len(text) > limit else text
+
+
+def file_denial(body: dict, now: float | None = None) -> list[dict]:
+    """CMX-184: file a classifier denial the Mod posted directly — no event-log tail.
+
+    ``body`` is the Mod's post (``mods/chela-hooks/hooks/denial.ts``): the window, the session
+    and the ``PermissionDenied`` fields. It goes through :func:`denied_events` exactly as an
+    event-log record would, so the run, orchestrator, cooldown and dedupe rules are one set.
+    Returns the queued notices (zero or one). Raises :class:`ValueError` on a body with no
+    window or no ``tool_use_id``: without the key it could not be told from the shell hook's
+    copy, and that copy still arrives through the event log.
+    """
+    if not enabled():
+        return []
+    wid = body.get("wid")
+    if not isinstance(wid, str) or not WID_RE.match(wid):
+        raise ValueError("a denial needs the window id it came from")
+    payload = hooks.clip_payload({k: body.get(k) for k in DENIAL_FIELDS if k in body})
+    if not denial_key(payload):
+        raise ValueError("a denial needs its tool_use_id (the dedupe key)")
+    from chela import dispatcher
+    runs = dispatcher.list_runs()
+    windows = discovery.get_windows_by_id()
+    now_epoch = epoch.current()
+    now = time.time() if now is None else now
+    # stamped by the tmux server running NOW: a live session posting its own window is current
+    record = {"wid": wid, "epoch": now_epoch, "ts": now, "payload": payload}
+    with locked_store() as store:
+        events = denied_events([record], runs, store, now, windows=windows,
+                               now_epoch=now_epoch)
+        store["queue"].extend(events)
+    for event in events:
+        log.info("inbox: queued %s (%s, direct)", event["kind"], wid)
+        event_log.from_inbox(event)
+    return events
 
 
 def tick(prev: dict[str, str], runs: list[dict] | None = None) -> dict[str, str]:
@@ -2965,6 +3393,7 @@ def tick(prev: dict[str, str], runs: list[dict] | None = None) -> dict[str, str]
     # CMX-86: the stuck-agent probes (git, transcripts, worktree markers), the hold file and
     # the daemon's uptime — all I/O, so all read here, outside the lock.
     probes = stuck_probes(runs)
+    tiers = review_tiers(runs)          # CMX-312: git, so outside the lock too
     from chela import hold
     held, released = hold.read(), hold.last_release()
     now = time.time()
@@ -2972,6 +3401,7 @@ def tick(prev: dict[str, str], runs: list[dict] | None = None) -> dict[str, str]
     # only for a pending marker, so every STUCK notice said "no daemon running" while the
     # daemon (the very process running this tick) was up.
     daemon, uptime = daemon_state(now) if probes else ("unknown", None)
+    denials, denied_cursor = read_denials(pre_store, now)   # CMX-155: the event log, outside
     alarms: list[dict] = []                # raised inside the lock, published outside it
 
     with locked_store() as store:
@@ -2988,11 +3418,15 @@ def tick(prev: dict[str, str], runs: list[dict] | None = None) -> dict[str, str]
                                                   windows=windows, now_epoch=now_epoch,
                                                   expected=store["expected_edges"])
         events += r_events
-        events += judge_wait_events(runs, store, now, windows=windows, now_epoch=now_epoch)
+        events += judge_wait_events(runs, store, now, windows=windows, now_epoch=now_epoch,
+                                    tiers=tiers)
         events += hold_events(store, held, released, now)
         events += conflict_events(runs, store, windows=windows, now_epoch=now_epoch)
         events += stuck_events(runs, store, probes, now, uptime, windows=windows,
-                               now_epoch=now_epoch, daemon=daemon)
+                               now_epoch=now_epoch, daemon=daemon,
+                               held=held is not None and not held.expired(now))
+        events += denied_events(denials, runs, store, now, windows=windows, now_epoch=now_epoch)
+        store["denied_cursor"] = denied_cursor
 
         for event in events:
             # A `silent` event carries no message — it exists only to retire a watch

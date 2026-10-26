@@ -11,33 +11,21 @@
 //
 // Everything runs the REAL nav.js render into a REAL #sidebar-agents, the orchestrator
 // slot set through a REAL /api/orchestrator/{subscribe,release} round trip, and the
-// inbox icon is the REAL index.html markup, clicked through its own onclick attribute.
+// inbox icon is the REAL Decisions island (CMX-228) in the REAL index.html slot, clicked.
 //
-// Run: node --test tests/sidebar_orchestrator_badge.test.mjs  (pytest runs it via tests/test_js_suites.py)
-import { before, beforeEach, test } from 'node:test';
+// Run: pnpm exec vitest run tests/sidebar_orchestrator_badge.test.mjs  (pytest runs it via tests/test_js_suites.py)
+import { closeMenu, menu, menuItems, openMenu } from './js_helpers/side_menu.mjs';
+import { beforeAll, beforeEach, test } from 'vitest';
 import assert from 'node:assert/strict';
-import { bootDashboardDom, clickOnclick, flush, sliceTemplate } from './js_helpers/dashboard_dom.mjs';
+import { APP_BODY, bootDashboardDom, clickIsland, flush, ORCHESTRATOR, SIDEBAR, AGENTS_STORE, VIEW_STORE, NAV } from './js_helpers/dashboard_dom.mjs';
 
-const INBOX_BTN = sliceTemplate('<button class="icon-btn" id="btn-decisions"', '</button>');
-// the end marker is the NEXT block's comment opener — cut it off, or it swallows the rest
-const DECISIONS_MENU = sliceTemplate('<div class="palette-overlay" id="decisions-menu"', '\n<!-- Launcher:')
-    .replace(/<!-- Launcher:$/, '');
-
-const BODY = `
-<aside class="sidebar">
-  <div class="sidebar-head">${INBOX_BTN}</div>
-  <div class="side-list" id="sidebar-agents"></div>
-</aside>
-<div id="agent-detail"></div>
-${DECISIONS_MENU}
-<span id="hdr-agents"></span><span id="hdr-next"></span><span id="hdr-updated"></span>`;
 
 const ok = body => Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(body) });
-let nav, util, orchestrator;
+let nav, agentsStore, viewStore, orchestrator, sidebar, decisions;
 
-before(async () => {
-    ({ modules: { util, nav, orchestrator } } = await bootDashboardDom({
-        body: BODY,
+beforeAll(async () => {
+    ({ modules: { agents: { agents: agentsStore }, view: { view: viewStore }, nav, orchestrator, sidebar } } = await bootDashboardDom({
+        body: APP_BODY,
         canvasStub: true,
         // Off, so the jump lands on the agent-detail view — a real DOM node to read back.
         terminalsEnabled: false,
@@ -54,8 +42,9 @@ before(async () => {
             if (u.includes('/api/sidebar/archive')) return ok({ hidden: [], sessions: [] });
             return ok(/\/api\/(agents|summary|log)/.test(u) && !u.includes('/api/log') ? [] : {});
         },
-        extraModules: ['util.js', 'nav.js', 'orchestrator.js'],
+        extraModules: [AGENTS_STORE, VIEW_STORE, NAV, ORCHESTRATOR, SIDEBAR],
     }));
+    decisions = await import('../chela/dashboard/frontend/src/features/decisions/index.ts');
 });
 
 const ROWS = [
@@ -68,8 +57,8 @@ const ROWS = [
 ];
 
 function render(rows = ROWS) {
-    util.setAgentsCache(rows);
-    nav.renderSidebarAgents(rows);
+    agentsStore.set(rows);
+    sidebar.renderSidebarAgents(rows);
 }
 
 async function setOrchestrator(wid) {
@@ -81,11 +70,11 @@ async function setOrchestrator(wid) {
 const rowFor = name => document.querySelector(`#sidebar-agents .agent-row[data-agent="${name}"]`);
 const badged = () => [...document.querySelectorAll('#sidebar-agents .agent-row')]
     .filter(r => r.querySelector('.ar-orch')).map(r => r.dataset.agent);
-const menuOpen = () => document.getElementById('decisions-menu').classList.contains('open');
+const menuOpen = () => decisions.inboxOpen.get();
 
 beforeEach(async () => {
     localStorage.clear();
-    window.chela.hideDecisionsMenu();
+    decisions.closeDecisions();
     await setOrchestrator(null);
     render();
 });
@@ -95,10 +84,12 @@ test('CMX-76: the orchestrator\'s row has the badge — a word with an accessibl
     // the listener re-rendered off the subscribe — no renderSidebarAgents call from here
     assert.deepEqual(badged(), ['orch'], 'exactly the orchestrator\'s row must carry the badge');
     const b = rowFor('orch').querySelector('.ar-orch');
-    assert.equal(b.textContent.trim(), 'orchestrator', 'the badge must be a WORD, not a colour-only cue');
-    assert.equal(b.getAttribute('aria-label'), 'Orchestrator');
-    // in the row's badge slot, next to the state word
-    assert.ok(b.closest('.ar-sub'), 'the badge is not in the row\'s .ar-sub badge slot');
+    // CMX-121: a crown icon whose tooltip and accessible name say it: never a colour-only cue
+    assert.ok(b.querySelector('svg.lucide-crown'), 'the badge is not the crown icon');
+    assert.equal(b.title, 'Orchestrator: holds the decisions inbox');
+    assert.equal(b.getAttribute('aria-label'), 'Orchestrator: holds the decisions inbox');
+    // in the row's metadata, after the title
+    assert.ok(b.closest('.ar-meta'), 'the badge is not in the row\'s .ar-meta');
     // the slot moves with the role
     await setOrchestrator('@3');
     assert.deepEqual(badged(), ['proj']);
@@ -124,7 +115,7 @@ test('CMX-76 / CMX-72 regression: the orchestrator\'s row is still in its folder
 test('CMX-76: the REAL inbox icon\'s click selects the orchestrator\'s window — and still opens the log', async () => {
     await setOrchestrator('@1');
     assert.equal(rowFor('orch').classList.contains('active'), false);
-    clickOnclick(document.getElementById('btn-decisions'));
+    clickIsland(document.getElementById('btn-decisions'));
     assert.equal(document.querySelector('#agent-detail .detail-title').textContent, 'orch',
         'the inbox icon did not jump to the orchestrator\'s window');
     assert.ok(rowFor('orch').classList.contains('active'), 'the orchestrator\'s row was not selected');
@@ -135,20 +126,20 @@ test('CMX-76: the REAL inbox icon\'s click selects the orchestrator\'s window �
 
 test('CMX-76: the jump expands the orchestrator\'s folder group when it is collapsed', async () => {
     await setOrchestrator('@1');
-    nav.toggleGroup('/home/u');
+    sidebar.toggleGroup('/home/u');
     assert.ok(rowFor('orch').closest('.side-group').classList.contains('collapsed'));
-    assert.equal(nav.jumpToOrchestrator(), true);
+    assert.equal(sidebar.jumpToOrchestrator(), true);
     assert.equal(rowFor('orch').closest('.side-group').classList.contains('collapsed'), false,
         'the jump left the orchestrator\'s row hidden in a collapsed group');
 });
 
 test('CMX-76: with no orchestrator the inbox icon only opens the log, as before', async () => {
     await setOrchestrator(null);
-    window.chela.selectAgent('proj');   // something else is selected; the click must not move it
-    clickOnclick(document.getElementById('btn-decisions'));
+    nav.selectAgent('proj');   // something else is selected; the click must not move it
+    clickIsland(document.getElementById('btn-decisions'));
     assert.ok(menuOpen(), 'the inbox icon stopped opening the decisions log');
     assert.equal(document.querySelector('#agent-detail .detail-title').textContent, 'proj');
-    assert.equal(nav.jumpToOrchestrator(), false);
+    assert.equal(sidebar.jumpToOrchestrator(), false);
     assert.equal(document.getElementById('btn-decisions').getAttribute('aria-label'), 'Decisions inbox');
 });
 
@@ -156,18 +147,16 @@ test('CMX-76: with no orchestrator the inbox icon only opens the log, as before'
 test('CMX-81: the idle orchestrator is NOT archivable — its row Archive is disabled and Archive all skips it', async () => {
     await setOrchestrator('@1');
     render();
-    const items = id => [...document.getElementById(id).querySelectorAll('.popover-item')]
-        .map(i => ({ text: i.textContent.trim(), disabled: i.classList.contains('disabled') }));
     const archiveOf = name => {
-        window.chela.hideSideMenus();
-        nav.openRowMenu(null, rowFor(name).dataset.item);
-        return items('row-menu').find(i => i.text === 'Archive');
+        if (menu()) closeMenu();
+        openMenu(rowFor(name).querySelector('.row-more'));
+        return menuItems().find(i => i.text === 'Archive');
     };
     assert.equal(archiveOf('orch').disabled, true, 'the orchestrator\'s row offers an enabled Archive');
     assert.equal(archiveOf('home-2').disabled, false, 'control: its idle neighbour is archivable');
-    window.chela.hideSideMenus();
-    nav.openGroupMenu(null, '/home/u');
-    assert.ok(items('group-menu').some(i => i.text === 'Archive all (1)'),
-        `expected "Archive all (1)", got ${JSON.stringify(items('group-menu').map(i => i.text))}`);
-    window.chela.hideSideMenus();
+    closeMenu();
+    openMenu(document.querySelector('.side-group[data-g="/home/u"] .group-more'));
+    assert.ok(menuItems().some(i => i.text === 'Archive all (1)'),
+        `expected "Archive all (1)", got ${JSON.stringify(menuItems().map(i => i.text))}`);
+    closeMenu();
 });

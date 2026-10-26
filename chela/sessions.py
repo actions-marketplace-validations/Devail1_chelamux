@@ -166,7 +166,7 @@ log = logging.getLogger(__name__)
 # from a payload or a command line must not walk the disk, and a GLOB METACHARACTER must
 # not match — `transcript_for_session("*")` would otherwise glob `*/*.jsonl` and hand back
 # some arbitrary agent's transcript.
-SESSION_RE = re.compile(r"^[0-9a-fA-F][0-9a-fA-F-]{7,63}$")
+SESSION_RE = re.compile(r"^[0-9a-fA-F][0-9a-fA-F-]{7,63}\Z")
 
 # Where the process facts come from. A module-level Path so a test can point the whole
 # lookup at a fixture tree.
@@ -521,8 +521,35 @@ def _looks_like_claude(pid: int) -> bool:
     return any("claude" in arg for arg in _cmdline_argv(pid))
 
 
+def pane_root_is_claude(pane_pid: int) -> bool:
+    """Is the pane's OWN process claude — a window tmux launched as ``claude …`` directly,
+    with no shell in between (CMX-198)?
+
+    Every resolver below otherwise looks at the pane's CHILDREN only, so such a window had
+    no claude at all: no cwd/session/status in ``/api/agents`` (the sidebar filed it under
+    "Other"), and :func:`chela.agent_manager.window_type` called it a shell, so Telegram
+    auto-topics never bound it. It is checked BEFORE the children, because a claude's own
+    children carry "claude" too — its Bash-tool subshells run
+    ``bash -c source ~/.claude/shell-snapshots/…`` — and the substring rule the child scan
+    uses would name one of those instead of the claude above it.
+
+    Stricter than :func:`_looks_like_claude` on purpose: the pane root is whatever tmux
+    was told to run, and a dev server started as ``python ~/projects/x-claude/app.py``
+    carries "claude" in its argv without being one. Only the process's own NAME counts —
+    its ``comm``, or its argv[0]'s basename (what ``ps`` stands in for ``comm`` with, and
+    what a node-installed claude rewrites its title to). A shell pane fails both.
+    """
+    if _comm(pane_pid) == "claude":
+        return True
+    argv = _cmdline_argv(pane_pid)
+    return bool(argv) and os.path.basename(argv[0]) == "claude"
+
+
 def _claude_pid(pane_pid: int) -> int | None:
-    """The claude process running in a pane (breadth-first, a couple of generations)."""
+    """The claude process running in a pane (breadth-first, a couple of generations) — or
+    the pane's own process, when tmux launched claude with no shell (CMX-198)."""
+    if pane_root_is_claude(pane_pid):
+        return pane_pid
     frontier = [pane_pid]
     for _ in range(_MAX_DEPTH):
         nxt: list[int] = []
@@ -547,7 +574,13 @@ def _direct_claude_pid(pane_pid: int) -> int | None:
     ``comm`` does when the command line is empty, which is what procps matches then — and
     the LOWEST such pid, the first line pgrep prints. Uncapped, unlike :func:`_children`:
     pgrep has no cap.
+
+    Except a pane whose own process is claude (:func:`pane_root_is_claude`, CMX-198): that
+    pid IS the window's claude, ahead of any child. ``agent_manager.claude_pid`` makes the
+    same check first, so the two stay interchangeable.
     """
+    if pane_root_is_claude(pane_pid):
+        return pane_pid
     table = _PS.get()
     if table is not None:
         hits = [k for k in table.children(pane_pid)
@@ -915,6 +948,25 @@ def session_of_window(wid: str | None,
     if not wid:
         return None
     pane_map = panes() if pane_map is None else pane_map
+    sid = live_session_of_window(wid, pane_map)
+    if sid:
+        return sid
+    pane = pane_map.get(wid)
+    return pane.resumed if pane else None
+
+
+def live_session_of_window(wid: str | None,
+                           pane_map: dict[str, Pane] | None = None) -> str | None:
+    """:func:`session_of_window` WITHOUT its last tier, the ``--resume <sid>`` command line.
+
+    CMX-337: that command line is the session the process was LAUNCHED with. A ``/clear`` or
+    ``/resume`` inside the window moves the live session on while the command line keeps the
+    old id, so only the event log and Claude Code's own registry follow it. ``None`` when
+    neither can say — the caller decides what a launch-time answer is worth.
+    """
+    if not wid:
+        return None
+    pane_map = panes() if pane_map is None else pane_map
     pane = pane_map.get(wid)
     if pane and pane.started is not None:
         sid = _session_from_log(wid, since=pane.started)
@@ -924,12 +976,7 @@ def session_of_window(wid: str | None,
     # shares its cwd with another agent had NO identity once its SessionStart record aged
     # out of the ring — every later hook is filed `wid: null` for exactly that ambiguity —
     # and `chela watch` recorded the orchestrator with self-heal disarmed.
-    sid = registry_session(pane.claude_pid) if pane else None
-    if sid:
-        return sid
-    if pane and pane.resumed:
-        return pane.resumed
-    return None
+    return registry_session(pane.claude_pid) if pane else None
 
 
 def wid_for_session(session_id: str | None,

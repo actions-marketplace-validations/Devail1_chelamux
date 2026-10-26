@@ -81,11 +81,12 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import NamedTuple
 
-from chela import envutil, judge_select
+from chela import envutil, generated, judge_select, procguard, risktier, suite_guard, toolconfig
 
 log = logging.getLogger(__name__)
 
@@ -133,6 +134,17 @@ J_STALE_HEAD = "stale_head"
 # moot (its commit cannot change), so this is a record, not a lever, exactly like every
 # other value here.
 J_UNJUDGED_MERGED = "unjudged_merged"
+# ⚖️🪜 CMX-208: every changed file is prose (`chela.risktier`), so no judge round ran.
+J_PROSE_ONLY = "prose_only"
+# ⏹️⚖️ CMX-286: the daemon STOPPED this round's live judge — its run was sent back, or its PR
+# head moved, so no verdict it could reach would be usable. Not a verdict: no inbox notice.
+J_CANCELLED = "cancelled"
+# ⚖️🪜 CMX-296: a STANDARD-tier PR (`chela.risktier`: product/UI, nothing core) gets no judge
+# round either — merge-ready on green CI + MERGEABLE, like `prose_only`.
+J_STANDARD_NO_JUDGE = "standard_no_judge"
+MERGE_READY = (J_CLEAN, J_PROSE_ONLY, J_STANDARD_NO_JUDGE)
+PROSE_ONLY_DETAIL = "prose-only: every changed file is docs/changelog/media — no judge round"
+STANDARD_NO_JUDGE_DETAIL = "standard tier: product/UI, no core path — no judge round"
 
 # A judge that proposes forty mutations is not being thorough, it is re-running the suite
 # forty times. The cap is enforced OUT LOUD (the report says what was dropped) — a silent
@@ -201,6 +213,59 @@ MIN_RAN_RATIO = 0.9
 
 _PY_SUFFIXES = (".py",)
 _JS_SUFFIXES = (".js", ".mjs", ".cjs")
+_TS_SUFFIXES = (".ts", ".tsx")
+
+# CMX-173: PARSE one .ts/.tsx (faster than `tsc --noEmit`) with the repo's own `typescript`,
+# resolved from the file's dir. Exit 0 parses, 1 does not (stderr says why), 3 no `typescript`.
+_TS_PARSE_JS = """
+const path = require("path"), fs = require("fs"), file = process.argv[1];
+let ts;
+try { ts = require(require.resolve("typescript", {paths: [path.dirname(file)]})); }
+catch (e) { process.stderr.write(String(e.message).split("\\n")[0]); process.exit(3); }
+const sf = ts.createSourceFile(file, fs.readFileSync(file, "utf8"), ts.ScriptTarget.Latest,
+  false, file.endsWith(".tsx") ? ts.ScriptKind.TSX : ts.ScriptKind.TS), d = sf.parseDiagnostics;
+if (d.length) {
+  process.stderr.write(`line ${sf.getLineAndCharacterOfPosition(d[0].start).line + 1}: ` +
+                       ts.flattenDiagnosticMessageText(d[0].messageText, " "));
+  process.exit(1);
+}
+"""
+TS_PARSES, TS_BROKEN, TS_NO_PARSER = "parses", "broken", "no-parser"
+
+
+def ts_parse(path: Path) -> tuple[str, str]:
+    """``(TS_PARSES | TS_BROKEN | TS_NO_PARSER, detail)`` for one .ts/.tsx file."""
+    try:
+        out = subprocess.run(["node", "-e", _TS_PARSE_JS, str(path)], capture_output=True,
+                             text=True, errors="replace", timeout=60, env=envutil.child_env())
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return TS_NO_PARSER, f"node unavailable: {e}"
+    detail = (out.stderr or "").strip()[:200]
+    if out.returncode == 0:
+        return TS_PARSES, ""
+    if out.returncode == 1:
+        return TS_BROKEN, detail
+    return TS_NO_PARSER, f"no `typescript` resolvable from {path.parent}: {detail}"
+
+
+def ts_unparseable(worktree: Path, items: list) -> str:
+    """⚖️ CMX-175: "" when every ``.ts``/``.tsx`` an experiment names parses, unmutated, with
+    the repo's own ``typescript``; else why not. ⛔ With no parser, no TS mutant's parse can be
+    proven, so a red suite might be a syntax error read as a guard firing — the run fails
+    CLOSED, as the sweep does (CMX-173). A held-out experiment's file is never named."""
+    for raw in items:
+        if not isinstance(raw, dict) or not isinstance(raw.get("file"), str):
+            continue
+        rel = raw["file"].strip()
+        if Path(rel).suffix.lower() not in _TS_SUFFIXES or not (worktree / rel).is_file():
+            continue        # not TS, or missing: `apply_mutation` reports it INVALID
+        status, detail = ts_parse(worktree / rel)
+        if status != TS_PARSES:
+            name = "a held-out experiment's file" if raw.get("held_out") is True else rel
+            return (f"{name} is TypeScript and could not be parse-checked before mutating it "
+                    f"({status}: {detail}) — a TS mutant whose parse cannot be proven is not "
+                    "evidence either way. Install the repo's `typescript` (and node).")
+    return ""
 
 # pytest ("3 failed, 1108 passed, 2 errors in 41s") and node --test ("# pass 15" /
 # "# fail 0") in one pass — a repo's `judge.test_cmd` may well run both.
@@ -209,6 +274,10 @@ _RE_FAILED = re.compile(r"(\d+) failed\b")
 _RE_ERRORS = re.compile(r"(\d+) errors?\b")
 _RE_NODE_PASS = re.compile(r"^# pass (\d+)$", re.M)
 _RE_NODE_FAIL = re.compile(r"^# fail (\d+)$", re.M)
+# ⚡ CMX-175: Vitest's summary counts test FILES on a line of its own above the TESTS
+# ("Test Files  1 failed | 2 passed (3)"); counted too, it inflates `ran` and blunts the
+# collapse check — a test file that no longer loads would still count as having run.
+_RE_VITEST_FILES = re.compile(r"^[ \t]*Test Files\b.*$", re.M)
 
 # ⛔ CMX-177: a count is not a cause. pytest's short summary line ("FAILED path::test - why")
 # and node --test's TAP line ("not ok N - test name") are the only place either format names
@@ -233,6 +302,11 @@ def _strip_ansi(text: str) -> str:
 MAX_NAMED_FAILURES = 5
 
 SUITE_TAIL_CHARS = 3000
+# 📄 CMX-163: how much of a NON-GREEN suite's output is persisted to its failure log, and how
+# long / how many of those logs a task keeps before they are pruned.
+SUITE_LOG_CHARS = 200_000
+SUITE_LOG_MAX_AGE_DAYS = 30
+SUITE_LOG_MAX_PER_TASK = 20
 
 
 class SuiteResult(NamedTuple):
@@ -244,6 +318,12 @@ class SuiteResult(NamedTuple):
     errors: int
     tail: str
     detail: str = ""
+    # 📄 CMX-163: how it ran — {cmd, cwd, env_diff, started, ended, output} — so a red run
+    # can be written to a failure log. Never part of a verdict.
+    run: dict | None = None
+    # ⏳ CMX-195: killed at the timeout — it never FINISHED, so it was never red either.
+    # CMX-253: so under a mutation it is UNKNOWN, never a red that killed it.
+    timed_out: bool = False
 
     @property
     def green(self) -> bool:
@@ -325,6 +405,8 @@ class Outcome:
     # FLIPPED between KILLED and SURVIVED. A flaky outcome never blocks — the operator decides.
     rerun_verdict: str = ""
     flaky: bool = False
+    # ⚖️🧰 CMX-259: why this survivor is ADVISORY ("" = it is not) — see chela/toolconfig.py.
+    advisory: str = ""
 
     @property
     def held_out(self) -> bool:
@@ -332,7 +414,7 @@ class Outcome:
 
     @property
     def blocking(self) -> bool:
-        return self.verdict == SURVIVED and not self.flaky
+        return self.verdict == SURVIVED and not self.flaky and not self.advisory
 
     @property
     def measured_by(self) -> str:
@@ -355,7 +437,7 @@ class Outcome:
             "selected": self.selected, "confirmed_full": self.confirmed_full,
             "selection": self.selection, "seconds": round(self.seconds, 1),
             "held_out": self.held_out, "rerun_verdict": self.rerun_verdict,
-            "flaky": self.flaky,
+            "flaky": self.flaky, "advisory": self.advisory,
         }
 
 
@@ -386,6 +468,12 @@ class Report:
     # ⏳ CMX-141 (self-check): UNRUN experiments — kept OUT of ``outcomes`` — and why.
     unrun: list[Outcome] = field(default_factory=list)
     exhausted: str = ""
+    # 📄 CMX-163: every NON-GREEN infrastructure suite run (the baseline, its coverage run, the
+    # base-branch diagnostic) — and the failure-log paths `judge_run` wrote them to.
+    suite_failures: list[SuiteResult] = field(default_factory=list)
+    # 🎲 CMX-195: tests that failed the baseline once and passed a re-run of just them.
+    baseline_flakes: list[str] = field(default_factory=list)
+    suite_logs: list[str] = field(default_factory=list)
 
     @property
     def blocking(self) -> list[Outcome]:
@@ -419,6 +507,10 @@ class Report:
     @property
     def flaky(self) -> list[Outcome]:
         return [o for o in self.outcomes if o.flaky]
+
+    @property
+    def advisory(self) -> list[Outcome]:
+        return [o for o in self.outcomes if o.advisory]
 
     @property
     def state(self) -> str:
@@ -514,11 +606,18 @@ def parse_check(path: Path) -> tuple[bool, str]:
         if out.returncode != 0:
             return False, f"the mutated JS does not parse: {(out.stderr or '').strip()[:200]}"
         return True, "the mutated JS still parses (node --check)"
+    if suffix in _TS_SUFFIXES:
+        status, detail = ts_parse(path)
+        if status == TS_BROKEN:
+            return False, f"the mutated TS does not parse: {detail}"
+        return True, (f"no parse check ran ({detail})" if status == TS_NO_PARSER
+                      else "the mutated TS still parses (typescript's parser)")
     return True, f"no parse check exists for {suffix or 'this file type'} — not parse-verified"
 
 
 def _counts(text: str) -> tuple[int, int, int]:
     """(passed, failed, errors), summed across pytest's summary and node --test's."""
+    text = _RE_VITEST_FILES.sub("", _strip_ansi(text))
     passed = sum(int(m) for m in _RE_PASSED.findall(text)) + \
         sum(int(m) for m in _RE_NODE_PASS.findall(text))
     failed = sum(int(m) for m in _RE_FAILED.findall(text)) + \
@@ -658,22 +757,53 @@ def run_suite(
     consistency check on a red run (did the suite still RUN?), where being approximate
     costs nothing.
     """
+    run = {"cmd": test_cmd, "cwd": str(cwd), "env_diff": {}, "started": _iso_now(),
+           "output": ""}
     try:
-        with tempfile.TemporaryDirectory(prefix="chela-suite-") as scratch:
+        # 🧠 CMX-119: one of the box's K suite slots, then a memory-capped scope of its own.
+        with (suite_guard.slot(cwd, on_wait=_run_ctx.get("on_slot_wait"),
+                               max_wait=suite_guard.max_wait(timeout)),
+              tempfile.TemporaryDirectory(prefix="chela-suite-") as scratch):
             env = _suite_env(Path(scratch))
             env.update(extra_env or {})
-            out = subprocess.run(
-                test_cmd, shell=True, cwd=str(cwd), env=env,
-                capture_output=True, text=True, errors="replace", timeout=timeout,
-            )
-    except subprocess.TimeoutExpired:
-        return SuiteResult(False, -1, 0, 0, 0, "", f"the suite did not finish in {timeout:.0f}s")
+            run["env_diff"] = _env_diff(os.environ, env)
+            # ⛔ CMX-307: the scope is probed and launched under the suite's OWN env.
+            with suite_guard.bounded(test_cmd, env) as (cmd, check):
+                # ⛔ CMX-253: the whole tree, not just the shell, dies on a timeout.
+                task = _run_ctx.get("task")
+                out = procguard.run_shell_group(
+                    cmd, cwd=str(cwd), env=env, timeout=timeout,
+                    frozen=(lambda since: frozen_since(task, since)) if task else None)
+                breach = check(out.returncode)
+    except subprocess.TimeoutExpired as e:
+        run.update(ended=_iso_now(), output=_decoded(e.stdout) + _decoded(e.stderr))
+        return SuiteResult(False, -1, 0, 0, 0, "", f"the suite did not finish in {timeout:.0f}s; "
+                           "its process tree was killed", run, timed_out=True)
     except OSError as e:
-        return SuiteResult(False, -1, 0, 0, 0, "", f"the suite could not be run: {e}")
+        run["ended"] = _iso_now()
+        return SuiteResult(False, -1, 0, 0, 0, "", f"the suite could not be run: {e}", run)
     text = (out.stdout or "") + (out.stderr or "")
     passed, failed, errors = _counts(text)
     tail = text[-SUITE_TAIL_CHARS:] if len(text) > SUITE_TAIL_CHARS else text
-    return SuiteResult(True, out.returncode, passed, failed, errors, tail)
+    run.update(ended=_iso_now(), output=text[-SUITE_LOG_CHARS:])
+    if breach:
+        return SuiteResult(False, out.returncode, passed, failed, errors, tail, breach, run)
+    return SuiteResult(True, out.returncode, passed, failed, errors, tail, "", run)
+
+
+def _iso_now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _decoded(out: bytes | str | None) -> str:
+    return out.decode(errors="replace") if isinstance(out, bytes) else (out or "")
+
+
+def _env_diff(operator: Mapping[str, str], suite: Mapping[str, str]) -> dict:
+    """The suite's env vs the operator's: ``{name: value}`` set/changed, ``{name: None}`` removed."""
+    diff: dict = {k: v for k, v in suite.items() if operator.get(k) != v}
+    diff.update({k: None for k in operator if k not in suite})
+    return dict(sorted(diff.items()))
 
 
 def _duration(seconds: float) -> str:
@@ -708,6 +838,7 @@ def _has_pytest_cov(worktree: Path) -> bool:
 
 def run_baseline(
     worktree: Path, test_cmd: str, timeout: float, scratch: Path, *, select_tests: bool = True,
+    failures: list[SuiteResult] | None = None, flakes: list[str] | None = None,
 ) -> tuple[SuiteResult, "judge_select.Selector | None", str]:
     """⚡ CMX-407: THE baseline — one full-suite run on the unmutated tree, exactly as before —
     that also records what per-mutation selection needs. Returns ``(baseline, selector, why)``;
@@ -726,6 +857,8 @@ def run_baseline(
     """
     if not select_tests:
         return run_suite(test_cmd, worktree, timeout), None, "selection is off (judge.select_tests)"
+    if judge_select.is_vitest(test_cmd):
+        return _vitest_baseline(worktree, test_cmd, timeout, scratch)
     if not judge_select.extendable(test_cmd):
         return (run_suite(test_cmd, worktree, timeout), None,
                 "`judge.test_cmd` is not a single pytest invocation — every mutation runs the "
@@ -741,11 +874,15 @@ def run_baseline(
         cov_args, extra_env = judge_select.coverage_args(cov_file)
         args += cov_args
     baseline = run_suite(judge_select.extend(test_cmd, args), worktree, timeout, extra_env)
-    if not baseline.green and extra_env:
+    if not baseline.green and extra_env and not baseline.timed_out:
         log.warning("judge: the baseline is red UNDER COVERAGE — re-running it plain")
+        if failures is not None:
+            failures.append(baseline)
         extra_env = {}
         baseline = run_suite(judge_select.extend(test_cmd, [f"--junitxml={junit}"]),
                              worktree, timeout)
+    if not baseline.green:
+        baseline = _rerun_failed_once(worktree, test_cmd, timeout, baseline, failures, flakes)
     if not baseline.green:
         return baseline, None, ""
     if extra_env:
@@ -759,6 +896,47 @@ def run_baseline(
     selector = judge_select.Selector(worktree, cases, cov or {})
     why = f"per-mutation selection over the baseline's {len(cases)} test(s)"
     return baseline, selector, why + (f"; {cov_note}" if cov_note else "")
+
+
+def _rerun_failed_once(
+    worktree: Path, test_cmd: str, timeout: float, baseline: SuiteResult,
+    failures: list[SuiteResult] | None, flakes: list[str] | None,
+) -> SuiteResult:
+    """🎲 CMX-195: a red baseline whose EVERY failure is a named test gets ONE re-run of just
+    those tests. All of them passing ⇒ a flake: recorded in ``flakes`` and the baseline reads
+    green. ⛔ Anything else — a test red twice, an error, an unnamed failure — stays red."""
+    named = _failing_test_names(baseline.tail)
+    if not named or baseline.errors or baseline.failed != len(named) or not baseline.passed:
+        return baseline
+    rerun = run_suite(judge_select.extend(test_cmd, named), worktree, timeout)
+    if not rerun.green or rerun.passed < len(named):
+        if failures is not None:            # the evidence it is red twice, beside the first
+            failures.append(rerun)
+        return baseline
+    if failures is not None:                # the flake's own red run, kept as evidence
+        failures.append(baseline)
+    log.warning("judge: baseline flake(s) — failed once, passed on re-run: %s", ", ".join(named))
+    if flakes is not None:
+        flakes.extend(named)
+    return baseline._replace(exit_code=0, failed=0)
+
+
+def _vitest_baseline(
+    worktree: Path, test_cmd: str, timeout: float, scratch: Path,
+) -> tuple[SuiteResult, "judge_select.Selector | None", str]:
+    """⚡ CMX-174: :func:`run_baseline` for ONE Vitest invocation — its universe is the
+    baseline's own JSON report, and each mutation runs only the test files that reach it."""
+    report = scratch / "baseline-vitest.json"
+    baseline = run_suite(judge_select.extend(test_cmd, judge_select.vitest_report_args(report)),
+                         worktree, timeout)
+    if not baseline.green:
+        return baseline, None, ""
+    cases = judge_select.parse_vitest_json(worktree, report)
+    if cases is None:
+        return (baseline, None, "the baseline wrote no readable Vitest JSON report — every "
+                                "mutation runs the full suite")
+    return (baseline, judge_select.Selector(worktree, cases),
+            f"per-mutation Vitest selection over the baseline's {len(cases)} test(s)")
 
 
 def _subset_baseline(sel: "judge_select.Selection") -> SuiteResult:
@@ -806,6 +984,10 @@ def adjudicate(
             "an emptied return).",
             baseline, mutated, parse_detail,
         )
+    if mutated is not None and mutated.timed_out:
+        # ⏳ CMX-253: a hung suite is UNKNOWN — never KILLED, never a pass, said as a TIMEOUT.
+        return Outcome(exp, INVALID, f"TIMEOUT (unknown) under the mutation: {mutated.detail}",
+                       baseline, mutated, parse_detail)
     if mutated is None or not mutated.ok:
         return Outcome(exp, INVALID,
                        f"the suite could not be run under the mutation: "
@@ -1016,6 +1198,7 @@ def _js_installer(worktree: Path) -> tuple[list[str], str] | None:
 
 def _diagnose_red_baseline(
     worktree: Path, test_cmd: str, base_branch: str, timeout: float,
+    failures: list[SuiteResult] | None = None,
 ) -> str:
     """WHY the baseline is red: this branch's own doing, already broken on ``base_branch``, or
     undeterminable. One sentence, always — never blank.
@@ -1085,6 +1268,8 @@ def _diagnose_red_baseline(
             log.error("judge: could not restore worktree %s to %s after the base_branch "
                       "diagnostic (git exited %d: %s)", worktree, orig_sha, restore.returncode,
                       (restore.stderr or "").strip()[:200])
+    if failures is not None and not base_result.green:
+        failures.append(base_result)
 
     if not base_result.ok:
         return (f"the judge tried `{test_cmd}` against `{ref}` alone and it would not even run "
@@ -1170,10 +1355,11 @@ def _is_docs_path(name: str) -> bool:
     return p.suffix.lower() in _DOCS_ROOT_SUFFIXES or p.name in _PROSE_BASENAMES
 
 
-def _changed_files(worktree: Path, base_branch: str) -> list[str] | None:
+def _changed_files(worktree: Path, base_branch: str, head: str = "HEAD") -> list[str] | None:
     """Every path this PR touches vs ``origin/<base_branch>``, or ``None`` when git cannot
     say. ``--no-renames``: a rename lists BOTH sides, so ``chela/x.py`` → ``docs/x.md``
-    reports the code path it removed instead of hiding behind the prose one it added."""
+    reports the code path it removed instead of hiding behind the prose one it added.
+    ``head`` (CMX-265) lets a caller with no checkout of the PR name its commit instead."""
     if not base_branch:
         return None
     ref = f"origin/{base_branch}"
@@ -1186,7 +1372,7 @@ def _changed_files(worktree: Path, base_branch: str) -> list[str] | None:
     base_sha = resolved.stdout.strip()
     diff = subprocess.run(
         ["git", "-C", str(worktree), "diff", "--name-only", "--no-renames",
-         f"{base_sha}...HEAD"],
+         f"{base_sha}...{head}"],
         capture_output=True, text=True, errors="replace",
     )
     if diff.returncode != 0:
@@ -1367,10 +1553,15 @@ def run_experiments(
     consistency_sample: int = 0,
     max_experiments: int = MAX_EXPERIMENTS,
     risk: str = "",
+    tool_config: tuple[str, ...] = toolconfig.DEFAULT_GLOBS,
     progress=None,
     heartbeat=None,
+    held_out: bool = True,
 ) -> Report:
     """Execute every proposed experiment IN THIS WORKTREE and adjudicate each one.
+
+    ⚖️🧰 CMX-259: experiments on ``tool_config`` files run LAST, and their unclaimed
+    survivors are advisory — see :mod:`chela.toolconfig`.
 
     ⏱️ CMX-411: ``progress``, when given, is called ``progress(done, total)`` as each
     experiment starts and once more when they are all done — what ``chela doctor`` reads to
@@ -1433,23 +1624,51 @@ def run_experiments(
     nothing; a report whose ONLY survivors are flaky becomes CANNOT VERIFY, naming them —
     never clean, because a flip is an unknown, and the operator decides. ``0`` (the default)
     skips it; ``judge_run`` passes the workflow's ``judge.consistency_sample``.
+
+    ⚖️🪜 CMX-288: ``held_out=False`` (a STANDARD-tier run) plans no held-out experiment —
+    see :func:`plan_experiments`.
     """
     started = time.monotonic()
     report = _run_experiments(worktree, test_cmd, raw, timeout=timeout,
                               base_branch=base_branch, select_tests=select_tests,
                               consistency_sample=consistency_sample,
                               max_experiments=max_experiments, risk=risk,
-                              progress=progress, heartbeat=heartbeat)
+                              tool_config=tool_config, progress=progress, heartbeat=heartbeat,
+                              held_out=held_out)
     report.battery_seconds = time.monotonic() - started
     log.info("judge: mutation battery took %s (%d experiment(s))",
              _duration(report.battery_seconds), len(report.outcomes))
     return report
 
 
+def _drop_generated(items: list) -> tuple[list, int]:
+    """🏭 CMX-284: ``(kept, skipped)`` — experiments on a generated file (see
+    :mod:`chela.generated`) are dropped before anything runs, and counted."""
+    kept = [i for i in items if not (isinstance(i, dict) and isinstance(i.get("file"), str)
+                                     and generated.is_generated(i["file"]))]
+    return kept, len(items) - len(kept)
+
+
+def plan_experiments(items: list, cap: int, tool_config: tuple[str, ...], *,
+                     held_out: bool = True) -> tuple[list, int]:
+    """``(planned, dropped)`` — the experiments a run will execute, in order, capped at ``cap``.
+
+    ⚖️🪜 CMX-288: with ``held_out=False`` (a STANDARD-tier run) nothing is held out — every
+    ``"held_out": true`` the judge wrote anyway is cleared, so it runs and reports as visible.
+    """
+    items = toolconfig.code_first(items, tool_config)
+    dropped = max(0, len(items) - cap)
+    items = items[:cap]
+    if not held_out:
+        items = [dict(i, held_out=False) if isinstance(i, dict) else i for i in items]
+    return items, dropped
+
+
 def _run_experiments(
     worktree: Path, test_cmd: str, raw: dict, *, timeout: float, base_branch: str,
     select_tests: bool, consistency_sample: int, max_experiments: int, risk: str,
-    progress=None, heartbeat=None,
+    tool_config: tuple[str, ...] = toolconfig.DEFAULT_GLOBS, progress=None, heartbeat=None,
+    held_out: bool = True,
 ) -> Report:
     report = Report(risk=risk, cap=max(1, int(max_experiments)))
     items = raw.get("experiments") if isinstance(raw, dict) else None
@@ -1466,6 +1685,20 @@ def _run_experiments(
         )
         return report
 
+    if isinstance(items, list):
+        items, skipped = _drop_generated(items)
+        if skipped:
+            report.notes.append({"title": "Generated files not mutated",
+                                 "body": generated.note(skipped)})
+        if skipped and not items:
+            report.cannot_verify = (
+                f"every one of the judge's {skipped} experiment(s) targeted a GENERATED file, "
+                "so none ran — nothing was proven. ⛔ Unknown is never a pass: the guards "
+                "live in the source those files are built from."
+            )
+            report.cannot_verify_final = True
+            return report
+
     if not isinstance(items, list) or not items:
         if _docs_only_diff(worktree, base_branch):
             report.cannot_verify = (
@@ -1476,18 +1709,18 @@ def _run_experiments(
                 "AUTONOMOUS merge (unknown ≠ safe), but it needs a human's read of the prose "
                 "itself, not a rework round."
             )
-            report.cannot_verify_final = True     # CMX-19: prose stays prose on a re-run
         else:
             report.cannot_verify = (
                 "the judge proposed NO experiments — nothing was corrupted, so nothing was "
                 "proven. ⛔ Unknown is never a pass: this is not a clean bill of health, it is "
                 "an unreviewed PR."
             )
+        # CMX-19/CMX-195: prose stays prose on a re-run, and a judge that proposed nothing
+        # proposes nothing again on the same inputs (CMX-15 ×3 in 2 min) — park it ONCE.
+        report.cannot_verify_final = True
         return report
 
-    if len(items) > report.cap:
-        report.dropped = len(items) - report.cap
-        items = items[:report.cap]
+    items, report.dropped = plan_experiments(items, report.cap, tool_config, held_out=held_out)
 
     # ⛔ CMX-80: PROVISION BEFORE MEASURING. A missing dependency and a broken guard both
     # come out of the suite as "exit 1", and the judge used to report the first as the
@@ -1504,16 +1737,35 @@ def _run_experiments(
             "judgment), and it did not install what `judge.test_cmd` needs."
         )
         return report
+    ts_problem = ts_unparseable(worktree, items)
+    if ts_problem:
+        report.cannot_verify = ts_problem
+        return report
 
     # THE BASELINE — the suite as the PR actually ships it, before anything is touched.
     baseline_started = time.monotonic()
     with tempfile.TemporaryDirectory(prefix="chela-judge-select-") as scratch:
         baseline, selector, report.selection = run_baseline(
-            worktree, test_cmd, timeout, Path(scratch), select_tests=select_tests)
+            worktree, test_cmd, timeout, Path(scratch), select_tests=select_tests,
+            failures=report.suite_failures, flakes=report.baseline_flakes)
     if heartbeat is not None:
         heartbeat("baseline", seconds=time.monotonic() - baseline_started)
     report.baseline = baseline
+    if baseline.timed_out:
+        report.suite_failures.append(baseline)
+        load = os.getloadavg()[0] if hasattr(os, "getloadavg") else -1.0
+        # ⏳ CMX-195: a suite killed mid-run never FINISHED; it is not red. No base diagnosis:
+        # that is another full run on the same budget, on the same loaded box.
+        report.cannot_verify = (
+            f"⏳ TIMEOUT: {baseline.detail} (killed after "
+            f"{_duration(time.monotonic() - baseline_started)}, `judge.suite_timeout_seconds`) "
+            f"under load {load:.1f} on {os.cpu_count()} CPU(s) "
+            "— not a failure: it never finished, so nothing was measured. A re-run when the "
+            "host is quieter can settle it."
+        )
+        return report
     if not baseline.green:
+        report.suite_failures.append(baseline)
         # ⛔ CMX-80: name the CAUSE, not just the exit code. `judge_detail` (this string) is
         # what the dashboard shows, and for three weeks it showed "exited 1" on every PR
         # while the suite itself was saying "jsdom is not installed" one pipe away.
@@ -1524,7 +1776,8 @@ def _run_experiments(
         # judge's box) that used to collapse into the same "exited 1" dead end.
         named = _failing_test_names(baseline.tail)
         which = f" — failing: {', '.join(named)}" if named else ""
-        cause = _diagnose_red_baseline(worktree, test_cmd, base_branch, timeout)
+        cause = _diagnose_red_baseline(worktree, test_cmd, base_branch, timeout,
+                                       report.suite_failures)
         report.cannot_verify = (
             f"the suite is NOT GREEN before any mutation (`{test_cmd}` exited "
             f"{baseline.exit_code}{': ' + why if why else ''}{which}). {cause}. Every "
@@ -1541,6 +1794,7 @@ def _run_experiments(
     if contamination:
         report.cannot_verify = contamination
         return report
+    toolconfig.classify(outcomes, worktree, base_branch, tool_config)
 
     if consistency_sample > 0:
         contamination = _check_consistency(
@@ -1550,7 +1804,9 @@ def _run_experiments(
         if contamination:
             report.cannot_verify = contamination
             return report
-        if report.flaky and not any(o.blocking for o in outcomes):
+        # ⚖️🧰 CMX-259: an ADVISORY survivor could never block, so its flip is not an unknown.
+        if (any(not o.advisory for o in report.flaky)
+                and not any(o.blocking for o in outcomes)):
             # ⚖️🎲 Nothing blocks ONLY because a survivor flipped. That is not a clean bill of
             # health either — it is a guard nobody can say holds. The operator decides.
             report.cannot_verify = (
@@ -1623,7 +1879,57 @@ def _apply_experiments(
     the tests that can observe its file — see :func:`_measure`. ``pinned`` (parallel to
     ``items``) replays each experiment's FIRST-run selection instead of computing one — the
     consistency re-run's contract.
+
+    ⛔ CMX-162: a KILLED experiment leaves the worktree byte-identical too. The loop's
+    ``finally`` restores the file on a normal exit or an exception, but SIGTERM/SIGHUP/SIGINT
+    skip it by default and SIGKILL skips anything. So this reuses the sweep's machinery
+    (CMX-97/131) instead of a second copy: those three signals raise
+    :class:`~chela.sweep._Interrupted` so the ``finally`` runs, every mutation writes the
+    sweep's recovery marker before it lands, and a guardian process in its own session
+    restores the file from the marker if this process dies anyway. Once the file is back, the
+    signal is delivered again to whatever handler it had before, so a killed judge still
+    dies the way it would have.
     """
+    from chela import sweep
+
+    recovered, err = sweep.recover(worktree)
+    if err:
+        return [], err
+    if recovered:
+        log.warning("judge: %s", recovered)
+    old = sweep._install_signal_handlers()
+    guardian = None
+    try:
+        # Inside the `try`: a signal while the guardian spawns still restores the handlers.
+        guardian = sweep._start_guardian(worktree)
+        if guardian is None:
+            log.warning("judge: the kill guardian could not start — a SIGKILL mid-mutation "
+                        "is only recovered by the next judge or sweep run in %s", worktree)
+        return _apply_each(worktree, test_cmd, items, baseline, timeout, selector, pinned,
+                           progress=progress, heartbeat=heartbeat)
+    except sweep._Interrupted as e:
+        signum = e.args[0]
+        # A signal between a mutation's write and its `try`, or inside the restore itself,
+        # never reached the `finally` that restores — the marker still holds the original.
+        _, err = sweep.recover(worktree)
+    finally:
+        sweep._restore_signal_handlers(old)
+        sweep._stop_guardian(guardian)
+    signal.raise_signal(signum)
+    # Only reached when the earlier handler returns (e.g. a daemon's graceful-shutdown flag).
+    return [], (f"interrupted by signal {signum} — the experiments stopped"
+                + (f", and the mutated file could NOT be recovered: {err}" if err
+                   else "; the mutated file was restored"))
+
+
+def _apply_each(
+    worktree: Path, test_cmd: str, items: list, baseline: SuiteResult, timeout: float,
+    selector: "judge_select.Selector | None", pinned: "list[judge_select.Selection | None] | None",
+    *, progress, heartbeat,
+) -> tuple[list[Outcome], str]:
+    """:func:`_apply_experiments`' loop, run under its signal handlers and guardian."""
+    from chela import sweep
+
     outcomes: list[Outcome] = []
 
     def _record(outcome: Outcome) -> None:
@@ -1660,6 +1966,7 @@ def _apply_experiments(
             ))
             continue
 
+        _mark_mutation(worktree, path, exp)
         applied, reason, original = apply_mutation(path, exp.before, exp.after)
         try:
             started = time.monotonic()
@@ -1682,7 +1989,10 @@ def _apply_experiments(
             # ⛔ ALWAYS. The next experiment's baseline is this file, unmutated.
             restored = True
             restore_detail = ""
-            if applied and original is not None:
+            # CMX-162: also when `apply_mutation` refused AFTER its write (the read-back
+            # raised, or the replacement is missing) — the file may be changed all the same,
+            # and the marker dropped below was its only other copy.
+            if original is not None:
                 try:
                     path.write_text(original)
                 except OSError as e:
@@ -1704,6 +2014,9 @@ def _apply_experiments(
                             f"{len(readback)} chars where the original was {len(original)} — "
                             "something else may have written to this file concurrently"
                         )
+            if restored:
+                # The marker stays when the restore failed: it holds the only known-good copy.
+                sweep.marker_path(worktree).unlink(missing_ok=True)
         if not restored:
             # ⛔ THE ARTIFACT IS NOW CONTAMINATED. Every experiment after this one would run
             # against a file still carrying the last mutation, so its "the suite went green"
@@ -1725,6 +2038,26 @@ def _apply_experiments(
     if progress is not None:
         progress(len(items), len(items))
     return outcomes, ""
+
+
+def _mark_mutation(worktree: Path, path: Path, exp: Experiment) -> None:
+    """⛔ CMX-162: write the sweep's recovery marker for ``exp`` BEFORE it is applied, so a
+    kill at any point after the write is recoverable. A file that cannot be read is not
+    marked — :func:`apply_mutation` will refuse it too, so nothing lands. A marker that
+    cannot be written leaves the ``finally`` and SIGTERM paths intact; only a SIGKILL is
+    then unrecoverable, so it is logged, not fatal."""
+    from chela import sweep
+
+    try:
+        original = path.read_text()
+    except (OSError, UnicodeDecodeError):
+        return
+    try:
+        sweep._write_marker(worktree, str(path.relative_to(worktree.resolve())), original,
+                            original.replace(exp.before, exp.after, 1))
+    except OSError as e:
+        log.warning("judge: no recovery marker for %s (%s) — a SIGKILL during this "
+                    "experiment would leave its mutation on disk", exp.file, e)
 
 
 _SELECT = object()   # _measure's "no pinned selection — compute one" sentinel
@@ -1763,12 +2096,16 @@ def _measure(
         outcome = adjudicate(exp, True, reason, parses, parse_detail, baseline, mutated)
         outcome.selection = sel.why if sel is not None else ""
         outcome.plan = sel
+        if sel is not None and sel.untested and outcome.verdict == SURVIVED:
+            # ⚖️ CMX-174: survivor-class, and said as what it is — not one test imports it.
+            outcome.reason = f"UNTESTED — no test file imports {exp.file}. {outcome.reason}"
         return outcome
     subset = run_suite(judge_select.extend(test_cmd, sel.nodes), worktree, timeout)
     outcome = adjudicate(exp, True, reason, parses, parse_detail, _subset_baseline(sel), subset)
     outcome.selected, outcome.selection, outcome.plan = sel.expected, sel.why, sel
-    if outcome.verdict == KILLED or not parses:
+    if outcome.verdict == KILLED or not parses or subset.timed_out:
         # Final. A broken parse is INVALID whatever the suite says — no full run can change it.
+        # ⏳ CMX-253: nor can a hung subset: the full suite holds the same hanging tests.
         return outcome
     if heartbeat is not None:
         # ⏳⚖️ CMX-431: a full-suite run is about to start — it is what the wall must budget.
@@ -1856,7 +2193,7 @@ def held_out_quota(n: int, fraction: float = HELD_OUT_FRACTION) -> int:
     1 once there are :data:`HELD_OUT_MIN_EXPERIMENTS`, else none (holding out one of two would
     leave the rework almost nothing to read). Recorded against what the judge actually tagged;
     chela never re-tags on the judge's behalf — the held-out choice is the judge's."""
-    if n < HELD_OUT_MIN_EXPERIMENTS:
+    if n < HELD_OUT_MIN_EXPERIMENTS or fraction <= 0:   # CMX-288: a 0 fraction asks for none
         return 0
     return max(1, round(n * max(0.0, min(1.0, fraction))))
 
@@ -1966,6 +2303,17 @@ def _held_out_section(report: Report) -> str:
     ])
 
 
+def _advisory_section(report: Report) -> str:
+    """⚖️🧰 CMX-259: tool-config survivors — listed, never blocking (CI is their guard)."""
+    if not report.advisory:
+        return ""
+    lines = ["### 🧰 advisory — tool config CI enforces; not blocking", ""]
+    for o in report.advisory:
+        lines.append("- a held-out experiment (withheld by design)" if o.held_out
+                     else f"- `{o.experiment.file}`: {o.experiment.guard} — {o.advisory}")
+    return "\n".join([*lines, ""]) + "\n"
+
+
 def _flaky_section(report: Report) -> str:
     """⚖️🎲 CMX-395: experiments whose outcome FLIPPED between two identical runs."""
     if not report.flaky:
@@ -2045,6 +2393,9 @@ def block_body(report: Report, pr_url: str | None, test_cmd: str) -> str:
     flaky = _flaky_section(report)
     if flaky:
         parts.append(flaky)
+    advisory = _advisory_section(report)
+    if advisory:
+        parts.append(advisory)
     parts += [
         "### What to do",
         "",
@@ -2101,8 +2452,8 @@ def comment_body(report: Report, pr_url: str | None, test_cmd: str) -> str:
             *([timing, ""] if timing else []),
             *risk_line(report),
             f"chela corrupted each guard this PR adds and re-ran `{test_cmd}` "
-            f"(baseline: {_suite_line(report.baseline)}). **Every mutation made the suite go "
-            "red** — the guards guard.",
+            f"(baseline: {_suite_line(report.baseline)}). **Every blocking mutation made the "
+            "suite go red** — the guards guard.",
             "",
             "⛔ This is not an approval and it is not a merge: the judge only ever reports "
             "whether the PR's own proof can fail. The merge is still the orchestrator's call.",
@@ -2117,6 +2468,8 @@ def comment_body(report: Report, pr_url: str | None, test_cmd: str) -> str:
             verdict = f"**{o.verdict}**"
             if o.flaky:
                 verdict += f" 🎲 flaky (re-run: {o.rerun_verdict})"
+            if o.advisory:
+                verdict += " 🧰 advisory"
             head.append(
                 f"| {o.experiment.guard[:60]} | `{o.experiment.file}` | {verdict} | {why} "
                 f"| {o.measured_by} |"
@@ -2127,6 +2480,8 @@ def comment_body(report: Report, pr_url: str | None, test_cmd: str) -> str:
                      "comment by design, so a rework cannot tune itself to them."]
     if report.flaky:
         head += ["", _flaky_section(report).rstrip()]
+    if report.advisory:
+        head += ["", _advisory_section(report).rstrip()]
     if report.dropped:
         head += ["", f"⚠️ {report.dropped} further experiment(s) were proposed and **not run** "
                      f"(the cap is {report.cap} — each one re-runs the whole suite)."]
@@ -2165,7 +2520,8 @@ def load_experiments(path: str | Path) -> tuple[dict, str]:
 
 def self_check(
     worktree: Path, test_cmd: str, raw: dict, *, timeout: float = SUITE_TIMEOUT_SECONDS,
-    select_tests: bool = True, budget=None,
+    select_tests: bool = True, budget=None, base_branch: str = "",
+    tool_config: tuple[str, ...] = toolconfig.DEFAULT_GLOBS,
 ) -> Report:
     """Run the judge's own mutation mechanics against YOUR OWN worktree, before you commit.
 
@@ -2201,13 +2557,14 @@ def self_check(
         SELF_CHECK_BUDGET_SECONDS, SELF_CHECK_MAX_EXPERIMENTS)
     started = _now()
     report = _self_check(worktree, test_cmd, raw, timeout=timeout, select_tests=select_tests,
-                         budget=budget, started=started)
+                         budget=budget, started=started, base_branch=base_branch,
+                         tool_config=tool_config)
     report.battery_seconds = _now() - started
     return report
 
 
 def _now() -> float:
-    return time.monotonic()
+    return suite_guard.busy_clock()     # 🧠 CMX-119: a slot wait is not spent budget
 
 
 def _mark_unrun(report: Report, items: list, why: str) -> None:
@@ -2220,7 +2577,8 @@ def _mark_unrun(report: Report, items: list, why: str) -> None:
 
 def _self_check(
     worktree: Path, test_cmd: str, raw: dict, *, timeout: float, select_tests: bool,
-    budget, started: float,
+    budget, started: float, base_branch: str = "",
+    tool_config: tuple[str, ...] = toolconfig.DEFAULT_GLOBS,
 ) -> Report:
     report = Report()
     items = raw.get("experiments") if isinstance(raw, dict) else None
@@ -2242,6 +2600,10 @@ def _self_check(
             f"the worktree could not be PROVISIONED to run the suite: {env_problem}"
         )
         return report
+    ts_problem = ts_unparseable(worktree, items)
+    if ts_problem:
+        report.cannot_verify = ts_problem
+        return report
 
     with tempfile.TemporaryDirectory(prefix="chela-judge-select-") as scratch:
         baseline, selector, report.selection = run_baseline(
@@ -2260,6 +2622,8 @@ def _self_check(
         return report
 
     # ⏳ CMX-141: one experiment at a time, so the wall-clock budget is checked before each.
+    # ⚖️🧰 CMX-259: code experiments first — tool-config ones must not starve them.
+    items = toolconfig.code_first(items, tool_config)
     chosen = items[:budget.max_mutations]
     for n, raw_exp in enumerate(chosen):
         if _now() - started >= budget.seconds:
@@ -2273,6 +2637,7 @@ def _self_check(
         if contamination:
             report.cannot_verify = contamination
             return report
+    toolconfig.classify(report.outcomes, worktree, base_branch, tool_config)
     if len(items) > len(chosen):
         why = f"over the {budget.max_mutations}-experiment budget ({len(items)} given)"
         report.exhausted = report.exhausted or why
@@ -2320,6 +2685,8 @@ def run_self_check(
     to = timeout
     select = True
     wf = None
+    base_branch = ""
+    globs = toolconfig.DEFAULT_GLOBS
     if workflow_path:
         from chela import workflow as workflow_mod
 
@@ -2332,6 +2699,9 @@ def run_self_check(
         cmd = cmd or cfg.test_cmd
         to = to if to is not None else cfg.suite_timeout_seconds
         select = cfg.select_tests
+        globs = cfg.tool_config
+        base_branch = wf.get("workspace", "base_branch", default="")
+        base_branch = base_branch if isinstance(base_branch, str) else ""
     if not cmd:
         return {"ok": False, "error": "no suite to run — pass --test-cmd, or --workflow "
                                        "pointing at a WORKFLOW.md with `judge.test_cmd` set"}
@@ -2342,7 +2712,8 @@ def run_self_check(
         keys=("self_check_budget_seconds", "self_check_max_experiments"),
         defaults=(SELF_CHECK_BUDGET_SECONDS, SELF_CHECK_MAX_EXPERIMENTS))
 
-    report = self_check(worktree, cmd, raw, timeout=to, select_tests=select, budget=budget)
+    report = self_check(worktree, cmd, raw, timeout=to, select_tests=select, budget=budget,
+                        base_branch=base_branch, tool_config=globs)
     blocking = report.blocking
     state = report.state
     if state == J_CLEAN and report.unrun:
@@ -2419,7 +2790,7 @@ def judge_run(
     ⛔ It never merges and never approves. A clean run is left in ``awaiting_review``, where
     the orchestrator finds it.
     """
-    from chela import config, dispatcher, event_log, workflow
+    from chela import config, dispatcher, event_log, verdictcarry, workflow
     from chela.sources import run_risk
 
     run = dispatcher.resolve_run(ident)
@@ -2448,6 +2819,12 @@ def judge_run(
     # never from anything the judged agent wrote. They size the battery only.
     risk = run_risk(run.get("risk"))
     exp_cap = config.judge_max_experiments(risk)
+    # ⚖️🪜 CMX-288: only a STANDARD run skips held-out, and only while the head `_spawn_judge`
+    # classified (`judge_sha`) is still the PR's head — an unstamped or stale tier is never
+    # assumed standard.
+    tier = run.get("risk_tier") or ""
+    held_out = not (tier == risktier.STANDARD and run.get("judge_sha")
+                    and run.get("judge_sha") == run.get("pr_head_sha"))
     repo_dir = str(wf.path.parent)
     pr_url = run.get("pr_url")
 
@@ -2467,11 +2844,13 @@ def judge_run(
     dispatcher.mark_judge_run_started(task_id)
     # ⏳⚖️ CMX-431: `progress_at` is when the run last demonstrably MOVED, `phase` where it
     # is, `baseline_seconds`/`confirmations` what its wall must budget — the daemon's
-    # watchdog (`dispatcher.judge_overdue`) reads all four.
+    # watchdog (`dispatcher.judge_overdue`) reads all four, plus `suite_timeout_seconds`.
     status = {**owner_identity(os.getpid()), "task_id": task_id,
               "run_started_at": run_started, "detached": detached, "done": 0, "total": None,
               "progress_at": run_started, "phase": "setup", "baseline_seconds": None,
               "confirmations": 0,
+              # ⏳⚖️ CMX-271: the stall window never undercuts this run's own suite timeout.
+              "suite_timeout_seconds": judge_cfg.suite_timeout_seconds,
               # ⚖️ CMX-40: what the judge pane / `chela peek` show live — the
               # window the badge belongs on, the running tally, and the current label.
               "window": judge_window_name(run.get("branch_name") or ""),
@@ -2482,6 +2861,10 @@ def judge_run(
     def _progress(done: int, total: int) -> None:
         status.update(done=done, total=total, progress_at=time.time(),
                       phase="battery" if done < total else "finishing")
+        _write_run_status(task_id, status)
+
+    def _slot_wait(since: float | None) -> None:
+        slot_wait_status(status, since, time.time())
         _write_run_status(task_id, status)
 
     def _heartbeat(event: str, **info) -> None:
@@ -2505,7 +2888,13 @@ def judge_run(
     # blows up — a `run_experiments`/`request_changes`/`set_judge_state` exception must not
     # leak the directory forever. `finally`, not a happy-path call at the bottom.
     try:
+        _run_ctx["task"] = task_id                   # ⏸️ CMX-214: whose freeze run_suite credits
+        _run_ctx["on_slot_wait"] = _slot_wait
         raw, err = load_experiments(experiments_path)
+        if not err:      # ⚖️🔀 CMX-289: the prior round's set first — never a fresh sample
+            raw, prior_n = verdictcarry.with_prior(raw, verdictcarry.load(task_id, pr_url),
+                                                   exp_cap)
+            exp_cap += prior_n   # ≤ 2 × cap: the re-run never crowds out new lines' experiments
         base_branch = wf.get("workspace", "base_branch", default="master")
         base_branch = base_branch if isinstance(base_branch, str) else ""
         reprovisioned = False
@@ -2525,16 +2914,16 @@ def judge_run(
                     worktree, test_cmd, raw, timeout=judge_cfg.suite_timeout_seconds,
                     base_branch=base_branch, select_tests=judge_cfg.select_tests,
                     consistency_sample=judge_cfg.consistency_sample,
-                    max_experiments=exp_cap, risk=risk, progress=_progress,
-                    heartbeat=_heartbeat,
+                    max_experiments=exp_cap, risk=risk, tool_config=judge_cfg.tool_config,
+                    progress=_progress, heartbeat=_heartbeat, held_out=held_out,
                 )
         else:
             report = run_experiments(
                 worktree, test_cmd, raw, timeout=judge_cfg.suite_timeout_seconds,
                 base_branch=base_branch, select_tests=judge_cfg.select_tests,
                 consistency_sample=judge_cfg.consistency_sample,
-                max_experiments=exp_cap, risk=risk, progress=_progress,
-                heartbeat=_heartbeat,
+                max_experiments=exp_cap, risk=risk, tool_config=judge_cfg.tool_config,
+                progress=_progress, heartbeat=_heartbeat, held_out=held_out,
             )
         report.risk, report.cap = risk, exp_cap
         report.total_seconds = _since(run.get("judge_started_at"))
@@ -2588,14 +2977,32 @@ def judge_run(
         # FALSE `SURVIVED` findings were published to the PR and escalated by the inbox as
         # urgent. A staleness check must not take its reference from the thing it is
         # checking.
+        if (live_run or {}).get("judge_state") == J_CANCELLED:
+            # ⏹️⚖️ CMX-286: the daemon cancelled this round (sent back / head moved) — a
+            # verdict now would be the unusable notice the cancel exists to prevent.
+            log.info("judge: %s: round cancelled under the run — no verdict", task_id)
+            return {"ok": False, "task_id": task_id, "state": J_CANCELLED,
+                    "error": f"the round was cancelled: {live_run.get('judge_detail')}"}
         row_head = (live_run or {}).get("pr_head_sha")
         live_head = dispatcher.pr_live_head_sha(pr_url, repo_dir) or row_head
         stale_head = bool(verified_sha and live_head and verified_sha != live_head)
 
+        if report.suite_failures:
+            report.suite_logs = write_suite_logs(
+                task_id, len(load_private(task_id)) + 1, report.suite_failures)
+        if report.suite_logs and report.cannot_verify:
+            # Prepended — `judge_detail` is truncated, and the pointer must survive that.
+            report.cannot_verify = (f"📄 full suite output: "
+                                    f"{', '.join(map(display_path, report.suite_logs))} — "
+                                    + report.cannot_verify)
+            result["cannot_verify"] = report.cannot_verify
         record_private(
-            task_id, report, raw if isinstance(raw, dict) else {}, judge_cfg.held_out_fraction,
-            sha=verified_sha, stale=stale_head, pr_url=pr_url,
+            task_id, report, raw if isinstance(raw, dict) else {},
+            judge_cfg.held_out_fraction if held_out else 0.0,
+            sha=verified_sha, stale=stale_head, pr_url=pr_url, tier=tier,
         )
+        if not stale_head:
+            verdictcarry.record(task_id, pr_url, verified_sha, report)
 
         if stale_head:
             log.warning(
@@ -2662,6 +3069,7 @@ def judge_run(
             verdict = dispatcher.request_changes(
                 task_id, body, post_comment=False,
                 mutations=[o.experiment.as_dict() for o in report.visible_blocking],
+                judge_state=J_BLOCKED,
             )
             if not verdict.get("ok"):
                 # ⚖️🧊 CMX-239: The CAS refused it: the row moved under us (a human merged it,
@@ -2725,6 +3133,13 @@ def judge_run(
                 # still `J_RUNNING` from this call's own launch — either way correct, or about
                 # to be corrected by the trigger on its next tick.
                 result["state"] = J_STALE_HEAD
+            elif report.cannot_verify and (live_run or {}).get("status") in ("done", "closed"):
+                # 🔕 CMX-195: the run finished while this judge worked (adopt-739/740 were
+                # override-merged mid-round). The unknown is recorded above; written to the
+                # row it would reach the inbox as an action item on a run nobody can act on.
+                log.info("judge: %s → CANNOT VERIFY dropped: the run is already %r",
+                         task_id, live_run["status"])
+                result["moot"] = live_run["status"]
             elif report.cannot_verify and report.cannot_verify_final:
                 # ⚖️🧱 CMX-19: an unknown no re-run can change. Recording it as a plain
                 # `cannot_verify` is what made CMX-15's docs-only PR come back FOUR times
@@ -2745,10 +3160,25 @@ def judge_run(
 
         return result
     finally:
+        _run_ctx.pop("task", None)
+        _run_ctx.pop("on_slot_wait", None)
         _release_judge_slot(worktree)
         _clear_run_status(task_id)
         if cleanup:
             _cleanup(wf, task_id, run.get("branch_name") or "", judge_epoch)
+
+
+def slot_wait_status(status: dict, since: float | None, now: float) -> None:
+    """🧠 CMX-119: record a suite-slot wait on a judge run's live status. A run queued for a
+    slot is waiting, not stuck: the watchdog holds it while ``slot_waiting_since`` is set and
+    credits ``slot_wait_seconds`` to its wall. ``since`` is the wait's start; ``None`` ends it."""
+    if since is None:
+        opened = status.get("slot_waiting_since")
+        if opened is not None:
+            status["slot_wait_seconds"] = (float(status.get("slot_wait_seconds") or 0.0)
+                                           + now - float(opened))
+        status["progress_at"] = now
+    status["slot_waiting_since"] = since
 
 
 def _blocked_detail(report: Report) -> str:
@@ -2775,7 +3205,7 @@ def heldout_store_path(task_id: str) -> Path:
 
 def record_private(
     task_id: str, report: Report, raw: dict, held_out_fraction: float = HELD_OUT_FRACTION, *,
-    sha: str | None = None, stale: bool = False, pr_url: str | None = None,
+    sha: str | None = None, stale: bool = False, pr_url: str | None = None, tier: str = "",
 ) -> Path | None:
     """Append this round to the operator's private record. Never raises — a record that
     could not be written (or even assembled) must not take a verdict down with it; it is
@@ -2783,7 +3213,7 @@ def record_private(
     building the record is the same "no record" outcome."""
     try:
         return _record_private(task_id, report, raw, held_out_fraction,
-                               sha=sha, stale=stale, pr_url=pr_url)
+                               sha=sha, stale=stale, pr_url=pr_url, tier=tier)
     except Exception as e:  # noqa: BLE001 — by contract, nothing escapes into the verdict
         log.warning("judge: %s: could not record the private held-out round: %s", task_id, e)
         return None
@@ -2791,7 +3221,7 @@ def record_private(
 
 def _record_private(
     task_id: str, report: Report, raw: dict, held_out_fraction: float, *,
-    sha: str | None, stale: bool, pr_url: str | None,
+    sha: str | None, stale: bool, pr_url: str | None, tier: str = "",
 ) -> Path | None:
     items = raw.get("experiments") if isinstance(raw, dict) else None
     proposed = len(items) if isinstance(items, list) else 0
@@ -2805,8 +3235,10 @@ def _record_private(
     rec = {
         "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "task_id": task_id, "sha": sha or "", "pr_url": pr_url or "",
-        "state": report.state, "stale": bool(stale),
+        "state": report.state, "stale": bool(stale), "tier": tier,
         "cannot_verify": report.cannot_verify,
+        "suite_logs": list(report.suite_logs),
+        "baseline_flakes": list(report.baseline_flakes),
         "proposed": proposed,
         "visible": {"total": len(visible),
                     "survived": sum(1 for o in visible if o.verdict == SURVIVED)},
@@ -3065,6 +3497,60 @@ def judge_log_path(task_id: str) -> Path:
     return judge_logs_dir() / f"{_safe_task(task_id)}.log"
 
 
+def write_suite_logs(task_id: str, round_no: int, failures: list[SuiteResult]) -> list[str]:
+    """📄 CMX-163: persist every non-green suite run of this judge round to
+    ``$CHELA_DIR/judge-logs/<task>/<round>-suite-<n>.log`` — the command, cwd, env diff vs the
+    operator, start/end, exit code and the captured output — then prune. Returns the paths.
+
+    Found by CMX-147: a flaky baseline turned a run ``cannot_verify`` three times and its
+    output survived nowhere but a one-line summary. Never raises — a log that cannot be
+    written must not take a verdict down with it."""
+    paths: list[str] = []
+    try:
+        d = judge_logs_dir() / _safe_task(task_id)
+        d.mkdir(parents=True, exist_ok=True, mode=0o700)
+        for n, s in enumerate(failures, 1):
+            run = s.run or {}
+            env = "\n".join(f"  {k}={'<removed>' if v is None else v}"
+                             for k, v in (run.get("env_diff") or {}).items())
+            text = (f"command:   {run.get('cmd', '?')}\ncwd:       {run.get('cwd', '?')}\n"
+                    f"started:   {run.get('started', '?')}\nended:     {run.get('ended', '?')}\n"
+                    f"exit code: {s.exit_code}\nresult:    {_suite_line(s)}\n"
+                    f"env diff vs the operator:\n{env or '  (none)'}\n\n--- output ---\n"
+                    f"{run.get('output') or s.tail}\n")
+            path = d / f"{round_no}-suite-{n}.log"
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as fh:
+                fh.write(text)
+            paths.append(str(path))
+        prune_suite_logs(judge_logs_dir())
+    except OSError as e:
+        log.warning("judge: %s: could not write the suite failure log: %s", task_id, e)
+    return paths
+
+
+def prune_suite_logs(root: Path, *, now: float | None = None,
+                     max_age_days: float = SUITE_LOG_MAX_AGE_DAYS,
+                     keep: int = SUITE_LOG_MAX_PER_TASK) -> list[Path]:
+    """Across every task under ``root``, delete suite logs older than ``max_age_days`` and
+    all but each task's newest ``keep``. Returns what it removed."""
+    cutoff = (time.time() if now is None else now) - max_age_days * 86400
+    doomed: list[Path] = []
+    for task_dir in (d for d in root.iterdir() if d.is_dir()):
+        logs = sorted(task_dir.glob("*-suite-*.log"), key=lambda f: f.stat().st_mtime,
+                      reverse=True)
+        doomed += [f for i, f in enumerate(logs) if i >= keep or f.stat().st_mtime < cutoff]
+    for f in doomed:
+        f.unlink(missing_ok=True)
+    return doomed
+
+
+def display_path(path: str) -> str:
+    """``~``-relative, so a path in a PUBLIC PR comment never names the operator's home."""
+    home = str(Path.home())
+    return "~" + path[len(home):] if path.startswith(home + os.sep) else path
+
+
 def judge_status_path(task_id: str) -> Path:
     """``$CHELA_DIR/judge-logs/<task>.json`` — a live run's pid, start and ``k/N``, for
     ``chela doctor``. Written by :func:`judge_run` after it claims the slot, removed when it
@@ -3081,6 +3567,41 @@ def _write_run_status(task_id: str, status: dict) -> None:
         tmp.replace(path)
     except OSError:
         log.debug("judge: could not write the run status for %s", task_id, exc_info=True)
+
+
+# ⏸️⚖️ CMX-214: the freeze ledger, ``{"round": judge_started_at, "intervals": [[frozen_at,
+# thawed_at | None], ...]}``, written by :mod:`chela.fleet` BEFORE its SIGSTOP and its SIGCONT:
+# a judge is never stopped without a record, and a thawed run already reads its credit.
+
+_run_ctx: dict = {}                    # "task": the task THIS process's judge_run is judging
+
+
+def freeze_path(task_id: str) -> Path:
+    return judge_logs_dir() / f"{_safe_task(task_id)}.freeze"
+
+
+def read_freeze(task_id: str) -> dict:
+    try:
+        rec = json.loads(freeze_path(task_id).read_text())
+    except (OSError, ValueError):
+        return {}
+    return rec if isinstance(rec, dict) and isinstance(rec.get("intervals"), list) else {}
+
+
+def write_freeze(task_id: str, rec: dict) -> None:
+    path = freeze_path(task_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".freeze.tmp")
+    tmp.write_text(json.dumps(rec))
+    tmp.replace(path)
+
+
+def frozen_since(task_id: str, since: float, now: float | None = None,
+                 rec: dict | None = None) -> float:
+    """Seconds ``task_id``'s judge spent frozen after ``since`` (an open freeze counts to now)."""
+    now = time.time() if now is None else now
+    return sum(max(0.0, (now if b is None else b) - max(a, since))
+               for a, b in (read_freeze(task_id) if rec is None else rec).get("intervals", []))
 
 
 def _clear_run_status(task_id: str) -> None:
@@ -3211,6 +3732,7 @@ def battery_for_window(window_name: str) -> dict | None:
         "killed": best.get("killed") or 0, "survived": best.get("survived") or 0,
         "invalid": best.get("invalid") or 0,
         "phase": best.get("phase"), "current": best.get("current"),
+        "slot_waiting": best.get("slot_waiting_since") is not None,       # 🧠 CMX-119
         "elapsed": (max(0.0, time.time() - started)
                     if alive and isinstance(started, (int, float)) else None),
         "log": best.get("log"),
@@ -3225,7 +3747,9 @@ def format_battery(battery: dict) -> str:
     if battery["state"] == BATTERY_TESTING:
         line += (f" (KILLED {battery['killed']} · SURVIVED {battery['survived']}"
                  f" · INVALID {battery['invalid']})")
-        if battery.get("current"):
+        if battery.get("slot_waiting"):
+            line += " — ⏳ waiting for a suite slot"
+        elif battery.get("current"):
             line += f" — {battery['current']}"
     elif battery.get("log"):
         line += f" — see {battery['log']}"
@@ -3293,11 +3817,45 @@ def stop_judge_run(worktree: Path) -> bool:
     pid = lock.get("pid")
     if not isinstance(pid, int) or pid == os.getpid():
         return False
+    tree = procguard.process_tree([pid])
     try:
         os.killpg(pid, signal.SIGTERM)
     except OSError:
         return False
+    # ⏸️ CMX-214: a STOPPED tree (the suite is outside the group) is woken to take its SIGTERM.
+    for sig in (signal.SIGTERM, signal.SIGCONT):
+        for p in tree:
+            try:
+                os.kill(p, sig)
+            except OSError:
+                pass
     return True
+
+
+def cancel_judge_run(task_id: str, worktree: Path) -> list[int]:
+    """⏹️⚖️ CMX-286: stop ``task_id``'s live DETACHED run — its run left review, so it holds a
+    judge slot for a verdict nobody can use. TERMs the run's whole tree (the suite leads its
+    own session, so a group signal misses it); a tree a fleet pause FROZE is closed on the
+    freeze ledger and SIGCONT'd first, or the TERM would sit pending. Returns the pids
+    signalled — none for a foreground run (its window kill reaches it) or this process."""
+    live = live_judge_run(task_id, worktree)
+    pid = (live or {}).get("pid")
+    if not live or not live.get("detached") or not isinstance(pid, int) or pid == os.getpid():
+        return []
+    tree = procguard.process_tree([pid])
+    rec = read_freeze(task_id)
+    sigs: tuple[int, ...] = (signal.SIGTERM,)
+    if rec.get("intervals") and rec["intervals"][-1][1] is None:
+        rec["intervals"][-1][1] = time.time()
+        write_freeze(task_id, rec)
+        sigs = (signal.SIGCONT, signal.SIGTERM)
+    for sig in sigs:
+        for p in tree:
+            try:
+                os.kill(p, sig)
+            except OSError:
+                pass
+    return tree
 
 
 def _cleanup(wf, task_id: str, branch: str, judge_epoch: str | None) -> None:
@@ -3390,6 +3948,7 @@ class JudgeSuiteConfig:
     held_out_fraction: float = HELD_OUT_FRACTION
     consistency_sample: int = CONSISTENCY_SAMPLE
     select_tests: bool = True
+    tool_config: tuple[str, ...] = toolconfig.DEFAULT_GLOBS
 
 
 def judge_select_tests(wf) -> bool:
@@ -3420,6 +3979,7 @@ def judge_suite_config(wf) -> JudgeSuiteConfig:
         select_tests=judge_select_tests(wf),
         held_out_fraction=judge_held_out_fraction(wf),
         consistency_sample=judge_consistency_sample(wf),
+        tool_config=toolconfig.globs_from(wf.get("judge", "tool_config", default=None)),
     )
 
 

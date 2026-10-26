@@ -41,7 +41,7 @@ from pathlib import Path
 from typing import Callable
 
 from chela import config, messenger
-from chela.telegram import gateanswers, media
+from chela.telegram import fleetcmd, gateanswers, media
 from chela.telegram.format import to_code_block
 from chela.telegram.interactive import (
     MIRROR_CB_PREFIX,
@@ -63,6 +63,7 @@ from chela.telegram.newsession import (
     start_dir,
 )
 from chela.telegram.panescan import detect_askuserquestion
+from chela.telegram.senders import SenderGate, allowed_users_from_env
 
 log = logging.getLogger(__name__)
 
@@ -87,7 +88,8 @@ def _keyboard_rows(markup) -> list[list[dict]]:
     return rows
 
 # A sender delivers text to a tmux window: ``send(window_id, text) -> ok``.
-# Production is ``chela.messenger.send_tmux``; tests inject a recording stub.
+# Production is ``chela.messenger.deliver_prompt`` (send_tmux that refuses to append to
+# an unsubmitted prompt, CMX-117); tests inject a recording stub.
 Sender = Callable[[str, str], bool]
 
 # Bridge-level slash commands: handled HERE (never forwarded to Claude Code),
@@ -98,6 +100,8 @@ BRIDGE_COMMANDS: list[tuple[str, str]] = [
     ("new", "Start a Claude session (browse to a folder)"),
     ("screenshot", "Snapshot the terminal (with control keys)"),
     ("esc", "Send Escape to interrupt the agent"),
+    ("pauseall", "Hold dispatch and pause every dispatched agent"),
+    ("resumeall", "Resume the paused agents and release the hold"),
 ]
 
 # Claude Code slash commands worth surfacing in Telegram's "/" autocomplete menu
@@ -239,7 +243,7 @@ class TopicRouter:
         # named topic reports its id. Normalise a configured topic to str so it
         # compares cleanly against the int thread id off the wire.
         self._topic_id = str(topic_id) if topic_id not in (None, "") else None
-        self._sender = sender or messenger.send_tmux
+        self._sender = sender or messenger.deliver_prompt
 
     @property
     def chat_id(self) -> str | None:
@@ -296,7 +300,7 @@ class RegistryRouter:
         # The chat gate is the CMX-8 security boundary; a registry with no chat
         # bound routes nothing (fail-closed) rather than accepting every chat.
         self._chat_id = str(registry.chat_id) if registry.chat_id is not None else None
-        self._sender = sender or messenger.send_tmux
+        self._sender = sender or messenger.deliver_prompt
 
     @property
     def chat_id(self) -> str | None:
@@ -346,6 +350,7 @@ def build_application(
     router,
     *,
     on_topic_closed=None,
+    on_topic_reopened=None,
     capture=None,
     send_escape=None,
     send_key=None,
@@ -355,6 +360,7 @@ def build_application(
     launch_session=None,
     decide_override=None,
     refresh_overrides=None,
+    allowed_users=None,
 ):
     """Build a ``python-telegram-bot`` Application wired to ``router``.
 
@@ -431,6 +437,10 @@ def build_application(
     agent. Browser navigation state (current path + subdir list) lives in PTB's
     per-user ``context.user_data`` so callback payloads stay tiny.
 
+    ``/pauseall [reason]`` and ``/resumeall`` (CMX-252) are ``chela dispatch --pause --all``
+    and ``--resume`` (:mod:`chela.telegram.fleetcmd`). Fleet-wide, so like ``/new`` they gate
+    on the bound ``chat_id`` alone and work from General.
+
     Taps on an **override request's** ✅ Approve / ❌ Deny (the ``ov:`` callbacks, CMX-79 —
     posted by :class:`chela.telegram.overridewatch.OverrideRelay`) route to ``_on_override``.
     Like ``/new`` it gates on the bound ``chat_id`` alone (the request is posted to the
@@ -444,6 +454,16 @@ def build_application(
     wires :meth:`chela.telegram.reconcile.TopicClosedHandler.handle` here to
     unbind (never kill) a window when its topic is closed from Telegram. Left
     ``None`` (single-topic / manual bindings), no such handler is registered.
+
+    ``on_topic_reopened`` (optional, CMX-267) is a callable ``(thread_id) -> str | None``
+    run on ``StatusUpdate.FORUM_TOPIC_REOPENED`` in the bound chat — in production
+    :meth:`chela.telegram.reconcile.TopicReopenedHandler.handle`, which resumes the
+    topic's Claude session; the line it returns is posted in that topic.
+
+    ``allowed_users`` (CMX-185) — the Telegram user ids allowed to drive the agents;
+    ``None`` reads ``CHELA_TELEGRAM_ALLOWED_USERS``. EVERY handler below is wrapped in
+    that :class:`~chela.telegram.senders.SenderGate`, so an update from anyone else is
+    dropped unanswered before it can type, tap or download anything.
     """
     try:
         from telegram import (
@@ -475,6 +495,17 @@ def build_application(
     # daemon is holding open. This process is the only one that sees a tap, so this is the
     # only place the half-answered map for a multi-question gate can live.
     drafts = drafts or gateanswers.DRAFTS
+    gate = SenderGate(allowed_users_from_env() if allowed_users is None
+                      else frozenset(str(u) for u in allowed_users))
+    gate.warn_if_open()
+
+    def _gated(callback):
+        """``callback`` behind the sender gate: a stranger's update reaches nothing."""
+        async def _wrapper(update, context) -> None:
+            if gate.allows(update):
+                await callback(update, context)
+        _wrapper.__wrapped__ = callback
+        return _wrapper
 
     def _screenshot_keyboard() -> "InlineKeyboardMarkup":
         """The control-key keyboard attached to every ``/screenshot`` reply."""
@@ -523,6 +554,9 @@ def build_application(
             return
         try:
             ok = router.route(chat_id, thread_id, text)
+        except messenger.PendingDraft:  # appending would merge it into that turn
+            await msg.reply_text(media.PENDING_DRAFT_TEXT)
+            return
         except Exception:  # a stuck tmux send must not wedge the update queue
             log.exception("inbound routing failed")
             ok = False
@@ -541,8 +575,8 @@ def build_application(
 
         The window is resolved from the message's OWN topic through
         ``router.resolve`` (the same chat/topic gate as a text message); the file
-        is delivered via :func:`chela.messenger.send_tmux` so Claude Code can
-        ``Read`` the image by path. See :func:`chela.telegram.media.receive_photo`.
+        is delivered via :func:`chela.messenger.deliver_image`, which verifies the
+        submit, so Claude Code can ``Read`` the image by path. See :func:`chela.telegram.media.receive_photo`.
         """
         msg = update.message
         if msg is None or not getattr(msg, "photo", None):
@@ -554,7 +588,7 @@ def build_application(
             await media.receive_photo(
                 msg, chat_id, thread_id,
                 resolve=router.resolve,
-                deliver=messenger.send_tmux,
+                deliver=messenger.deliver_image,
                 docs_dir=config.CHELA_DIR / "documents",
             )
         except Exception:  # a media hiccup must not wedge the update queue
@@ -577,7 +611,7 @@ def build_application(
             await media.receive_document(
                 msg, chat_id, thread_id,
                 resolve=router.resolve,
-                deliver=messenger.send_tmux,
+                deliver=messenger.deliver_prompt,
                 docs_dir=config.CHELA_DIR / "documents",
             )
         except Exception:  # a media hiccup must not wedge the update queue
@@ -681,6 +715,22 @@ def build_application(
             return
         ok = send_escape(window_id)
         await msg.reply_text("⎋ Sent Escape" if ok else "❌ Couldn't send Escape.")
+
+    # -- /pauseall, /resumeall: the fleet pause (CMX-252) -------------------------
+    # Fleet-wide, so gated like /new on the bound CHAT alone: they work from General too.
+    async def _on_pauseall(update, _context: "ContextTypes.DEFAULT_TYPE") -> None:
+        msg = update.message
+        if msg is None or not _new_chat_ok(update):
+            return  # wrong chat — stay silent, exactly like the other commands
+        parts = (msg.text or "").split(maxsplit=1)  # drop the "/pauseall[@bot]" token
+        reason = parts[1].strip() if len(parts) > 1 else ""
+        await msg.reply_text(await asyncio.to_thread(fleetcmd.pause_all, reason))
+
+    async def _on_resumeall(update, _context: "ContextTypes.DEFAULT_TYPE") -> None:
+        msg = update.message
+        if msg is None or not _new_chat_ok(update):
+            return
+        await msg.reply_text(await asyncio.to_thread(fleetcmd.resume_all))
 
     # -- /new: launch a Claude session from anywhere -----------------------------
     # State keys in PTB's per-user context.user_data: the folder currently being
@@ -1115,32 +1165,34 @@ def build_application(
     application = Application.builder().token(token).post_init(_post_init).build()
     # Command handlers FIRST so /screenshot and /esc are intercepted here; the
     # catch-all text handler forwards every other message (and /command) onward.
-    application.add_handler(CommandHandler("new", _on_new))
-    application.add_handler(CommandHandler("screenshot", _on_screenshot))
-    application.add_handler(CommandHandler("esc", _on_esc))
+    application.add_handler(CommandHandler("new", _gated(_on_new)))
+    application.add_handler(CommandHandler("screenshot", _gated(_on_screenshot)))
+    application.add_handler(CommandHandler("esc", _gated(_on_esc)))
+    application.add_handler(CommandHandler("pauseall", _gated(_on_pauseall)))
+    application.add_handler(CommandHandler("resumeall", _gated(_on_resumeall)))
     # AskUserQuestion taps (``qa:``) and mirror D-pad taps (``m:``) are matched FIRST
     # via patterns so they route to their own handlers; PTB runs one handler per group,
     # and the pattern-less _on_key below picks up the /screenshot ``k:`` taps (and
     # ignores anything else).
-    application.add_handler(CallbackQueryHandler(_on_qa, pattern=r"^qa:"))
+    application.add_handler(CallbackQueryHandler(_gated(_on_qa), pattern=r"^qa:"))
     application.add_handler(
-        CallbackQueryHandler(_on_mirror, pattern="^" + re.escape(MIRROR_CB_PREFIX))
+        CallbackQueryHandler(_gated(_on_mirror), pattern="^" + re.escape(MIRROR_CB_PREFIX))
     )
     # ``/new`` folder-browser taps (``n:``), matched by pattern so they route here
     # and not to the pattern-less _on_key catch-all below.
     application.add_handler(
-        CallbackQueryHandler(_on_new_cb, pattern="^" + re.escape(NEW_CB_PREFIX))
+        CallbackQueryHandler(_gated(_on_new_cb), pattern="^" + re.escape(NEW_CB_PREFIX))
     )
     application.add_handler(
-        CallbackQueryHandler(_on_override, pattern="^" + re.escape(OVERRIDE_CB_PREFIX))
+        CallbackQueryHandler(_gated(_on_override), pattern="^" + re.escape(OVERRIDE_CB_PREFIX))
     )
-    application.add_handler(CallbackQueryHandler(_on_key))
+    application.add_handler(CallbackQueryHandler(_gated(_on_key)))
     # Media handlers BEFORE the text catch-all (PTB runs one handler per group):
     # a photo/document pasted into a bound topic is downloaded and its path
     # forwarded to the window, instead of being silently dropped.
-    application.add_handler(MessageHandler(filters.PHOTO, _on_photo))
-    application.add_handler(MessageHandler(filters.Document.ALL, _on_document))
-    application.add_handler(MessageHandler(filters.TEXT, _on_message))
+    application.add_handler(MessageHandler(filters.PHOTO, _gated(_on_photo)))
+    application.add_handler(MessageHandler(filters.Document.ALL, _gated(_on_document)))
+    application.add_handler(MessageHandler(filters.TEXT, _gated(_on_message)))
 
     if on_topic_closed is not None:
         async def _on_topic_closed(update, _context: "ContextTypes.DEFAULT_TYPE") -> None:
@@ -1150,12 +1202,37 @@ def build_application(
             # The closed topic's own thread id rides on the service message.
             thread_id = getattr(msg, "message_thread_id", None)
             try:
-                on_topic_closed(thread_id)
+                # Off the event loop: the close now also resolves the session id (CMX-267).
+                await asyncio.to_thread(on_topic_closed, thread_id)
             except Exception:  # never let a bad unbind wedge the update queue
                 log.exception("topic-closed handling failed")
 
         application.add_handler(
-            MessageHandler(filters.StatusUpdate.FORUM_TOPIC_CLOSED, _on_topic_closed)
+            MessageHandler(filters.StatusUpdate.FORUM_TOPIC_CLOSED, _gated(_on_topic_closed))
+        )
+
+    if on_topic_reopened is not None:
+        async def _on_topic_reopened(update, context: "ContextTypes.DEFAULT_TYPE") -> None:
+            msg = update.message
+            if msg is None or not _new_chat_ok(update):
+                return  # spawns a session: the bound chat only
+            if getattr(getattr(msg, "from_user", None), "is_bot", False):
+                return  # chela's own reopen (CMX-204 / CMX-75) already has its window
+            thread_id = getattr(msg, "message_thread_id", None)
+            try:
+                reply = await asyncio.to_thread(on_topic_reopened, thread_id)
+            except Exception:  # never let a failed resume wedge the update queue
+                log.exception("topic-reopened handling failed")
+                reply = "❌ Couldn't bring this topic's session back — see the chela-telegram log"
+            if reply:
+                try:
+                    await context.bot.send_message(chat_id=msg.chat_id, text=reply,
+                                                   message_thread_id=thread_id)
+                except Exception:  # noqa: BLE001 — the resume itself already happened
+                    log.exception("could not post the topic-reopened line")
+
+        application.add_handler(
+            MessageHandler(filters.StatusUpdate.FORUM_TOPIC_REOPENED, _gated(_on_topic_reopened))
         )
 
     return application

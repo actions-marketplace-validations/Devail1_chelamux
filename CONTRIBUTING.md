@@ -115,7 +115,10 @@ The orchestrator (or you) runs this; it is safe for an agent because it **pushes
 It fetches `origin`, refuses unless `origin/main` is an ancestor of `origin/dev`, and in its
 own worktree off `origin/dev` (under `$CHELA_DIR/releases/`) runs steps 1–3 below — the
 notes, the version bump, `uv lock` (refused if it changes nothing or the lock does not name
-the new version), and `tests/test_version.py` + `tests/test_release_notes.py`. It then commits
+the new version), the dashboard frontend build (`pnpm install --frozen-lockfile`, then Vite
+into the committed `chela/dashboard/static/app/`, CMX-177, so it needs `node` and `pnpm`), and
+`tests/test_version.py` + `tests/test_release_notes.py`. `--dry-run` runs all of that and then
+removes it: no commit, tag, request or push. Otherwise it commits
 `Release X.Y.Z — <theme>` (the `--body-file` text as the body) and creates the annotated tag
 **locally**, and files an approval request. A failed or dirty step refuses with the reason and
 leaves no commit, tag, branch or worktree behind.
@@ -126,7 +129,13 @@ the dashboard's `/override/<id>`, or `chela merge-approve <id>` in a plain termi
 to deny). On approval chela re-checks that `origin/dev` is still the commit the release was
 cut from and `origin/main` an ancestor, then pushes the release commit to `main`, the tag,
 then the same commit to `dev` — plain pushes, so anything but a fast-forward is refused, and
-any failed check pushes nothing. That last push IS step 5's back-merge. The card is edited
+any failed check pushes nothing. That last push IS step 5's back-merge. Then, under the
+same approval, it force-moves the **major tag** (`v0` for any `0.y.z`, `vX` in general) to the
+release commit, so `uses: Devail1/chelamux@v0` follows releases. That is the only forced push
+the release makes, and only of that one tag. If it fails, the release stays pushed and chela
+says so loudly (log, event, notification, inbox); fix it with
+`chela release X.Y.Z --major-tag-only` from a plain terminal, which points the major tag at
+origin's existing `vX.Y.Z`. The card is edited
 to the outcome (released `<sha>`, then the GitHub Release's URL once the Release workflow has
 built it; or denied / expired / failed), and the release's worktree and local branch are
 removed. A push to `dev` after the request expires it — cut the release again. The approval

@@ -68,9 +68,9 @@ def _assert_clean(env: dict) -> None:
 # --- the helper itself -------------------------------------------------------
 
 def test_child_env_drops_the_leak_and_keeps_everything_else():
-    base = {**_LEAK, **_KEEP, "PATH": "/usr/bin", "HOME": "/home/x", "name": "chela-daemon"}
+    base = {**_LEAK, **_KEEP, "PATH": "/usr/bin", "HOME": "/home/x", "my_setting": "1"}
     env = envutil.child_env(base=base)
-    assert set(env) == {"PM2_HOME", "CHELA_TMUX_SESSION", "PATH", "HOME", "name"}
+    assert set(env) == {"PM2_HOME", "CHELA_TMUX_SESSION", "PATH", "HOME", "my_setting"}
     assert envutil.child_env({"NODE_CHANNEL_FD": "5", "X": "1"}, base=base)["NODE_CHANNEL_FD"] == "5"
 
 
@@ -165,7 +165,7 @@ def test_judge_suite_subprocess_gets_the_sanitised_env(monkeypatch, tmp_path, le
         seen.append(k)
         return SimpleNamespace(stdout="1 passed\n", stderr="", returncode=0)
 
-    monkeypatch.setattr(judge.subprocess, "run", fake_run)
+    monkeypatch.setattr(judge.procguard, "run_shell_group", fake_run)
     judge.run_suite("true", tmp_path)
     assert len(seen) == 1
     env = _effective(seen[0])

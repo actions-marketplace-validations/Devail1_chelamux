@@ -18,11 +18,11 @@
 // and its body-slice ran to the first `\n}\n`, so a reformat would have truncated the
 // body to '' — and ''.includes(x) is false, i.e. a grep matching NO TEXT read GREEN.
 //
-// Run: node --test tests/  (tests/test_js_suites.py runs every .test.mjs in pytest)
-import { test } from 'node:test';
+// Run: pnpm exec vitest run  (tests/test_js_suites.py runs every .test.mjs in pytest)
+import { test } from 'vitest';
 import assert from 'node:assert/strict';
 
-import { bezierPath, resolveDrop, roomsByWid } from '../chela/dashboard/static/js/wire.js';
+import { applyRoomAccents, bezierPath, resolveDrop, roomsByWid } from '../chela/dashboard/static/js/wire.ts';
 
 const STATUS = (...pairs) => ({
     rooms: Object.fromEntries(pairs.map(([room, wids]) => [room, {
@@ -82,4 +82,10 @@ test('rooms are indexed by wid — which is what the Wall has', () => {
 test('an empty payload leaves every tile roomless (and does not throw)', () => {
     assert.deepEqual(roomsByWid({ rooms: {} }), {});
     assert.deepEqual(roomsByWid(null), {});
+});
+
+test('no stage, no patch: applyRoomAccents finds 0 tiles and touches nothing', () => {
+    const status = { rooms: { ops: { members: { '@1': {} } } } };
+    assert.equal(applyRoomAccents(null, status), 0);
+    assert.equal(applyRoomAccents(undefined, status), 0);
 });

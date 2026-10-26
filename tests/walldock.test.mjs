@@ -23,9 +23,9 @@
 //      server restart, and the dock state is persisted in localStorage keyed by id. A
 //      wid that is no longer dispatched is disowned — and un-hidden.
 //
-// Run: node --test tests/walldock.test.mjs  (pytest runs it via tests/test_js_suites.py;
+// Run: pnpm exec vitest run tests/walldock.test.mjs  (pytest runs it via tests/test_js_suites.py;
 // it needs `pnpm install` for jsdom — CHELA_REQUIRE_JS_TESTS makes a missing jsdom a FAILURE.)
-import { before, test } from 'node:test';
+import { beforeAll, test } from 'vitest';
 import assert from 'node:assert/strict';
 import { JSDOM } from 'jsdom';   // needs `pnpm install` — tests/test_js_suites.py enforces it
 
@@ -37,7 +37,6 @@ const PANEL = `
   <select id="term-agent"></select>
   <span id="term-wall-grid"><span id="term-grid-presets"></span><button id="term-lock-btn"></button></span>
   <button id="term-new-shell"></button>
-  <div id="term-switcher"></div>
   <div id="term-stage"></div>
   <div id="term-min-dock"></div>
   <div id="term-bar" class="kb-collapsed"><button class="kb-toggle" id="kb-toggle"></button><div class="kb-body" id="kb-body"></div></div>
@@ -91,12 +90,11 @@ function fakeGridStack() {
     return { init: () => grid };
 }
 
-let terminals, util;
+let terminals, agentsStore, viewStore;
 
-before(async () => {
+beforeAll(async () => {
     const dom = new JSDOM(`<!doctype html><html><body>${PANEL}</body></html>`,
         { url: 'http://localhost:5005/', pretendToBeVisual: true });
-    dom.window.TERMINALS_ENABLED = true;
     for (const k of ['window', 'document', 'localStorage', 'navigator', 'HTMLElement',
         'Element', 'Node', 'Event', 'MouseEvent', 'KeyboardEvent', 'CustomEvent',
         'getComputedStyle', 'requestAnimationFrame', 'cancelAnimationFrame']) {
@@ -127,14 +125,15 @@ before(async () => {
     // behind it through the module graph (nav ↔ main is a cycle — import anything else
     // first and nav.js's `let`s are in their TDZ). main.js also arms the poll timers.
     globalThis.setInterval = () => 0;
-    await import('../chela/dashboard/static/js/main.js');
-    util = await import('../chela/dashboard/static/js/util.js');
-    terminals = await import('../chela/dashboard/static/js/terminals.js');
-    util.setCurrentTab('terminals');
+    (await import('../chela/dashboard/frontend/src/boot.ts')).start();
+    ({ agents: agentsStore } = await import('../chela/dashboard/frontend/src/shared/store/agents.ts'));
+    ({ view: viewStore } = await import('../chela/dashboard/frontend/src/shared/store/view.ts'));
+    terminals = await import('../chela/dashboard/frontend/src/features/wall/index.ts');
+    viewStore.set('terminals');
 
     // The worker is WORKING when the wall first paints — the state the feature is about.
     AGENTS = fleet();
-    util.setAgentsCache(AGENTS);
+    agentsStore.set(AGENTS);
     await terminals.renderTerminals();
 });
 
@@ -193,7 +192,7 @@ test('once popped, the wall never re-docks it — the human owns the tile from t
     // And the converse: minimize it BY HAND (the real header button's real handler) and
     // the wall leaves it alone too — including when it blocks again. Past the first
     // pop-out, the tile is the human's to place.
-    window.chela.termMinFor(tile(WORKER).querySelector('.gs-min-btn'));
+    tile(WORKER).querySelector('.gs-min-btn').click();
     assert.ok(isDocked(WORKER));
     AGENTS = fleet({ needsHuman: true });
     await terminals.termTick();

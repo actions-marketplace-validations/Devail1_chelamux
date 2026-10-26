@@ -13,6 +13,7 @@ they assert the state paths land in a scratch dir, and — the part a future "si
 refactor cannot quietly undo — that the guard **fails** when code does reach the real dir.
 Delete conftest's isolation and this file goes red.
 """
+import ast
 import io
 import os
 import pwd
@@ -190,6 +191,50 @@ def test_a_scratch_and_an_in_memory_db_still_open(tmp_path):
     sqlite3.connect(f"file:{tmp_path / 'y.db'}", uri=True).close()
 
 
+def test_a_test_db_skips_fsync(tmp_path):
+    """⏱️ CMX-295 — every test connection runs ``synchronous=OFF`` (0); sqlite's default
+    is FULL (2). Drop the pragma from ``guarded_connect`` ⇒ 2 ⇒ RED."""
+    conn = sqlite3.connect(tmp_path / "x.db")
+    assert conn.execute("PRAGMA synchronous").fetchone() == (0,)
+    conn.close()
+
+
+def test_a_read_only_open_still_reads(tmp_path):
+    """⭐ ``mode=ro`` (ops.py, judge_select.py) still opens and reads under the pragma."""
+    db = tmp_path / "ro.db"
+    rw = sqlite3.connect(db)
+    rw.execute("CREATE TABLE t (x)")
+    rw.execute("INSERT INTO t VALUES (7)")
+    rw.commit()
+    rw.close()
+    ro = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    assert ro.execute("SELECT x FROM t").fetchall() == [(7,)]
+    assert ro.execute("PRAGMA synchronous").fetchone() == (0,)
+    ro.close()
+
+
+@pytest.mark.parametrize("make", [
+    "not_a_database",
+    pytest.param("autocommit_false", marks=pytest.mark.skipif(
+        sys.version_info < (3, 12), reason="sqlite3.connect(autocommit=) is 3.12+")),
+])
+def test_a_refused_pragma_still_returns_the_connection(tmp_path, make):
+    """🔴 GUARD — the two opens that refuse the pragma (a ``DatabaseError`` and its
+    ``OperationalError`` subclass) still get a connection back, as unwrapped sqlite would
+    give; the product code then meets the error where it would without the fence. Narrow
+    the ``except`` to ``OperationalError`` ⇒ the junk file raises at connect ⇒ RED."""
+    if make == "not_a_database":
+        junk = tmp_path / "junk.db"
+        junk.write_text("not a database " * 100)
+        conn = sqlite3.connect(junk)
+        with pytest.raises(sqlite3.DatabaseError, match="not a database"):
+            conn.execute("SELECT 1 FROM sqlite_master")
+    else:
+        conn = sqlite3.connect(tmp_path / "x.db", autocommit=False)
+        assert conn.execute("PRAGMA synchronous").fetchone() == (2,)
+    conn.close()
+
+
 def test_a_chela_dir_that_resolves_to_the_real_home_one_is_refused(tmp_path):
     """🔴 GUARD — the check the per-test autouse fixture and conftest's import both run.
     Corrupt it (compare against the wrong dir, or return early) ⇒ RED."""
@@ -292,3 +337,31 @@ def test_a_test_whose_config_chela_dir_is_the_real_one_is_refused_at_setup(tmp_p
     out = proc.stdout + proc.stderr
     assert proc.returncode != 0, out
     assert "LiveChelaDirEscape" in out and "1 passed" not in out, out
+
+
+def _imports_tests_conftest(src: str) -> bool:
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.ImportFrom) and node.level == 0:
+            if node.module == "tests.conftest" or (
+                    node.module == "tests" and any(a.name == "conftest" for a in node.names)):
+                return True
+        if isinstance(node, ast.Import) and any(a.name == "tests.conftest" for a in node.names):
+            return True
+    return False
+
+
+def test_no_test_imports_conftest_as_tests_conftest():
+    """🔴 GUARD — ``tests.conftest`` is a SECOND copy of the conftest: importing it re-runs
+    the module, so a new sandbox's gh fence lands first on PATH and PM2_HOME moves for the
+    rest of that xdist worker. CMX-273's ``from tests.conftest import …`` reded CI on every
+    branch whose file split put it before ``test_suite_containment``. Corrupt the scan
+    (never return True) ⇒ the bad-spelling probes below pass ⇒ RED."""
+    for bad in ("from tests.conftest import X", "import tests.conftest",
+                "from tests import conftest", "def f():\n    from tests.conftest import X\n"):
+        assert _imports_tests_conftest(bad), bad
+    assert not _imports_tests_conftest("from conftest import X\nimport conftest\n"
+                                       "# tests.conftest is the wrong spelling\n")
+    root = Path(__file__).resolve().parent
+    offenders = [p.name for p in sorted(root.rglob("*.py"))
+                 if _imports_tests_conftest(p.read_text(encoding="utf-8"))]
+    assert offenders == []

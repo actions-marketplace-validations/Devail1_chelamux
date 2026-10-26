@@ -1,13 +1,14 @@
-// 🙋 CMX-7 wiring: main.js's refresh() poll must actually ASK the server for the guests'
-// access requests, so the pending pill (#btn-access-req — the ONLY way to open the sheet)
-// ever shows. access_requests.test.mjs proves the pill logic; this proves the real page runs
-// it — drop the tickAccessRequests() call from refresh() and the pill stays hidden here.
+// 🙋 CMX-7 wiring: the refresh loop must actually ASK the server for the guests' access
+// requests, so the pending pill (#btn-access-req, the ONLY way to open the sheet) ever shows.
+// The access-request island's own tests (frontend/src/features/accessreq/tests) prove the pill
+// logic; this proves the real page runs it: drop the lane and the pill never shows here.
 // Harness copied from update_banner_wiring.test.mjs.
 //
-// Run: node --test tests/access_requests_wiring.test.mjs (tests/test_js_suites.py runs it).
-import { before, test } from 'node:test';
+// Run: pnpm exec vitest run tests/access_requests_wiring.test.mjs (tests/test_js_suites.py runs it).
+import { beforeAll, test } from 'vitest';
 import assert from 'node:assert/strict';
 import { JSDOM } from 'jsdom';   // needs `pnpm install` — tests/test_js_suites.py enforces it
+import { bootBlock, exposeDomConstructors, mountIslands } from './js_helpers/dashboard_dom.mjs';
 
 const PAGE_VERSION = 'aaaaaaaaaaaa';
 const ACCESS = { share_typing: true, default_minutes: 60, requests: [
@@ -16,15 +17,13 @@ const ACCESS = { share_typing: true, default_minutes: 60, requests: [
 ] };
 
 const PANEL = `
-<span id="hdr-agents"></span><span id="hdr-schedules"></span><span id="hdr-next"></span><span id="hdr-updated"></span>
-<button id="btn-access-req" hidden><span class="ar-pill-text"></span></button>
+<span class="island-slot" id="access-req-island"></span>
 <div class="panel" id="panel-terminals">
   <button id="term-mode-single"></button>
   <button id="term-mode-wall"></button>
   <select id="term-agent"></select>
   <span id="term-wall-grid"><span id="term-grid-presets"></span><button id="term-lock-btn"></button></span>
   <button id="term-new-shell"></button>
-  <div id="term-switcher"></div>
   <div id="term-stage"></div>
   <div id="term-min-dock"></div>
   <div id="term-bar" class="kb-collapsed"><button class="kb-toggle" id="kb-toggle"></button><div class="kb-body" id="kb-body"></div></div>
@@ -78,11 +77,9 @@ class FakeEventSource {
     close() {}
 }
 
-before(async () => {
-    const dom = new JSDOM(`<!doctype html><html><body>${PANEL}</body></html>`,
+beforeAll(async () => {
+    const dom = new JSDOM(`<!doctype html><html><body>${bootBlock({ assetVersion: PAGE_VERSION })}${PANEL}</body></html>`,
         { url: 'http://localhost:5005/', pretendToBeVisual: true });
-    dom.window.TERMINALS_ENABLED = true;
-    dom.window.CHELA_ASSET_VERSION = PAGE_VERSION;
     for (const k of ['window', 'document', 'localStorage', 'navigator', 'HTMLElement',
         'Element', 'Node', 'Event', 'MouseEvent', 'KeyboardEvent', 'CustomEvent',
         'getComputedStyle', 'requestAnimationFrame', 'cancelAnimationFrame']) {
@@ -102,15 +99,17 @@ before(async () => {
     globalThis.window.chela = globalThis.window.chela || {};
     globalThis.setInterval = () => 0;
 
-    await import('../chela/dashboard/static/js/main.js');
-    // refresh() awaits a chain of polls before the access-request tick; let them all settle.
-    for (let i = 0; i < 40 && document.getElementById('btn-access-req').hidden; i++) {
+    exposeDomConstructors(dom.window);
+    await mountIslands(dom.window);
+    (await import('../chela/dashboard/frontend/src/boot.ts')).start();
+    // the boot's refresh runs every lane; let them all settle
+    for (let i = 0; i < 40 && document.getElementById('btn-access-req')?.hidden !== false; i++) {
         await new Promise(resolve => setTimeout(resolve, 5));
     }
 });
 
 test("the page's own refresh poll shows the pending access-request pill", () => {
     const pill = document.getElementById('btn-access-req');
-    assert.equal(pill.hidden, false, 'refresh() never polled /api/share-requests — the pill never shows');
+    assert.equal(pill.hidden, false, 'the refresh loop never polled /api/share-requests: the pill never shows');
     assert.match(pill.textContent, /1 access request\b/);
 });

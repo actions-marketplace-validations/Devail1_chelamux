@@ -59,17 +59,19 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
-from chela import judge
+from chela import generated, judge, suite_guard
 
 RECOVERY_MARKER = ".chela-sweep-recovery.json"
 PY_SUFFIXES = (".py",)
 JS_SUFFIXES = (".js", ".mjs")
+TS_SUFFIXES = (".ts", ".tsx")     # CMX-173: the JS mutator, plus TS/TSX-only mutations
 
 # Per-mutation statuses. KILLED / SURVIVED / INVALID are the judge's own verdicts; the two
 # below are mutations that never reached a suite, and are NEVER counted as killed.
 UNPARSEABLE = "UNPARSEABLE"   # the mutated file did not parse — skipped, said out loud
 NOT_APPLIED = "NOT_APPLIED"   # the anchor could not be applied/proven — skipped, said out loud
 UNRUN = "UNRUN"               # CMX-111: the budget ran out before it — CANNOT VERIFY, not killed
+TIMEOUT = "TIMEOUT"           # CMX-253: its suite hit the timeout — CANNOT VERIFY, not killed
 
 # ⏳ CMX-111: the defaults a 0/unset/unreadable budget falls back to. The wall-clock budget is
 # checked BEFORE each mutation, so a sweep can overrun it by at most the one mutation already
@@ -80,7 +82,8 @@ DEFAULT_MAX_MUTATIONS = 60
 # Which mutations the budget reaches first: a dropped branch (the shape the judge finds most)
 # before a flipped return code/value, before a flipped comparison.
 _KIND_RANK = {"if-false": 0, "if-true": 1, "return-code": 2, "returncode": 2,
-              "return-none": 3, "return-value": 3, "compare-flip": 4}
+              "return-none": 3, "return-value": 3, "compare-flip": 4, "jsx-and": 0,
+              "ternary-false": 0, "ternary-true": 1, "return-bool": 2, "logic-flip": 4}
 
 _PY_FLIP = {ast.Eq: ("==", "!="), ast.NotEq: ("!=", "=="), ast.Lt: ("<", ">="),
             ast.GtE: (">=", "<"), ast.Gt: (">", "<="), ast.LtE: ("<=", ">")}
@@ -91,16 +94,21 @@ _JS_FLIP = {"===": "!==", "!==": "===", "==": "!=", "!=": "==",
 _RE_JS_CMP = re.compile(r"(?<=\s)(===|!==|==|!=|<=|>=|<|>)(?=\s)")
 _RE_JS_IF = re.compile(r"\bif\s*\(")
 _RE_JS_RET = re.compile(r"\breturn\s+([01])\b")
+_RE_TS_RET_BOOL = re.compile(r"\breturn\s+(true|false)\b")
+_RE_TS_LOGIC = re.compile(r"(?<=\s)(&&|\|\|)(?=\s)")
+# A ternary's `?`: whitespace both sides, so `?.`, `??` and an optional `x?: T` never match.
+_RE_TS_TERNARY = re.compile(r"(?<=\s)\?(?=\s)")
+_RE_TS_LEAD = re.compile(r"(?:return|throw|yield|case)\s+")
 _RE_HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 
 # Source languages the mutators cannot handle (`.cjs` too: the JS mutator claims .js/.mjs).
 UNSUPPORTED_SUFFIXES = frozenset({
-    ".ts", ".tsx", ".mts", ".cts", ".jsx", ".cjs", ".go", ".rs", ".java", ".kt", ".kts",
+    ".mts", ".cts", ".jsx", ".cjs", ".go", ".rs", ".java", ".kt", ".kts",
     ".scala", ".rb", ".php", ".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".cs", ".swift",
     ".m", ".mm", ".lua", ".ex", ".exs", ".erl", ".hs", ".ml", ".clj", ".dart", ".sh",
     ".bash",
 })
-SUPPORTED_NOTE = "only Python (and .js/.mjs, line-based) is mutated"
+SUPPORTED_NOTE = "only Python (and .js/.mjs/.ts/.tsx, line-based) is mutated"
 
 # Verdicts, in the order they win. The exit code of `chela judge sweep` is EXIT_CODES[verdict].
 V_CLEAN, V_SURVIVORS, V_UNKNOWN = "clean", "survivors", "unknown"
@@ -214,6 +222,7 @@ class SweepReport:
             "invalid": [r.as_dict() for r in self._with(judge.INVALID)],
             # ⏳ CMX-111: never measured — CANNOT VERIFY for these lines, never killed.
             "unrun": [r.as_dict() for r in self._with(UNRUN)],
+            "timeout": [r.as_dict() for r in self._with(TIMEOUT)],
             "measured": len([r for r in self.results if r.status != UNRUN]),
             "budget": self.budget.as_dict(), "exhausted": self.exhausted,
             "cannot_verify": self.cannot_verify, "recovered": self.recovered,
@@ -235,8 +244,9 @@ def verdict(result: dict) -> str:
         return V_CANNOT_VERIFY
     if result.get("survivors"):
         return V_SURVIVORS
-    if result.get("unrun"):
+    if result.get("unrun") or result.get("timeout"):
         # ⏳ CMX-111: mutations the budget never reached are unmeasured — never a pass.
+        # ⏳ CMX-253: and so is one whose suite hung until the timeout killed it.
         return V_CANNOT_VERIFY
     if result.get("unsupported"):
         return V_UNKNOWN
@@ -337,6 +347,10 @@ def _changed_lines(worktree: Path, base: str) -> tuple[dict[str, set[int]], str]
 
 
 def _sweepable(rel: str) -> bool:
+    if generated.is_generated(rel):     # 🏭 CMX-284: rebuilt from source — never mutated
+        return False
+    if rel.endswith(TS_SUFFIXES):   # a `.d.ts` has no runtime code; a spec MEASURES mutations
+        return not (rel.endswith(".d.ts") or is_test_path(rel) or _RE_FOREIGN_TEST.search(rel))
     return rel.endswith(PY_SUFFIXES + JS_SUFFIXES) and not is_test_path(rel)
 
 
@@ -344,13 +358,25 @@ _RE_FOREIGN_TEST = re.compile(r"(_test|_spec|Tests?)\.|\.spec\.|(^|/)(__tests__|
 
 
 def _unsupported(rel: str) -> bool:
-    return PurePosixPath(rel).suffix.lower() in UNSUPPORTED_SUFFIXES and not (
+    suffix = PurePosixPath(rel).suffix      # `x.TS` is not swept, so it stays UNKNOWN
+    return not generated.is_generated(rel) and (suffix.lower() in UNSUPPORTED_SUFFIXES or (
+        suffix.lower() in TS_SUFFIXES and suffix not in TS_SUFFIXES)) and not (
         is_test_path(rel) or _RE_FOREIGN_TEST.search(rel))
 
 
 def unsupported_files(worktree: Path, base: str) -> tuple[list[str], str]:
     """Changed (or untracked, not deleted) files vs ``base`` the mutators cannot handle, as
     ``(files, error)`` — a git failure is an error, never "no such files"."""
+    return _changed_names(worktree, base, _unsupported)
+
+
+def generated_files(worktree: Path, base: str) -> tuple[list[str], str]:
+    """🏭 CMX-284: changed (or untracked, not deleted) GENERATED files vs ``base`` — never
+    swept, but counted out loud."""
+    return _changed_names(worktree, base, generated.is_generated)
+
+
+def _changed_names(worktree: Path, base: str, keep) -> tuple[list[str], str]:
     mb = _git(worktree, "merge-base", base, "HEAD")
     if mb.returncode != 0 or not mb.stdout.strip():
         return [], (f"`{base}` does not resolve to a merge base with HEAD in {worktree} — "
@@ -363,7 +389,7 @@ def unsupported_files(worktree: Path, base: str) -> tuple[list[str], str]:
     if untracked.returncode != 0:
         return [], f"git ls-files failed: {(untracked.stderr or '').strip()[:200]}"
     found = {n for n in (names.stdout + "\0" + untracked.stdout).split("\0")
-             if n and _unsupported(n)}
+             if n and keep(n)}
     return sorted(found), ""
 
 
@@ -568,7 +594,62 @@ def _js_has_else(src: list[str], idx: int, after: int) -> bool:
     return False
 
 
-def js_mutations(rel: str, text: str, lines: set[int]) -> list[Mutation]:
+def _cond_start(line: str, pos: int) -> int:
+    """Where the operand ending at ``pos`` begins: back to an unmatched bracket, ``,;:?``, an
+    assignment, ``=>`` or a ``return``-like keyword. A misread start fails the parse check."""
+    depth = 0
+    i = pos - 1
+    while i >= 0:
+        c = line[i]
+        if _in_js_string(line, i):
+            pass
+        elif c in ")]}":
+            depth += 1
+        elif c in "([{":
+            if depth == 0:
+                break
+            depth -= 1
+        elif depth == 0 and (c in ",;:" or (c == "?" and line[i + 1] not in ".?" and line[i - 1]
+                             != "?") or (c == ">" and line[i - 1] == "=") or (
+                c == "=" and line[i + 1] != "=" and line[i - 1] not in "=!<>")):
+            break
+        i -= 1
+    start = i + 1
+    start += len(line[start:pos]) - len(line[start:pos].lstrip())
+    lead = _RE_TS_LEAD.match(line, start)
+    return lead.end() if lead else start
+
+
+def _ts_mutations(rel: str, ln: int, line: str, code_end: int) -> list[Mutation]:
+    """CMX-173, on top of JS: ``&&``↔``||``, ``return true``↔``false``, a ternary's condition
+    forced (``false && (c) ? a : b``/``true || (c)``), JSX ``{c && <X/>}`` → ``{false && <X/>}``."""
+    muts: list[Mutation] = []
+    for m in _RE_TS_LOGIC.finditer(line, 0, code_end):
+        if _in_js_string(line, m.start()):
+            continue
+        new = "||" if m.group(1) == "&&" else "&&"
+        muts.append(Mutation(rel, ln, "logic-flip", line,
+                             f"{line[:m.start()]}{new}{line[m.end():]}"))
+        if m.group(1) == "&&" and line[m.end():code_end].lstrip().startswith("<"):
+            start = _cond_start(line, m.start())
+            muts.append(Mutation(rel, ln, "jsx-and", line,
+                                 f"{line[:start]}false {line[m.start():]}"))
+    for m in _RE_TS_RET_BOOL.finditer(line, 0, code_end):
+        if not _in_js_string(line, m.start()):
+            new = "false" if m.group(1) == "true" else "true"
+            muts.append(Mutation(rel, ln, "return-bool", line,
+                                 f"{line[:m.start(1)]}{new}{line[m.end(1):]}"))
+    for m in _RE_TS_TERNARY.finditer(line, 0, code_end):
+        start = _cond_start(line, m.start())
+        cond = line[start:m.start()].rstrip()
+        for kind, forced in (("ternary-false", "false && "), ("ternary-true", "true || ")):
+            if cond and not _in_js_string(line, m.start()):
+                muts.append(Mutation(rel, ln, kind, line,
+                                     f"{line[:start]}{forced}({cond}){line[start + len(cond):]}"))
+    return muts
+
+
+def js_mutations(rel: str, text: str, lines: set[int], *, ts: bool = False) -> list[Mutation]:
     """Every mechanical mutation of the CHANGED lines of one JS file. Line-based (no JS
     parser): a mutation inside something it misread is caught by ``node --check`` and
     reported UNPARSEABLE, never counted as killed."""
@@ -616,13 +697,21 @@ def js_mutations(rel: str, text: str, lines: set[int]) -> list[Mutation]:
             new = "1" if m.group(1) == "0" else "0"
             muts.append(Mutation(rel, ln, "return-code", line,
                                  f"{line[:m.start(1)]}{new}{line[m.end(1):]}"))
+        if ts:
+            muts.extend(_ts_mutations(rel, ln, line, code_end))
     return muts
 
 
-def collect_mutations(worktree: Path, base: str) -> tuple[list[Mutation], str]:
-    changed, err = changed_lines(worktree, base)
-    if err:
-        return [], err
+def collect_mutations(worktree: Path, base: str,
+                      lines: dict[str, set[int]] | None = None) -> tuple[list[Mutation], str]:
+    """The mutations of the lines changed vs ``base`` — or (CMX-303) of exactly ``lines``,
+    ``{file: {1-based line numbers}}``, when the caller already knows which lines to sweep."""
+    if lines is None:
+        changed, err = changed_lines(worktree, base)
+        if err:
+            return [], err
+    else:
+        changed = {rel: set(ns) for rel, ns in lines.items() if _sweepable(rel)}
     muts: list[Mutation] = []
     for rel in sorted(changed):
         try:
@@ -635,8 +724,13 @@ def collect_mutations(worktree: Path, base: str) -> tuple[list[Mutation], str]:
                 ast.parse(text)
             except (SyntaxError, ValueError) as e:
                 return [], f"{rel} is a changed source file that could not be parsed: {e}"
-        gen = py_mutations if rel.endswith(PY_SUFFIXES) else js_mutations
-        muts.extend(gen(rel, text, changed[rel]))
+        if rel.endswith(TS_SUFFIXES):
+            # ⛔ fail CLOSED: with no parser, no mutant can be proven to parse.
+            status, detail = judge.ts_parse(worktree / rel)
+            if status != judge.TS_PARSES:
+                return [], f"{rel} is a changed source file that could not be parsed: {detail}"
+        muts.extend(py_mutations(rel, text, changed[rel]) if rel.endswith(PY_SUFFIXES) else
+                    js_mutations(rel, text, changed[rel], ts=rel.endswith(TS_SUFFIXES)))
     return muts, ""
 
 
@@ -826,15 +920,18 @@ def guard(pid: int, worktree: Path, poll: float = GUARD_POLL_SECONDS) -> int:
 
 
 def _now() -> float:
-    return time.monotonic()
+    return suite_guard.busy_clock()     # 🧠 CMX-119: a slot wait is not spent budget
 
 
 def sweep(
     worktree: str | Path, base: str, test_cmd: str, *,
     timeout: float = judge.SUITE_TIMEOUT_SECONDS, select_tests: bool = True, progress=None,
     provision: bool = True, budget: SweepBudget | None = None,
+    lines: dict[str, set[int]] | None = None,
 ) -> SweepReport:
-    """``provision=False`` standalone: the repo's env is its owner's (no ``uv sync``)."""
+    """``provision=False`` standalone: the repo's env is its owner's (no ``uv sync``).
+    ``lines`` (CMX-303, the nightly sweep): mutate exactly these lines of the checkout instead
+    of the branch's diff vs ``base`` — ``base`` is then only the report's label."""
     worktree = Path(worktree).resolve()
     budget = budget if budget is not None else SweepBudget()
     started = _now()
@@ -842,7 +939,7 @@ def sweep(
     try:
         report = _sweep(worktree, base, test_cmd, timeout=timeout, select_tests=select_tests,
                         progress=progress, provision=provision, budget=budget,
-                        started=started)
+                        started=started, lines=lines)
     except _Interrupted as e:
         # The mutation's own `finally` has already restored the file by the time this runs.
         report = SweepReport(cannot_verify=f"interrupted by signal {e.args[0]} — the sweep "
@@ -857,20 +954,33 @@ def sweep(
 
 def _sweep(worktree: Path, base: str, test_cmd: str, *, timeout: float, select_tests: bool,
            progress, budget: SweepBudget, started: float,
-           provision: bool = True) -> SweepReport:
+           provision: bool = True, lines: dict[str, set[int]] | None = None) -> SweepReport:
     report = SweepReport(budget=budget)
     report.recovered, err = recover(worktree)
     if err:
         report.cannot_verify = err
         return report
-    muts, err = collect_mutations(worktree, base)
+    # Two shapes on purpose: callers (and tests) that replace `collect_mutations` keep its
+    # two-argument form for the judge's own sweep.
+    muts, err = (collect_mutations(worktree, base) if lines is None else
+                 collect_mutations(worktree, base, lines))
     if err:
         report.cannot_verify = err
         return report
-    report.unsupported, err = unsupported_files(worktree, base)
+    if lines is None:
+        report.unsupported, err = unsupported_files(worktree, base)
+    else:
+        report.unsupported = sorted(rel for rel in lines if _unsupported(rel))
     if err:
         report.cannot_verify = err
         return report
+    skipped, err = (generated_files(worktree, base) if lines is None else
+                    (sorted(rel for rel in lines if generated.is_generated(rel)), ""))
+    if err:
+        report.cannot_verify = err
+        return report
+    if skipped:
+        report.notes.append(generated.note(len(skipped)))
     if report.unsupported:
         report.notes.append(f"{len(report.unsupported)} changed file(s) NOT swept — "
                             f"{SUPPORTED_NOTE}; each is UNKNOWN, not clean")
@@ -983,7 +1093,9 @@ def _apply_and_measure(worktree: Path, test_cmd: str, mut: Mutation, before: str
     fallback = ""
     if outcome.selected is None:
         fallback = outcome.selection or "no per-mutation selection for this sweep"
-    return SweepResult(mut, outcome.verdict, outcome.reason, outcome.measured_by, fallback)
+    status = TIMEOUT if outcome.mutated is not None and outcome.mutated.timed_out \
+        else outcome.verdict
+    return SweepResult(mut, status, outcome.reason, outcome.measured_by, fallback)
 
 
 # --- `--sweep-equivalent` ---------------------------------------------------------------------

@@ -1,28 +1,28 @@
-// ⚖️🔌 CMX-103 wiring: the REAL page runs the Pending-approvals surface. approvals.test.mjs
-// proves the module's logic in isolation; this loads main.js (the browser's entry point,
-// harness copied from update_banner_wiring.test.mjs) and proves each hop that connects it:
+// ⚖️🔌 CMX-103 wiring: the REAL page runs the Pending-approvals surface. The approvals island's
+// own tests (frontend/src/features/approvals/tests) prove its logic; this boots the page (the
+// islands, then the legacy graph, as index.html loads them) and proves each hop between them:
 //
-//   1. 🔴 main.js's refresh() poll calls tickApprovals() — the pill shows on EVERY tab with
-//      its count, before anyone opens anything. Drop that call and the pill never appears.
-//   2. 🔴 the pill markup index.html actually ships opens the sheet — its inline onclick
-//      reaches `chela.openApprovals`. The markup is read from the template, not retyped.
-//   3. 🔴 an SSE `overrides` frame re-fetches /api/overrides (sse.js) — and updates the
-//      count — between refresh() ticks.
-//   4. 🔴 Settings → Notifications' "Approval requests" select reaches setApprovalNotify:
-//      choosing "Browser notification" stores the opt-in, and the drawer re-renders it
-//      selected; choosing "Off" clears it.
+//   1. 🔴 the refresh loop runs the approvals lane: the pill shows on EVERY view with its
+//      count, before anyone opens anything.
+//   2. 🔴 the pill, in the slot index.html actually ships, opens the sheet. The slot is read
+//      from the template, not retyped.
+//   3. 🔴 an SSE `overrides` frame re-fetches /api/overrides, and updates the count, between
+//      refresh ticks.
+//   4. 🔴 Settings → Notifications' "Approval requests" select (features/settings) reaches
+//      setApprovalNotify: choosing "Browser notification" stores the opt-in, and the drawer
+//      re-renders it selected; choosing "Off" clears it.
 //
-// runScripts:'dangerously' is ONLY so jsdom compiles inline on* attributes (2, 4) — the
-// page carries no <script> of its own.
+// runScripts:'dangerously' is ONLY so jsdom compiles inline on* attributes (4): the page
+// carries no <script> of its own.
 //
-// Run: node --test tests/approvals_wiring.test.mjs (tests/test_js_suites.py runs it).
-import { before, test } from 'node:test';
+// Run: pnpm exec vitest run tests/approvals_wiring.test.mjs (tests/test_js_suites.py runs it).
+import { beforeAll, test } from 'vitest';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
 import { JSDOM } from 'jsdom';   // needs `pnpm install` — tests/test_js_suites.py enforces it
+import { exposeDomConstructors, mountIslands, pickOption } from './js_helpers/dashboard_dom.mjs';
 
-const TEMPLATE = readFileSync(new URL('../chela/dashboard/templates/index.html', import.meta.url), 'utf8');
-const PILL = TEMPLATE.match(/<button[^>]*id="btn-approvals"[\s\S]*?<\/button>/)[0];
+// The pill's shell slot: mountIslands draws it from the shell's own table (features/shell).
+const PILL = '<span class="island-slot" id="approvals-island"></span>';
 
 const PANEL = `
 <header><span id="hdr-agents"></span><span id="hdr-next"></span><span id="hdr-updated"></span></header>
@@ -32,7 +32,6 @@ const PANEL = `
   <select id="term-agent"></select>
   <span id="term-wall-grid"><span id="term-grid-presets"></span><button id="term-lock-btn"></button></span>
   <button id="term-new-shell"></button>
-  <div id="term-switcher"></div>
   <div id="term-stage"></div>
   <div id="term-min-dock"></div>
   <div id="term-bar" class="kb-collapsed"><button class="kb-toggle" id="kb-toggle"></button><div class="kb-body" id="kb-body"></div></div>
@@ -43,7 +42,8 @@ const PANEL = `
   <div class="decisions-list" id="decisions-list"></div>
 </section>
 <aside class="drawer" id="settings-drawer"><div class="drawer-body" id="drawer-body"></div></aside>
-<div class="safety-float">${PILL}</div>`;
+<div class="safety-float">${PILL}</div>
+<div id="overlays-island"></div>`;
 
 const AGENTS = [{ name: 'shell', window_id: '@1', online: true }];
 const ORCH_STATUS = { wid: null, name: null, state: 'unregistered', why: '', queued: 0 };
@@ -89,10 +89,9 @@ class FakeEventSource {
 const flush = () => new Promise(resolve => setTimeout(resolve, 5));
 let pillShownByRefresh = false;
 
-before(async () => {
+beforeAll(async () => {
     const dom = new JSDOM(`<!doctype html><html><body>${PANEL}</body></html>`,
         { url: 'http://localhost:5005/', pretendToBeVisual: true, runScripts: 'dangerously' });
-    dom.window.TERMINALS_ENABLED = true;
     for (const k of ['window', 'document', 'localStorage', 'navigator', 'HTMLElement',
         'Element', 'Node', 'Event', 'MouseEvent', 'KeyboardEvent', 'CustomEvent',
         'getComputedStyle', 'requestAnimationFrame', 'cancelAnimationFrame']) {
@@ -110,26 +109,31 @@ before(async () => {
     globalThis.window.chela = globalThis.window.chela || {};
     globalThis.setInterval = () => 0;
 
-    await import('../chela/dashboard/static/js/main.js');
+    exposeDomConstructors(dom.window);
+    await mountIslands(dom.window);
+    (await import('../chela/dashboard/frontend/src/boot.ts')).start();
     // refresh() awaits a chain of polls before tickApprovals(); let them settle. Only the
     // page's own load is allowed to show the pill — nothing below has run yet.
-    for (let i = 0; i < 40 && document.getElementById('btn-approvals').hidden; i++) await flush();
-    pillShownByRefresh = !document.getElementById('btn-approvals').hidden;
+    const shown = () => document.getElementById('btn-approvals')?.hidden === false;
+    for (let i = 0; i < 40 && !shown(); i++) await flush();
+    pillShownByRefresh = shown();
 });
 
 test('the page\'s own refresh poll shows the pill with the pending count', () => {
     const pill = document.getElementById('btn-approvals');
-    assert.ok(pillShownByRefresh, 'refresh() never ran tickApprovals() — no pill on page load');
+    assert.ok(pillShownByRefresh, 'the refresh loop never ran the approvals lane: no pill on page load');
     assert.match(pill.textContent, /1 pending approval\b/);
 });
 
 test('the pill index.html ships opens the Pending approvals sheet', async () => {
     document.getElementById('btn-approvals').click();
-    for (let i = 0; i < 10 && !document.getElementById('approvals-backdrop'); i++) await flush();
-    const sheet = document.getElementById('approvals-backdrop');
+    for (let i = 0; i < 10 && !document.querySelector('.approvals-sheet'); i++) await flush();
+    const sheet = document.querySelector('.approvals-sheet');
     assert.ok(sheet, 'clicking the shipped pill did not open the sheet');
     assert.equal(sheet.querySelectorAll('.pa-row').length, 1);
-    window.chela.closeApprovals();
+    sheet.querySelector('.ss-close').click();
+    await flush();
+    assert.equal(document.querySelector('.approvals-sheet'), null, 'the sheet\'s close button did not close it');
 });
 
 test('an SSE `overrides` frame re-fetches the list and updates the count', async () => {
@@ -156,23 +160,21 @@ test('the Settings select opts in and out of approval notifications', async () =
 
     window.chela.toggleSettings();
     await flush();
-    let sel = document.getElementById('approval-notify-select');
-    assert.ok(sel, 'Settings has no "Approval requests" select');
-    assert.equal(sel.value, 'off', 'approval notifications must be OFF by default');
+    const sel = () => document.getElementById('approval-notify-select');
+    assert.ok(sel(), 'Settings has no "Approval requests" select');
+    assert.equal(sel().textContent, 'Off', 'approval notifications must be OFF by default');
 
-    sel.value = 'on';
-    sel.dispatchEvent(new window.Event('change'));
+    await pickOption(sel(), 'Browser notification');
     await flush();
     assert.equal(localStorage.getItem(KEY), '1', 'choosing "Browser notification" did not opt in');
 
     window.chela.toggleSettings();     // close
-    window.chela.toggleSettings();     // re-open → re-render from storage
     await flush();
-    sel = document.getElementById('approval-notify-select');
-    assert.equal(sel.value, 'on', 'the drawer does not show the stored opt-in');
+    window.chela.toggleSettings();     // re-open: re-render from storage
+    await flush();
+    assert.equal(sel().textContent, 'Browser notification', 'the drawer does not show the stored opt-in');
 
-    sel.value = 'off';
-    sel.dispatchEvent(new window.Event('change'));
+    await pickOption(sel(), 'Off');
     await flush();
     assert.equal(localStorage.getItem(KEY), null, 'choosing "Off" did not clear the opt-in');
     window.chela.toggleSettings();

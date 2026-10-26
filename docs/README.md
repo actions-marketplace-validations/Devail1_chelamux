@@ -15,6 +15,7 @@ behind decisions that are otherwise invisible in the code.
 | [RISK_LEVELS.md](RISK_LEVELS.md) | `high` / `normal` / `low` tasks: what the level changes (judge search, rework cap) and what it never does |
 | [CONFIG.md](CONFIG.md) | Where configuration lives (`chela.env`), precedence, and PM2 |
 | [HOOKS.md](HOOKS.md) | The Claude Code hooks plugin — what it enables and what it costs |
+| [MODS_SPIKE.md](MODS_SPIKE.md) | Spike: the hook layer as a Claude Code Mod, measured side by side, and the go/no-go |
 | [EVENTS.md](EVENTS.md) | The event log: kinds, shape, rotation |
 | [TRUST_AND_APPROVAL_POSTURE.md](TRUST_AND_APPROVAL_POSTURE.md) | Who may dispatch, what a running agent may do, what approves a merge — in one place |
 | [ESCALATION_CONTRACT.md](ESCALATION_CONTRACT.md) | When an agent must stop and surface to a human |
@@ -26,6 +27,8 @@ behind decisions that are otherwise invisible in the code.
 | [DEFEAT_SHAPES.md](DEFEAT_SHAPES.md) + [defeat_shapes/](defeat_shapes/) | The catalogue of ways a guard passes while proving nothing — one file per shape |
 | [OKF.md](OKF.md) | Open Knowledge Format export design |
 | [ORCHESTRATOR_PERSONA.md](ORCHESTRATOR_PERSONA.md) · [PERSONA_PATTERN.md](PERSONA_PATTERN.md) | Giving an agent a stable standing role |
+| [FRONTEND_PORT_PLAN.md](FRONTEND_PORT_PLAN.md) | Porting the whole dashboard to React + TypeScript: inventory, target architecture, the ordered port slices |
+| [TEST_ARCHITECTURE_PLAN.md](TEST_ARCHITECTURE_PLAN.md) | The test suite's flakes, hermeticity and speed: what was measured, two tiers, fakes, a leak guard, the ordered slices |
 
 ## Design records — context, not instructions
 

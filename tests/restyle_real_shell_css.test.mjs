@@ -10,23 +10,23 @@
 //      jsdom's getComputedStyle skips every rule nested in an at-rule, so an
 //      always-true wrapper hides any override from it.
 //   2. `.gs-head .term-status-dot[data-wid].waiting { …circle… }` — the real
-//      pane-header dot carries data-wid (terminals.js paneHead); the fixture's
+//      pane-header dot carries data-wid (features/panehead PaneHead); the fixture's
 //      bare `<span>` did not, so the fork matched only the real header.
 //   3. `#term-stage > .grid-stack:has(.gs-head) { padding… }` — every real
 //      pane has a .gs-head; the fixture's panes were empty.
 // Each is the same gap: the guard's input (DOM + stylesheet) was not the
-// browser's input. So this file boots the REAL index.html shell (sliceTemplate),
-// renders REAL panes through the real renderTerminals → paneHead path and REAL
+// browser's input. So this file boots the REAL shell (features/shell <App>, CMX-248),
+// renders REAL panes through the real renderTerminals → PaneHead path and REAL
 // sidebar rows through renderSidebarAgents, colours them through the real
 // status tick, and resolves styles against cssForViewport(style.css) — every
 // @supports/@media block evaluated for the viewport and unwrapped, exactly as a
 // browser would apply it.
-import { before, test } from 'node:test';
+import { beforeAll, test } from 'vitest';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { bootDashboardDom, sliceTemplate, flush } from './js_helpers/dashboard_dom.mjs';
+import { APP_BODY, bootDashboardDom, flush, SIDEBAR, WALL, AGENTS_STORE, VIEW_STORE, NAV } from './js_helpers/dashboard_dom.mjs';
 import { cssForViewport, resolveVars, shapeSignature, DESKTOP, DESKTOP_DARK } from './js_helpers/css_viewport.mjs';
 
 const CSS = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'chela', 'dashboard', 'static', 'style.css'), 'utf8');
@@ -62,21 +62,20 @@ function fakeGridStack() {
 }
 
 let win;
-before(async () => {
+beforeAll(async () => {
     globalThis.GridStack = fakeGridStack();
-    // The REAL shell, byte-identical to what Flask serves (terminals enabled).
-    const body = sliceTemplate('<div class="app">', '\n  </main>') + '</div>';
+    // The REAL shell (features/shell <App>, CMX-248), terminals enabled.
     const { dom, modules } = await bootDashboardDom({
-        body, fetchImpl: fakeFetch, canvasStub: true,
-        extraModules: ['util.js', 'terminals.js', 'nav.js'],
+        body: APP_BODY, fetchImpl: fakeFetch, canvasStub: true,
+        extraModules: [AGENTS_STORE, VIEW_STORE, WALL, NAV, SIDEBAR],
     });
     win = dom.window;
     win.document.elementFromPoint = () => null;
-    const { util, terminals, nav } = modules;
-    util.setCurrentTab('terminals');
-    util.setAgentsCache(AGENTS);
-    await terminals.renderTerminals();   // real paneHead() markup, real status tick
-    nav.renderSidebarAgents(AGENTS);     // real sidebar rows
+    const { agents: { agents: agentsStore }, view: { view: viewStore }, terminals, sidebar } = modules;
+    viewStore.set('terminals');
+    agentsStore.set(AGENTS);
+    await terminals.renderTerminals();   // real PaneHead markup, real status tick
+    sidebar.renderSidebarAgents(AGENTS);     // real sidebar rows
     await flush();
     sheet = win.document.createElement('style');
     win.document.head.appendChild(sheet);

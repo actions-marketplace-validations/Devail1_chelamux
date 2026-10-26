@@ -324,10 +324,12 @@ def _run_row(tmp_path: Path, root: Path, task_id: str = "cmx-88") -> None:
 
 
 def _task_finished(*extra: str) -> int | None:
+    """⚖️🪜 CMX-296: pinned to the CORE tier — a standard-tier hand-in runs no sweep."""
     from chela import main
 
     with patch.object(sys, "argv", ["chela", "task-finished", "cmx-88", "--no-new-guards",
-                                     *extra]):
+                                     *extra]), \
+         patch.object(dispatcher, "hand_in_tier", return_value="core"):
         try:
             main.main()
         except SystemExit as e:
@@ -1993,7 +1995,7 @@ def test_the_sweepable_suffixes_are_exactly_py_js_mjs_and_never_tests(tmp_path):
     assert sweep.PY_SUFFIXES == (".py",) and sweep.JS_SUFFIXES == (".js", ".mjs")
     body = "if a == 1:\n    pass\n"
     keep = ["a.py", "b.js", "c.mjs", "pkg/d.py", "web/e.mjs", "src/tests/f.py"]
-    skip = ["g.cjs", "h.pyi", "i.ts", "j.jsx", "k.mts", "l.md", "m.py.txt", "n.json", "Makefile",
+    skip = ["g.cjs", "h.pyi", "i.d.ts", "j.jsx", "k.mts", "l.md", "m.py.txt", "n.json", "Makefile",
             "x.test.js", "y.test.mjs", "tests/z.py", "tests/z.js", "pkg/test_q.py",
             "pkg/test_q.js", "pkg/r_test.py", "pkg/conftest.py"]
     root = _plain_repo(tmp_path / "r", {}, {n: body for n in keep + skip})
@@ -2166,7 +2168,7 @@ def test_apply_and_measure_hands_the_judge_the_exact_experiment(tmp_path, monkey
         import types
 
         return types.SimpleNamespace(verdict="SURVIVED", reason="why", measured_by="312 tests",
-                                     selected=312, selection="sel")
+                                     selected=312, selection="sel", mutated=None)
 
     monkeypatch.setattr(sweep.judge, "_measure", fake_measure)
     res = sweep._apply_and_measure(root, TEST_CMD, mut, mut.before, mut.after, "BASE", 7, "SEL")
@@ -2558,6 +2560,7 @@ def _budgeted(tmp_path, monkeypatch, muts, *, budget, tick: float = 0.0,
     monkeypatch.setattr(sweep, "_now", lambda: clock[0])
     monkeypatch.setattr(sweep, "collect_mutations", lambda wt, base: (list(muts), ""))
     monkeypatch.setattr(sweep, "unsupported_files", lambda wt, base: ([], ""))  # CMX-97
+    monkeypatch.setattr(sweep, "generated_files", lambda wt, base: ([], ""))  # CMX-284
     monkeypatch.setattr(sweep.judge, "provision_suite_env", lambda wt: "")
     monkeypatch.setattr(sweep.judge, "run_baseline", lambda *a, **kw: (
         SimpleNamespace(green=True, detail="", tail="", exit_code=0), None, ""))

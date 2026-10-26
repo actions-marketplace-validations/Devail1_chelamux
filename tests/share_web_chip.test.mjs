@@ -13,9 +13,9 @@
 // The judge's round-2 survivor: `if (a.share_net) _netModes.set(…)` → `if (false)`
 // stayed green because nothing rendered a fleet carrying share_net at all.
 //
-// Run: node --test tests/share_web_chip.test.mjs (pytest runs it via
+// Run: pnpm exec vitest run tests/share_web_chip.test.mjs (pytest runs it via
 // tests/test_js_suites.py; needs `pnpm install` for jsdom.)
-import { before, test } from 'node:test';
+import { beforeAll, test } from 'vitest';
 import assert from 'node:assert/strict';
 import { JSDOM } from 'jsdom';
 
@@ -27,7 +27,6 @@ const PANEL = `
   <select id="term-agent"></select>
   <span id="term-wall-grid"><span id="term-grid-presets"></span><button id="term-lock-btn"></button></span>
   <button id="term-new-shell"></button>
-  <div id="term-switcher"></div>
   <div id="term-stage"></div>
   <div id="term-min-dock"></div>
   <div id="term-bar" class="kb-collapsed"><button class="kb-toggle" id="kb-toggle"></button><div class="kb-body" id="kb-body"></div></div>
@@ -60,12 +59,11 @@ function fakeGridStack() {
     return { init: () => grid };
 }
 
-let terminals, util;
+let terminals, agentsStore, viewStore;
 
-before(async () => {
+beforeAll(async () => {
     const dom = new JSDOM(`<!doctype html><html><body>${PANEL}</body></html>`,
         { url: 'http://localhost:5005/', pretendToBeVisual: true });
-    dom.window.TERMINALS_ENABLED = true;
     for (const k of ['window', 'document', 'localStorage', 'navigator', 'HTMLElement',
         'Element', 'Node', 'Event', 'MouseEvent', 'KeyboardEvent', 'CustomEvent',
         'getComputedStyle', 'requestAnimationFrame', 'cancelAnimationFrame']) {
@@ -80,11 +78,12 @@ before(async () => {
     });
     globalThis.window.chela = globalThis.window.chela || {};
     globalThis.setInterval = () => 0;
-    await import('../chela/dashboard/static/js/main.js');
-    util = await import('../chela/dashboard/static/js/util.js');
-    terminals = await import('../chela/dashboard/static/js/terminals.js');
-    util.setCurrentTab('terminals');
-    util.setAgentsCache(AGENTS);
+    (await import('../chela/dashboard/frontend/src/boot.ts')).start();
+    ({ agents: agentsStore } = await import('../chela/dashboard/frontend/src/shared/store/agents.ts'));
+    ({ view: viewStore } = await import('../chela/dashboard/frontend/src/shared/store/view.ts'));
+    terminals = await import('../chela/dashboard/frontend/src/features/wall/index.ts');
+    viewStore.set('terminals');
+    agentsStore.set(AGENTS);
     await terminals.renderTerminals();
 });
 

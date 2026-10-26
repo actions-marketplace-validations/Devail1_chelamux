@@ -62,16 +62,20 @@ from chela.telegram.parser import Message, parse_entries, parse_line
 from chela.telegram.reconcile import (
     TopicClosedHandler,
     TopicManager,
+    TopicReopenedHandler,
     ai_title_for_window,
     blocked_on_human,
+    delete_archived_topics,
     disambiguate_topic_names,
     dispatched_window_ids,
     live_agent_windows,
+    window_session_id,
     reconcile_bindings,
     sync_pinned_titles,
     topic_name_for,
 )
 from chela.telegram.relay import BotSender, RegistryRelay, TelegramRelay
+from chela.topic_ledger import TopicLedger
 
 __all__ = [
     "TranscriptMonitor",
@@ -105,12 +109,16 @@ __all__ = [
     "to_plain_text",
     "TopicManager",
     "TopicClosedHandler",
+    "TopicReopenedHandler",
     "reconcile_bindings",
+    "delete_archived_topics",
+    "TopicLedger",
     "sync_pinned_titles",
     "ai_title_for_window",
     "blocked_on_human",
     "dispatched_window_ids",
     "live_agent_windows",
+    "window_session_id",
     "topic_name_for",
     "disambiguate_topic_names",
     "build_browser",

@@ -56,11 +56,21 @@ import shutil
 import signal
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
 
 import pytest
+
+# CMX-281: tests/ has no __init__.py, so pytest imports this file as the top-level module
+# ``conftest``. Importing it as ``tests.conftest`` as well runs everything below a SECOND
+# time — a second sandbox, a second gh fence prepended to PATH — and every test after it in
+# that worker sees PATH, CHELA_DIR … point at the copy, not at the module it asserts
+# against. Refuse the copy before any of that runs.
+if __name__ != "conftest" and "conftest" in sys.modules:
+    raise ImportError(f"tests/conftest.py imported a second time as {__name__!r}: "
+                      "import it as `conftest`, the module pytest already loaded")
 
 os.environ.setdefault("CHELA_ENV_FILE", "")
 
@@ -277,7 +287,9 @@ if _PREV_SIGTERM is not signal.SIG_IGN:   # a parent that chose to ignore it kee
 
 # A developer who exported these to debug against live files would otherwise aim the whole
 # suite straight back at production, under the sandbox's nose.
-for _var in ("CHELA_EVENTS_FILE", "CHELA_INBOX_FILE"):
+# The bridge's sender allowlist (CMX-185) too: a developer's own id in the shell would
+# silently drop every stub update the inbound tests feed in.
+for _var in ("CHELA_EVENTS_FILE", "CHELA_INBOX_FILE", "CHELA_TELEGRAM_ALLOWED_USERS"):
     os.environ.pop(_var, None)
 
 # **And the suite must not be able to DISPATCH.** This one is not about reading or writing
@@ -298,6 +310,29 @@ os.environ["CHELA_DISPATCH_WORKFLOWS"] = ""
 # table hands the code one (see tests/test_runtime_truth.py).
 os.environ["CHELA_TMUX_SESSION"] = "chela-tests-no-such-session"
 
+# **And GitHub is live state too — the worst kind: a real `gh pr merge` merges a real PR.**
+# CMX-253: a sweep mutant in `overrides.resume` sent a test past its stubs into the merge
+# gate, which ran the REAL `gh` and blocked until the 1500s suite timeout (2026-10-18). Two
+# layers, like pm2's. Structurally, a `gh` that fails loudly at once goes first on PATH and
+# the token env is dropped, for every test and every subprocess a test starts: a read fails
+# closed in milliseconds instead of hanging on the network. In-process, :func:`_no_live_gh`
+# turns a MERGE that would reach that stub or the real `gh` into a test failure — the worst
+# case must never pass quietly as "gh failed, fail closed". A test that wants `gh` puts its
+# own fake earlier on PATH (or stubs the seam).
+_REAL_GH_BIN = shutil.which("gh")
+_REAL_GH_REALPATH = os.path.realpath(_REAL_GH_BIN) if _REAL_GH_BIN else None
+GH_FENCE_MESSAGE = ("chela tests: the real `gh` is fenced off (CMX-253) — stub the seam "
+                    "that calls it, or put a fake `gh` first on PATH")
+GH_STUB_DIR = SANDBOX_CHELA_DIR / "gh-fence"
+GH_STUB_DIR.mkdir()
+(GH_STUB_DIR / "gh").write_text(f"#!/bin/sh\necho '{GH_FENCE_MESSAGE}' >&2\nexit 97\n")
+(GH_STUB_DIR / "gh").chmod(0o755)
+os.environ["PATH"] = f"{GH_STUB_DIR}{os.pathsep}{os.environ.get('PATH', '')}"
+for _var in ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"):
+    os.environ.pop(_var, None)
+# …and no stored login either: even a real `gh` run by absolute path finds no credentials.
+os.environ["GH_CONFIG_DIR"] = str(GH_STUB_DIR / "config")
+
 # Collapse the dispatcher's seed-delivery confirm loop to ~instant. In production it polls a
 # freshly-spawned Claude window for up to 5×8s ≈ 44s, waiting for it to flip "busy" (see
 # dispatcher.SEED_CONFIRM_TIMEOUT_SECONDS). No test has a real TUI to flip, so every test
@@ -309,6 +344,14 @@ os.environ["CHELA_TMUX_SESSION"] = "chela-tests-no-such-session"
 os.environ.setdefault("CHELA_SEED_CONFIRM_TIMEOUT_SECONDS", "0.05")
 os.environ.setdefault("CHELA_SEED_CONFIRM_POLL_INTERVAL", "0.01")
 os.environ.setdefault("CHELA_SEED_RESEND_SETTLE_SECONDS", "0")
+
+# 🧠 CMX-119: the suite this conftest belongs to already runs inside chela's own memory
+# ceiling and slot (judge.run_suite). Tests that call run_suite for a tiny `true`/`exit 1`
+# must not each pay a systemd scope; tests/test_suite_guard.py turns both back on where tested.
+os.environ["CHELA_SUITE_MEMORY_MAX"] = "0"
+os.environ["CHELA_SUITE_SLOTS"] = "0"      # ...nor queue on each other's suite slots
+# A mutation that breaks the slot loop fails a run_suite in 5s instead of hanging the suite.
+os.environ["CHELA_SUITE_SLOT_MAX_WAIT"] = "5"
 
 
 class LiveNotificationEscape(BaseException):
@@ -366,6 +409,44 @@ def _is_live_state(path) -> bool:
     if not any(p == r or r in p.parents for r in roots):
         return False
     return not any(p == e or e in p.parents for e in _EXEMPT)
+
+
+@pytest.fixture(autouse=True)
+def reaper_kills(monkeypatch):
+    """CMX-151: the worktree reaper NEVER signals a real process under test.
+
+    ``reap_processes_in`` scans ``/proc`` and SIGKILLs what it finds; a judge mutation of
+    one of its checks once SIGKILLed every process of the user (2026-10-16). Its only kill
+    path, ``worktree._signal_pid``, records here instead — for every test, including the
+    many that remove a worktree incidentally. A test asserts on the list and kills the
+    dummies it spawned itself.
+    """
+    from chela import worktree
+
+    kills: list[tuple[int, int]] = []
+    monkeypatch.setattr(worktree, "_signal_pid", lambda pid, sig: kills.append((pid, sig)))
+    return kills
+
+
+@pytest.fixture(autouse=True)
+def _fresh_linear_caches():
+    """CMX-193: the Linear source's per-process caches start empty for every test.
+
+    ``linear._team_states`` caches a team's workflow states for an hour, keyed by team
+    name. A test that filled it for team ``CMX`` handed those states to whichever later
+    test on the same xdist worker built the dashboard payload — and the repo's own
+    ``WORKFLOW.md`` (team ``CMX``, auto-discovered by the dashboard) then grew
+    ``tracker_columns`` there and nowhere else, flipping that test's board to Linear's
+    columns. Green alone, red in CI, depending on test order.
+    """
+    from chela.sources import linear
+
+    caches = (linear._backoff, linear._last_sweep, linear._team_states, linear._reported)
+    for c in caches:
+        c.clear()
+    yield
+    for c in caches:
+        c.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -522,7 +603,17 @@ def _no_live_state(monkeypatch):
                 "code at the per-test scratch dir (the CHELA_DIR fixtures in "
                 "tests/conftest.py), or hand it the path you want it to use."
             )
-        return real_connect(database, *args, **kwargs)
+        conn = real_connect(database, *args, **kwargs)
+        # ⏱️ CMX-295: a test DB is scratch, so skip the per-commit fsync (147 s → 3 s on
+        # test_contract + test_dispatcher_reopen). A ``mode=ro`` open takes it fine; the
+        # pragma is refused only by a file that is not a database, or by an
+        # ``autocommit=False`` connection already in a transaction — those keep the
+        # default, and the error surfaces where the product code would see it.
+        try:
+            conn.execute("PRAGMA synchronous=OFF")
+        except sqlite3.DatabaseError:
+            pass
+        return conn
 
     monkeypatch.setattr(sqlite3, "connect", guarded_connect)
 
@@ -533,6 +624,24 @@ def _hand_in_size_passes(request, monkeypatch):
     if not getattr(request.module, "REAL_SIZE_GATE", False):
         from chela import dispatcher
         monkeypatch.setattr(dispatcher, "check_hand_in_size",
+                            lambda *a, **k: {"ok": True, "record": None})
+
+
+@pytest.fixture(autouse=True)
+def _hand_in_base_sync_passes(request, monkeypatch):
+    """🔀 CMX-189: the base-sync gate passes unless a module sets ``REAL_BASE_SYNC = True``."""
+    if not getattr(request.module, "REAL_BASE_SYNC", False):
+        from chela import dispatcher
+        monkeypatch.setattr(dispatcher, "check_base_sync",
+                            lambda *a, **k: {"ok": True, "record": None})
+
+
+@pytest.fixture(autouse=True)
+def _hand_in_review_passes(request, monkeypatch):
+    """🔎 CMX-209: the self-review gate passes unless a module sets ``REAL_REVIEW_GATE = True``."""
+    if not getattr(request.module, "REAL_REVIEW_GATE", False):
+        from chela import dispatcher
+        monkeypatch.setattr(dispatcher, "check_review_section",
                             lambda *a, **k: {"ok": True, "record": None})
 
 
@@ -746,6 +855,51 @@ def _no_live_tmux_mutation(monkeypatch):
             reason = _tmux_violation(list(args), kw.get("env"))
             if reason is not None:
                 raise LiveTmuxMutationEscape(f"test issued a {reason}")
+        return real_init(self, args, *a, **kw)
+
+    monkeypatch.setattr(subprocess.Popen, "__init__", guarded_init)
+
+
+class LiveGhEscape(BaseException):
+    """A test ran the real ``gh`` (or the fence's stub standing in for it). ``BaseException``
+    like :class:`LiveTmuxMutationEscape`: the gh callers fail closed on ``Exception``."""
+
+
+def _gh_violation(args, env: dict | None) -> str | None:
+    """Why this Popen ``args`` would MERGE through the real ``gh`` (``gh pr merge``, or the
+    merge API) — or ``None`` if it would not."""
+    try:
+        words = (os.fsdecode(args).split() if isinstance(args, (str, bytes))
+                 else [os.fsdecode(a) for a in args])
+    except TypeError:
+        return None                        # not a path-like argv
+    if not words or os.path.basename(words[0]) != "gh":
+        return None
+    if not (("pr" in words and "merge" in words)
+            or any(w.rstrip("/").endswith(("/merge", "/merges")) for w in words)):
+        return None
+    prog = words[0]
+    # An explicit env with no PATH execs against the default path, not this process's.
+    path = os.environ.get("PATH") if env is None else env.get("PATH", os.defpath)
+    resolved = shutil.which(prog, path=path)
+    if resolved is None:
+        return None
+    real = os.path.realpath(resolved)
+    if real not in {os.path.realpath(GH_STUB_DIR / "gh"), _REAL_GH_REALPATH}:
+        return None                        # a test's own fake gh
+    return f"{GH_FENCE_MESSAGE}: {args!r}"
+
+
+@pytest.fixture(autouse=True)
+def _no_live_gh(monkeypatch):
+    """The fence: a merge that would run the real ``gh`` fails the test AT ONCE, before the
+    process starts — so a mutant that slips past a stub can never merge."""
+    real_init = subprocess.Popen.__init__
+
+    def guarded_init(self, args, *a, **kw):
+        reason = _gh_violation(args, kw.get("env"))
+        if reason is not None:
+            raise LiveGhEscape(reason)
         return real_init(self, args, *a, **kw)
 
     monkeypatch.setattr(subprocess.Popen, "__init__", guarded_init)

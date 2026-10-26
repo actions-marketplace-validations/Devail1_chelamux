@@ -400,7 +400,7 @@ class DispatchKnob(NamedTuple):
     """One row of the Dispatch tab. Unlike :class:`TimingKnob` (every member a
     plain positive number), this group mixes shapes — booleans, free text, a
     K/M/G/T size — so ``kind`` picks the cast/validation rule and which control
-    the UI renders (``_renderDispatchRows`` in nav.js), rather than assuming a
+    the UI renders (the Dispatch tab, ``features/settings`` in the dashboard frontend), rather than assuming a
     numeric ``<input>`` for everything."""
     key: str            # ~/.chela/config.json key
     env: str             # CHELA_* env var name
@@ -429,6 +429,11 @@ DISPATCH_KNOBS: tuple[DispatchKnob, ...] = (
                  "Max reworks — risk: normal", floor=0),
     DispatchKnob("max_reworks_low", "CHELA_MAX_REWORKS_LOW", 3, int,
                  "Max reworks — risk: low", floor=0),
+    # 🏗️🔁 CMX-192: the SEPARATE budget for rounds that were not a review verdict (a CI
+    # send-back, a rework agent that died without handing in). Higher than every rework cap
+    # on purpose: these are not evidence about the code, but a crash loop must still stop.
+    DispatchKnob("max_infra_restarts", "CHELA_MAX_INFRA_RESTARTS", 8, int,
+                 "Max infra restarts (CI failures, dead agents) before escalation", floor=0),
     # ⚖️🎚️ CMX-405: how many experiments the judge may RUN per risk level. `high` is the
     # pre-CMX-405 behaviour (judge.MAX_EXPERIMENTS). ⛔ It scales the SEARCH only — every
     # experiment that does run is adjudicated identically, and a survivor BLOCKS at every level.
@@ -442,8 +447,7 @@ DISPATCH_KNOBS: tuple[DispatchKnob, ...] = (
                  "Judge (adversarial review)", kind="bool", restart_required=True),
     DispatchKnob("judge_max_unknown_retries", "CHELA_JUDGE_MAX_UNKNOWN_RETRIES", 2, int,
                  "Judge cannot-verify retries", floor=0),
-    DispatchKnob("judge_max_concurrent", "CHELA_JUDGE_MAX_CONCURRENT", 1, int,
-                 "Judge max concurrent (per workflow)", floor=1),
+    # (judge_max_concurrent moved to its own Settings row, CMX-164: chela/concurrency.py)
     DispatchKnob("judge_outage_backoff_seconds", "CHELA_JUDGE_OUTAGE_BACKOFF_S", 600.0, float,
                  "Judge classifier-outage backoff", unit="s", floor=0),
     # ⏳⚖️ CMX-431: the judge wall scales with the battery — see `judge_wall_*` below.
@@ -834,6 +838,17 @@ def max_reworks_for(risk: object) -> int:
     return min(max(0, dispatch_value(f"max_reworks_{level}")), max_reworks())
 
 
+def max_infra_restarts() -> int:
+    """🏗️🔁 CMX-192. How many rounds that were NOT a review verdict a run may spend — a CI
+    send-back, a rework agent whose window died or that stalled without handing in. They do
+    not spend the rework cap (:func:`max_reworks_for`): that one stops a PR that keeps
+    FAILING REVIEW, and CMX-180 burned all of it on a clock flake and a tmux death without a
+    single judge round. Past this cap the run escalates to ``needs_human`` with an infra
+    reason, so a crash loop still stops. Read per call (a Dispatch-tab knob).
+    """
+    return max(0, dispatch_value("max_infra_restarts"))
+
+
 def judge_max_experiments(risk: object) -> int:
     """⚖️🎚️ CMX-405. How many of the judge's proposed experiments are RUN at this RISK
     level (``judge_experiments_<level>``: high 12, normal 8, low 4 by default); the rest
@@ -888,10 +903,12 @@ def judge_max_concurrent() -> int:
     not mean "disabled" (that is ``judge_enabled=false``) — it would silently wedge every
     workflow's judge queue forever, indistinguishable from a stuck daemon. Read per call,
     never latched at import: a policy knob an operator turns on a running daemon, and a
-    garbage value degrades to the default rather than crashing the tick. A Dispatch-tab
-    knob (CMX-220) — see DISPATCH_KNOBS above.
+    garbage value degrades to the default rather than crashing the tick. CMX-164: its own
+    "Judges at once" Settings row, where the stored value wins over the env var (see
+    ``chela/concurrency.py``), bounded 1 to 8.
     """
-    return max(1, dispatch_value("judge_max_concurrent"))
+    from chela import concurrency
+    return concurrency.judges_at_once()[0]
 
 
 def judge_outage_backoff_seconds() -> float:
@@ -1102,21 +1119,6 @@ STATUS_LINE = os.environ.get("CHELA_STATUS_LINE", "true").strip().lower() not in
     "false", "0", "no", "off",
 )
 
-# Live-terminal message timestamps (CMX-277, correcting CMX-270's "not feasible"
-# verdict; CMX-285 corrected CMX-277's own mechanism — see
-# docs/archive/SPIKE_LIVE_TERMINAL_TIMESTAMPS.md): the MessageDisplay hook's `displayContent`
-# response prepends a local-time marker to an assistant reply's own first line, which is
-# what the wall's ttyd tile mirrors byte-for-byte — genuinely INLINE, unlike CMX-277's
-# `systemMessage`, which Claude Code renders as its own separate line. OFF by default —
-# this decorates every assistant message in every adopter's terminal, and needs Claude
-# Code 2.1.152+ (older pins never fire the hook at all, so this degrades to "no marker,"
-# never a broken one — but that is still unverified across the full version range). Liav
-# turns it on with CHELA_TERMINAL_TIMESTAMPS=true on his own box; that is a config change,
-# not a shipped default.
-TERMINAL_TIMESTAMPS = os.environ.get("CHELA_TERMINAL_TIMESTAMPS", "false").strip().lower() not in (
-    "false", "0", "no", "off",
-)
-
 # Embedded ttyd terminal wall on/off (read by the dashboard and the ttyd
 # supervisor in scripts/agent-terminals.sh). The wall — the flagship feature —
 # is ON by default, but it serves writable shells, so the dashboard gates it on
@@ -1322,6 +1324,12 @@ def judge_not_started_alert_s() -> int:
 def stuck_agent_alert_s() -> int:
     """A running agent with no new commit AND no transcript activity this long ⇒ one notice."""
     return int(os.environ.get("CHELA_STUCK_AGENT_ALERT_S", "1200"))
+
+
+def park_max_s() -> int:
+    """A run parked by ``chela park`` (CMX-318) is never called STUCK — until it has been
+    parked this long (or past its ``--until``); then ONE notice says the park outlived itself."""
+    return int(os.environ.get("CHELA_PARK_MAX_S", "21600"))
 
 
 def selfcheck_alert_s() -> int:

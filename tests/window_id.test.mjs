@@ -16,27 +16,25 @@
 //   4. clicking the footer chip copies the id and shows a "Copied" toast;
 //   5. ⭐ MUST STILL PASS: a window with a very long name still shows its id.
 //
-// Run: node --test tests/window_id.test.mjs (pytest runs it via
+// Run: pnpm exec vitest run tests/window_id.test.mjs (pytest runs it via
 // tests/test_js_suites.py; needs `pnpm install` for jsdom.)
-import { before, test } from 'node:test';
+import { beforeAll, test } from 'vitest';
 import assert from 'node:assert/strict';
 import { JSDOM } from 'jsdom';
-import { resolveWindowId, windowIdQuery } from '../chela/dashboard/static/js/windowid.js';
+import { resolveWindowId, windowIdQuery } from '../chela/dashboard/static/js/windowid.ts';
+import { closePalette, mountIslands, searchPalette } from './js_helpers/dashboard_dom.mjs';
 
 const LONG = 'a-very-long-session-name-that-goes-on-and-on-well-past-any-pane-width-' + 'x'.repeat(80);
 
 const PANEL = `
 <div id="sidebar-agents"></div>
-<div class="palette-overlay" id="palette">
-  <div class="palette"><input id="palette-input"><div id="palette-list"></div></div>
-</div>
+<div id="overlays-island"></div>
 <div class="panel" id="panel-terminals">
   <button id="term-mode-single"></button>
   <button id="term-mode-wall"></button>
   <select id="term-agent"></select>
   <span id="term-wall-grid"><span id="term-grid-presets"></span><button id="term-lock-btn"></button></span>
   <button id="term-new-shell"></button>
-  <div id="term-switcher"></div>
   <div id="term-stage"></div>
   <div id="term-min-dock"></div>
   <div id="term-bar" class="kb-collapsed"><button class="kb-toggle" id="kb-toggle"></button><div class="kb-body" id="kb-body"></div></div>
@@ -77,12 +75,11 @@ function fakeGridStack() {
     return { init: () => grid };
 }
 
-let terminals, util, nav, clipboard = [];
+let terminals, agentsStore, viewStore, nav, clipboard = [], sidebar;
 
-before(async () => {
+beforeAll(async () => {
     const dom = new JSDOM(`<!doctype html><html><body>${PANEL}</body></html>`,
         { url: 'http://localhost:5005/', pretendToBeVisual: true });
-    dom.window.TERMINALS_ENABLED = true;
     for (const k of ['window', 'document', 'localStorage', 'navigator', 'HTMLElement',
         'Element', 'Node', 'Event', 'MouseEvent', 'KeyboardEvent', 'CustomEvent',
         'getComputedStyle', 'requestAnimationFrame', 'cancelAnimationFrame']) {
@@ -101,14 +98,17 @@ before(async () => {
     });
     globalThis.window.chela = globalThis.window.chela || {};
     globalThis.setInterval = () => 0;
-    await import('../chela/dashboard/static/js/main.js');
-    util = await import('../chela/dashboard/static/js/util.js');
-    nav = await import('../chela/dashboard/static/js/nav.js');
-    terminals = await import('../chela/dashboard/static/js/terminals.js');
-    util.setCurrentTab('terminals');
-    util.setAgentsCache(AGENTS);
+    await mountIslands(dom.window);   // CMX-276: the sidebar island draws #sidebar-agents
+    (await import('../chela/dashboard/frontend/src/boot.ts')).start();
+    ({ agents: agentsStore } = await import('../chela/dashboard/frontend/src/shared/store/agents.ts'));
+    ({ view: viewStore } = await import('../chela/dashboard/frontend/src/shared/store/view.ts'));
+    nav = await import('../chela/dashboard/frontend/src/features/shell/index.ts');
+    sidebar = await import('../chela/dashboard/frontend/src/features/sidebar/controller.ts');
+    terminals = await import('../chela/dashboard/frontend/src/features/wall/index.ts');
+    viewStore.set('terminals');
+    agentsStore.set(AGENTS);
     await terminals.renderTerminals();
-    nav.renderSidebarAgents(AGENTS);
+    sidebar.renderSidebarAgents(AGENTS);
 });
 
 const tile = wid => document.querySelector(`#term-stage .grid-stack-item[gs-id="${wid}"]`);
@@ -118,12 +118,20 @@ const footerId = wid => {
 };
 const sidebarRow = name => [...document.querySelectorAll('#sidebar-agents .agent-row')]
     .find(r => r.dataset.agent === name);
-const paletteRows = () => [...document.querySelectorAll('#palette-list .palette-item')].map(r => ({
-    i: Number(r.dataset.i),
-    title: r.querySelector('.pi-title').textContent,
-    sub: r.querySelector('.pi-sub').textContent,
-}));
+// CMX-221: the palette is the React dialog; a row runs on a real click.
+const paletteRows = searchPalette;
+const runRow = row => row.el.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+// The footer sets its toast after the copy's await, so React paints it on a later scheduler
+// tick: on a loaded CI runner one sleep(0) can read no toast, or the previous test's. Wait for
+// `text` (up to 1s, under the 1.5s toast life); the assertions after still decide.
+async function settleToast(wid, text) {
+    for (let t = 0; t < 1000; t += 10) {
+        const el = tile(wid).querySelector('.gs-wid-toast');
+        if (el && el.textContent === text) return;
+        await sleep(10);
+    }
+}
 
 // --- the harness itself is not a mock -------------------------------------------
 
@@ -157,78 +165,70 @@ test('⭐ a window with a very long name still shows its id in the footer and th
 
 // --- 2. the sidebar row carries the id ------------------------------------------
 
-test('the sidebar row shows its window id on its second line and in its tooltip', () => {
+test('the sidebar row shows its window id at the end of its metadata and in its tooltip', () => {
     const row = sidebarRow('alpha');
     assert.ok(row, 'no sidebar row for alpha');
-    const wid = row.querySelector('.ar-sub .ar-wid');
-    assert.ok(wid, 'no .ar-wid on the row\'s second line');
+    const wid = row.querySelector('.ar-meta .ar-wid');
+    assert.ok(wid, 'no .ar-wid in the row\'s metadata');
     assert.equal(wid.textContent, '@3');
-    // The sub-line ENDS with this row's own id (not merely contains an "@3").
-    assert.match(row.querySelector('.ar-sub').textContent, / · @3$/);
+    // The metadata ENDS with this row's own id (not merely contains an "@3").
+    assert.match(row.querySelector('.ar-meta').textContent, /@3$/);
 });
 
 // The two tooltip branches, each read back EXACTLY (modulo the on-wall suffix):
-// "<label> · @N" heads the tooltip whether or not an ai_title/recap line follows.
-const tooltip = row => row.title.replace(/ — open on the wall$/, '');
+// "<label> · @N" heads the tooltip whether or not an ai_title/recap line follows; CMX-121's
+// state word (gone from the row face) is the line under it.
+const tooltip = row => row.title.replace(/ \(open on the wall\)$/, '');
 
 test('a row WITH an ai_title/recap: the tooltip heads with "<label> · @N", then the extras', () => {
     const row = sidebarRow('alpha');
-    assert.equal(tooltip(row), 'alpha · @3\nRefactor the flux capacitor — Tests green, PR open');
+    assert.equal(tooltip(row), 'alpha · @3\nidle\nRefactor the flux capacitor, Tests green, PR open');
 });
 
-test('a row WITHOUT extras: the tooltip is exactly "<label> · @N" — even for a very long name', () => {
+test('a row WITHOUT extras: the tooltip is exactly "<label> · @N" and its state — even for a very long name', () => {
     const row = sidebarRow(LONG);
-    assert.equal(tooltip(row), `${LONG} · @32`);
+    assert.equal(tooltip(row), `${LONG} · @32\nidle`);
 });
 
 // --- 3. the palette resolves "@N" exactly ---------------------------------------
 
-test('"@3" in the palette puts @3 first — exact, not its prefix-sibling @32', () => {
-    window.chela.openPalette();
-    window.chela._renderPalette('@3');
-    const rows = paletteRows();
+test('"@3" in the palette puts @3 first — exact, not its prefix-sibling @32', async () => {
+    const rows = await paletteRows('@3');
     assert.ok(rows.length, 'no palette rows for "@3"');
     assert.equal(rows[0].title, 'alpha', `first row is ${JSON.stringify(rows[0])}`);
     assert.match(rows[0].sub, /@3$/);
-    window.chela.closePalette();
+    await closePalette();
 });
 
-test('"@3" still lists its prefix-sibling @32 below — even with a very long name — and @3 only once', () => {
-    window.chela.openPalette();
-    window.chela._renderPalette('@3');
-    const rows = paletteRows();
+test('"@3" still lists its prefix-sibling @32 below — even with a very long name — and @3 only once', async () => {
+    const rows = await paletteRows('@3');
     assert.ok(rows.slice(1).some(r => r.sub.endsWith('· @32')), `no @32 row in ${JSON.stringify(rows)}`);
     assert.equal(rows.filter(r => / @3$/.test(r.sub)).length, 1, `@3 listed twice: ${JSON.stringify(rows)}`);
-    window.chela.closePalette();
+    await closePalette();
 });
 
-test('"@32" in the palette resolves to the long-named @32', () => {
-    window.chela.openPalette();
-    window.chela._renderPalette('@32');
-    const rows = paletteRows();
+test('"@32" in the palette resolves to the long-named @32', async () => {
+    const rows = await paletteRows('@32');
     assert.equal(rows[0].sub, 'window · @32');
     assert.match(rows[0].title, /^a-very-long-session-name/);
-    window.chela.closePalette();
+    await closePalette();
 });
 
 test('running the "@3" row focuses @3\'s pane (and only it) — a jump, not a toggle', async () => {
-    window.chela.openPalette();
-    window.chela._renderPalette('@3');
-    const row = paletteRows()[0];
-    window.chela._palRun(row.i);
+    const row = (await paletteRows('@3'))[0];
+    runRow(row);
     await sleep(120);   // focusPaneByWid defers 60ms for the view switch to settle
     const flashed = [...document.querySelectorAll('#term-stage .grid-stack-item')]
         .filter(it => it.querySelector('.pane-flash, .grid-stack-item-content.pane-flash'))
         .map(it => it.getAttribute('gs-id'));
     assert.deepEqual(flashed, ['@3']);
-    assert.ok(!terminals._minimized.has('@3'), 'the jump minimized the pane it should focus');
+    const { minimizedPanes } = await import('../chela/dashboard/frontend/src/shared/store/wall.ts');
+    assert.ok(!minimizedPanes.get().has('@3'), 'the jump minimized the pane it should focus');
 });
 
-test('a query that is not an open window id gets no window row', () => {
-    window.chela.openPalette();
-    window.chela._renderPalette('@99');
-    assert.ok(!paletteRows().some(r => r.sub.startsWith('window ·')));
-    window.chela.closePalette();
+test('a query that is not an open window id gets no window row', async () => {
+    assert.ok(!(await paletteRows('@99')).some(r => r.sub.startsWith('window ·')));
+    await closePalette();
 });
 
 // --- 4. click copies ------------------------------------------------------------
@@ -236,10 +236,8 @@ test('a query that is not an open window id gets no window row', () => {
 test('clicking the footer id copies it and shows a "Copied" toast', async () => {
     clipboard = [];
     const chip = tile('@32').querySelector('.gs-wid');
-    // jsdom runs no inline handlers: assert the wiring, then call what it calls.
-    assert.match(chip.getAttribute('onclick'), /chela\.copyWindowId\(this\)/);
-    window.chela.copyWindowId(chip);
-    await sleep(0);
+    chip.click();   // the footer's own handler (features/tilefoot)
+    await settleToast('@32', 'Copied @32');
     assert.deepEqual(clipboard, ['@32']);
     const toast = tile('@32').querySelector('.gs-wid-toast');
     assert.ok(toast, 'no toast after the copy');
@@ -248,7 +246,7 @@ test('clicking the footer id copies it and shows a "Copied" toast', async () => 
 
 test('the footer chip\'s own tooltip names its window', () => {
     for (const wid of ['@3', '@32']) {
-        assert.equal(tile(wid).querySelector('.gs-wid').title, `tmux window ${wid} — click to copy`);
+        assert.equal(tile(wid).querySelector('.gs-wid').title, `tmux window ${wid}, click to copy`);
     }
 });
 
@@ -281,8 +279,8 @@ async function withLegacyCopy({ clipboardRejects, execResult }, fn) {
 
 test('no clipboard API: the footer chip copies via a textarea + execCommand, then toasts', async () => {
     await withLegacyCopy({ clipboardRejects: false, execResult: true }, async copied => {
-        window.chela.copyWindowId(tile('@32').querySelector('.gs-wid'));
-        await sleep(0);
+        tile('@32').querySelector('.gs-wid').click();
+        await settleToast('@32', 'Copied @32');
         assert.deepEqual(copied, [{ cmd: 'copy', text: '@32' }]);
         assert.equal(document.querySelectorAll('body > textarea').length, 0, 'the copy textarea was left behind');
         assert.equal(tile('@32').querySelector('.gs-wid-toast').textContent, 'Copied @32');
@@ -291,8 +289,8 @@ test('no clipboard API: the footer chip copies via a textarea + execCommand, the
 
 test('a clipboard that refuses falls back to the legacy copy of the SAME id', async () => {
     await withLegacyCopy({ clipboardRejects: true, execResult: true }, async copied => {
-        window.chela.copyWindowId(tile('@3').querySelector('.gs-wid'));
-        await sleep(0);
+        tile('@3').querySelector('.gs-wid').click();
+        await settleToast('@3', 'Copied @3');
         assert.deepEqual(copied, [{ cmd: 'copy', text: '@3' }]);
         assert.equal(tile('@3').querySelector('.gs-wid-toast').textContent, 'Copied @3');
     });
@@ -300,36 +298,32 @@ test('a clipboard that refuses falls back to the legacy copy of the SAME id', as
 
 test('a legacy copy that fails says so — never a false "Copied"', async () => {
     await withLegacyCopy({ clipboardRejects: false, execResult: false }, async () => {
-        window.chela.copyWindowId(tile('@32').querySelector('.gs-wid'));
-        await sleep(0);
+        tile('@32').querySelector('.gs-wid').click();
+        await settleToast('@32', 'Copy failed: @32');
         const toasts = tile('@32').querySelectorAll('.gs-wid-toast');
         assert.equal(toasts.length, 1, 'a second click must replace, not stack, the toast');
-        assert.equal(toasts[0].textContent, 'Copy failed — @32');
+        assert.equal(toasts[0].textContent, 'Copy failed: @32');
     });
 });
 
 // --- the palette reaches a window with no /api/agents row (a plain shell) -------
 
 test('"@N" for an open plain-shell pane (no agent row) still resolves to that window', async () => {
-    terminals._renderedWids.push('@40');
+    terminals.renderedWids.push('@40');
     try {
-        window.chela.openPalette();
-        window.chela._renderPalette('@40');
-        const rows = paletteRows();
+        const rows = await paletteRows('@40');
         assert.ok(rows.length, 'no palette row for the shell\'s "@40"');
         assert.deepEqual({ title: rows[0].title, sub: rows[0].sub }, { title: '@40', sub: 'window · @40' });
-        window.chela.closePalette();
+        await closePalette();
     } finally {
-        terminals._renderedWids.splice(terminals._renderedWids.indexOf('@40'), 1);
+        terminals.renderedWids.splice(terminals.renderedWids.indexOf('@40'), 1);
     }
 });
 
 test('jumping to "@32" from the single-pane view switches to the Wall and focuses @32', async () => {
-    window.chela.setTermMode('single');
+    terminals.setTermMode('single');
     await sleep(0);
-    window.chela.openPalette();
-    window.chela._renderPalette('@32');
-    window.chela._palRun(paletteRows()[0].i);
+    runRow((await paletteRows('@32'))[0]);
     await sleep(120);
     assert.ok(terminals.isWallVisible(), 'the jump left the single-pane view up');
     const flashed = [...document.querySelectorAll('#term-stage .grid-stack-item')]

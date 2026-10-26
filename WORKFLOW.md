@@ -32,12 +32,17 @@ workspace:
   base_branch: dev          # active branch — worktrees fork from dev, PRs target dev
 
 concurrency:
-  max: 2                    # 2 in flight — light dashboard/JS coding agents. NOTE: the
+  max: 3                    # 2026-10-23: back to 3 now that suite admission control (CMX-119, #839)
+                            # caps box-wide suite runs and puts each under a memory ceiling.
+                            # 10-21..23 it was 2: 3 agents + judges running full suites at once got
+                            # hand-ins reaped for memory. Before that: 3 in flight (raised 2026-10-16 once CMX-151 stopped orphaned
+                            # node test trees leaking ~4 GB). Light dashboard/JS agents. NOTE: the
                             # dispatcher's active-count is GLOBAL across workflows, so this
                             # also caps total box-wide agents; lean-alpha stays at max:1 so
                             # two heavy LEAN backtests never run in parallel (memcap/OOM).
 
 agent:
+  standing_rules: docs/AGENT_STANDING_RULES.md   # rendered into {{standing_rules}} below
   # 🧱 #502 §6.4 step 4 — the sandbox TRIAL ran 2026-09-15 and is REVERTED. ⛔ Do not
   # re-enable until #513 lands. What the trial proved: the boundary itself works (the
   # --settings flag reaches the process; ~/.chela and the gh token are denied; the
@@ -93,18 +98,37 @@ agent:
 # tests vs base_branch) unless the agent passes `--oversize-reason`. `size_exclude` = fnmatch
 # globs that do not count (default: docs/*, *.md, changelog.d/*, images, video).
 # hand_in:
-#   max_pr_lines: 300
+#   max_pr_lines: 300   (the code default; this workflow effectively disables it below, Liav 2026-10-20)
 #   size_exclude: ["docs/*", "*.md", "changelog.d/*", "*.png", "*.jpg", "*.gif", "*.svg", "*.mp4", "*.webm"]
+# Liav 2026-10-20: no line cap ("I'm not limiting my model to max lines changes"). Every PR
+# pays a fixed pipeline cost, so a cap only multiplies PRs. The gate has no off switch (an
+# unreadable limit refuses by design), so it is set beyond any real diff. One coherent change
+# per PR is the rule; risk:high core briefs may still ask for small slices.
+hand_in:
+  max_pr_lines: 1000000
+  # ⚖️🪜 CMX-296: a STANDARD-tier hand-in (no core path, docs/ESCALATION_CONTRACT.md) runs this,
+  # then `judge.test_cmd` once — no experiment battery, no sweep, no judge round. Unset = skipped.
+  lint_cmd: uv run ruff check chela tests
 
 judge:
   test_cmd: CHELA_REQUIRE_JS_TESTS=1 uv run pytest -q
-  suite_timeout_seconds: 900
+  # ⏳ 1500 (was 900), Liav 2026-10-17: the full suite now takes ~13 min (8725 tests,
+  # 789s measured on CMX-174's head) and runs past 900s when 2 judges + 3 agents share the
+  # host, so baseline runs were cut off and reported as NOT GREEN. Revisit once CMX-195
+  # (timeout reported as a timeout) and CMX-196 (per-phase judge timings) land.
+  # ⏳ 2400 (was 1500), Liav 2026-10-19: ~9270 tests; a clean full run took 1850s at load
+  # 12-20 on 20 cores (CMX-182's task-finished baseline), so 1500 cut it off twice.
+  suite_timeout_seconds: 2400
   # ⏳ CMX-111: `chela judge sweep` (and the sweep inside `task-finished`) is BUDGETED. It
   # measures conditionals first, then return codes/values, then comparison flips, round-robin
   # across files, and stops at whichever budget runs out first. Every mutation it did not
   # reach is listed as UNRUN — CANNOT VERIFY, never counted as killed, never a pass.
   # 0 or unset = the default. `chela judge sweep --budget-seconds/--max-mutations` override.
   # sweep_budget_seconds: 900   # wall-clock, baseline included (default 900)
+  # ⏳ 2400, Liav 2026-10-19: the full-suite baseline alone now takes ~16 min (9,500+ tests
+  # under fleet load), so a 900s budget measured 0 mutations (CMX-215's hand-in: 0/196).
+  # Stopgap until CMX-283's fast test tier; matches suite_timeout_seconds.
+  sweep_budget_seconds: 2400
   # sweep_max_mutations: 60     # most mutations measured (default 60)
   # ⏳ CMX-141: `chela judge self-check` (and `task-finished --self-check-experiments`) is
   # budgeted the same way: experiments run in file order, each measured with per-mutation test
@@ -112,7 +136,16 @@ judge:
   # not reach are UNRUN — CANNOT VERIFY, never killed. They do NOT refuse the hand-in (the
   # judge re-runs experiments anyway) but task-finished names them. 0 or unset = the default. `chela judge self-check --budget-seconds/--max-experiments`.
   # self_check_budget_seconds: 900  # wall-clock, baseline included (default 900)
+  # ⏳ 2400, Liav 2026-10-19: same reason (CMX-215's self-check measured 0/8 at 900s).
+  self_check_budget_seconds: 2400
   # self_check_max_experiments: 12  # most experiments measured (default 12)
+  # ⚖️🧰 CMX-259: TOOL CONFIG whose guard is the CI job that runs it. A survivor in one of
+  # these is ADVISORY (listed, never blocking) unless a test the PR changes names the file;
+  # their experiments run after code ones. A glob matches the repo-relative path, or the
+  # basename when it has no `/`; `glob:key` scopes a JSON file to one top-level key.
+  # Unset = the list below (chela/toolconfig.py); `[]` = off.
+  # tool_config: ["eslint.config.*", ".dependency-cruiser.*", "tsconfig*.json", "vite.config.*",
+  #               "vitest.config.*", "package.json:scripts", ".github/workflows/*"]
 
 hooks:
   # ⛔ THIS HOOK IS THE JUDGE'S ENVIRONMENT TOO, not just the agent's — `_launch_agent` runs
@@ -190,6 +223,8 @@ repo (a public AGPL-3.0-or-later project: a tmux-driven orchestrator for Claude 
 This run is **{{project_key}}-{{task_number}}** — use it as the PR-title prefix.
 Task ID `{{task_id}}`.
 
+{{standing_rules}}
+
 ## Your workspace
 
 A fresh git worktree at `{{workspace_path}}` on branch `{{branch_name}}` (forked from
@@ -203,6 +238,7 @@ most reasonable default, note the assumption in your PR body, and proceed. Run t
 commands **synchronously** and wait for them — never park work on a prompt for a human. The
 only sanctioned stop is a real blocker (see "If you get stuck" below), stated in your final
 message.
+A classifier or hook denial is final; never relaunch the same action in another mode or wrapper.
 
 ## Done criteria — follow in order
 
@@ -210,7 +246,9 @@ message.
    mirror the style of the existing `skills/chela-setup`, `skills/orchestrate`, and
    `skills/telegram-send` skills.
 2. **Validate — this repo's CI gates on ruff.** Run `uv run ruff check chela tests`
-   (MUST pass — pytest-green is NOT sufficient) and `uv run pytest -q`; fix what you broke.
+   (MUST pass — pytest-green is NOT sufficient) and `timeout 2400 uv run pytest -q`; fix what
+   you broke. ⏳ CMX-274: always run the suite under `timeout <judge.suite_timeout_seconds>`
+   — a Bash call that times out or is backgrounded otherwise leaves pytest running for hours.
    ⛔ **Before writing "pre-existing on {{base_branch}}" or "reproduces on unmodified
    {{base_branch}}" anywhere — in a PR body, a comment, your own reasoning — confirm it on
    a checkout you did not create, not by re-reading this window's own red output.** This
@@ -223,6 +261,10 @@ message.
 3. **⚖️ SELF-VERIFY YOUR GUARDS — this is a CHECK, not a habit, so run it as one.**
    Do these three in order: (a) write the category tests, (b) run the mechanical sweep and
    fix its survivors, (c) self-check your experiments.
+   ⚖️🪜 **CMX-296: a STANDARD-tier diff** (it touches no core path — the dispatcher, the
+   judge, the workflow loader, the sources, the merge/containment machinery, a `CLAUDE.md`
+   or `AGENTS.md`, or an always-human file; `chela/risktier.py`) gets no judge round: (b) and (c) are optional, and
+   `task-finished` runs `hand_in.lint_cmd` plus ONE full suite instead of the battery. Do (a).
 
    **(a) 🧭 GUARD-CATEGORY CHECKLIST — walk your OWN diff before hand-in.** Cover each whole
    CATEGORY up front, not one survivor per judge round (CMX-87 took 13 rounds that way;
@@ -268,6 +310,14 @@ message.
    corruption instead of hand-editing and eyeballing it. **This is the exact check the judge will
    run — catch your own decoration first, or the PR comes straight back.** ⛔ **Keep the
    experiments JSON file** (do not delete it after step 3) — step 6 needs its path.
+   **(d) 🔎 Review your own diff (CMX-209).** Run Claude Code's `/code-review` on your diff vs
+   `origin/{{base_branch}}` (effort medium). Fix each **Important** finding, or dismiss it with
+   a one-line reason. **Nits**: optional. **Pre-existing** (not introduced by this diff): list,
+   don't fix. Your PR body (step 5) gets a `## Review` section — counts first ("3 findings:
+   2 fixed, 1 dismissed"; "0 findings" said plainly), then one line per finding (`file:line`,
+   verdict, reason). `task-finished` REFUSES a code PR whose body has none (a prose-only PR is
+   exempt). Only if no review can run, pass `--no-review-reason '<why>'` — recorded on the
+   run, shown to the judge and in your PR body.
 4. **Commit in the worktree.** Stage only files you intentionally changed
    (`git add <paths>` — never `git add -A`). Verify with `git status` +
    `git diff --cached --stat` before committing.
@@ -305,11 +355,9 @@ message.
      It is recorded on the run, shown to the judge and appended to your PR body — the judge
      treats it as a claim to test, so a wrong one comes straight back. A note for a line
      that did not survive is refused.
-   - **📏 CMX-126: `task-finished` measures your diff first** (code + tests vs `dev`; docs,
-     media and changelog excluded) and REFUSES it over `hand_in.max_pr_lines` (300) before
-     any sweep runs. Split it into ≤300-line PRs. Only a diff that truly cannot be split
-     may pass `--oversize-reason '<why>'` — recorded on the run, shown to the judge and in
-     your PR body.
+   - **📏 PR size: no line cap** (Liav 2026-10-20). Ship ONE coherent change per PR, as big
+     as that change is. Don't split a task to fit a number. If your brief (a `risk:high` core
+     task) asks for small slices, follow the brief.
    - **Optional: `--handoff "<note>"`** — a short note for your reviewer (what changed, what
      to look at first, what you assumed). It is shown in the orchestrator's inbox notice and
      on the Dispatch board. Informational only — it never gates anything.

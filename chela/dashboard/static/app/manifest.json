@@ -1,0 +1,23 @@
+{
+  "../static/fonts/Geist-Variable.woff2": {
+    "file": "assets/Geist-Variable-DPGgOCY9.woff2",
+    "src": "../static/fonts/Geist-Variable.woff2"
+  },
+  "../static/fonts/Heebo.woff2": {
+    "file": "assets/Heebo-CZLdcoYQ.woff2",
+    "src": "../static/fonts/Heebo.woff2"
+  },
+  "src/main.tsx": {
+    "file": "assets/main-vGkdtCIt.js",
+    "name": "main",
+    "src": "src/main.tsx",
+    "isEntry": true,
+    "css": [
+      "assets/main-CQW6yjFU.css"
+    ],
+    "assets": [
+      "assets/Geist-Variable-DPGgOCY9.woff2",
+      "assets/Heebo-CZLdcoYQ.woff2"
+    ]
+  }
+}

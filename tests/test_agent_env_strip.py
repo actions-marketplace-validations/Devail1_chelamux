@@ -23,6 +23,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from chela.judge import judge_worktree_path
 from chela.workflow import WorkflowDef
 
 SENTINEL = "CHELA_CMX45_SENTINEL"
@@ -35,7 +36,8 @@ _REAL_RUN = subprocess.run
 def _wf(tmp_path):
     return WorkflowDef(
         path=tmp_path / "WORKFLOW.md",
-        config={"project_key": "CMX", "agent": {}},
+        config={"project_key": "CMX", "agent": {},
+                "workspace": {"root": str(tmp_path / "wts")}},
         prompt_template="go {{workspace_path}}",
     )
 
@@ -195,7 +197,7 @@ def test_non_shell_names_are_scrubbed_from_the_tmux_global_table():
     so the only place to drop it is the tmux server's global table before the window opens."""
     from chela import envutil
 
-    out = "chela-daemon=x\nPATH=/bin\nstatus=online\n"
+    out = "chela-daemon=x\nPATH=/bin\nmy_setting=1\n"
     assert envutil.tmux_scrub_names(out, forward=frozenset()) == ["chela-daemon"]
 
 
@@ -241,6 +243,9 @@ def test_spawn_judge_strips_notify_url_too(monkeypatch, tmp_path):
 
     monkeypatch.setattr(dispatcher, "detached_worktree",
                          lambda *_a, **_k: (tmp_path / "judge-abc123", True))
+    # 🎲 CMX-257: the judge slot (worktree + lock) is THIS test's — never the shared
+    # `~/.chela/worktrees/default` a concurrent suite's judge lock can be holding.
+    assert judge_worktree_path(wf, "abc123").is_relative_to(tmp_path.resolve())
     assert dispatcher._spawn_judge(wf, row, "deadbeef", conn) is True
 
     unset_idx = next(i for i, line in enumerate(sent) if line.startswith("unset"))
@@ -286,3 +291,16 @@ def test_the_suite_itself_cannot_push_a_real_notification(monkeypatch):
         f"send() did not raise the fence's escape (got {type(excinfo.value).__name__}) — "
         "if it returned False instead, the guard derives from Exception and send() ate it"
     )
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs a real bash")
+@pytest.mark.parametrize("role", ["coding", "judge"])
+def test_the_agent_pane_is_stamped_as_a_dispatched_run(monkeypatch, tmp_path, role):
+    """🪆 CMX-190: the nested-`claude` gate binds only panes carrying `CHELA_RUN_ID` — the
+    agent AND the judge must inherit it (and its role), exported after the strip."""
+    import chela.dispatcher as dispatcher
+
+    sent = _launch(monkeypatch, dispatcher, tmp_path, role=role)
+    agent_env = _run_in_pane(sent, {"PATH": os.environ["PATH"], "HOME": str(tmp_path)})
+    assert agent_env.get("CHELA_RUN_ID") == "t1"
+    assert agent_env.get("CHELA_RUN_ROLE") == role

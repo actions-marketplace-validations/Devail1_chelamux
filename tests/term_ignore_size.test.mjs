@@ -9,7 +9,7 @@
 //
 // This runs the REAL terminals.js in jsdom (like tests/wall.test.mjs / walldock.test.mjs):
 // the real `renderTerminals`, the real visibilitychange listener, the real `minimizePane`
-// / `toggleDockChip` (via the same `window.chela` surface the pane buttons call). Nothing
+// / the dock chip's restore (a real click on each). Nothing
 // here greps the source — every assertion is on an actual POST the browser would send.
 //
 // Two properties:
@@ -21,9 +21,9 @@
 //      and coming back / restoring reports watching:true — WITHOUT reloading the pane
 //      (no iframe src reassignment, no lost scrollback).
 //
-// Run: node --test tests/term_ignore_size.test.mjs (pytest runs it via
+// Run: pnpm exec vitest run tests/term_ignore_size.test.mjs (pytest runs it via
 // tests/test_js_suites.py; needs `pnpm install` for jsdom).
-import { before, beforeEach, test } from 'node:test';
+import { beforeAll, beforeEach, test } from 'vitest';
 import assert from 'node:assert/strict';
 import { JSDOM } from 'jsdom';   // needs `pnpm install` — tests/test_js_suites.py enforces it
 
@@ -34,7 +34,6 @@ const PANEL = `
   <select id="term-agent"></select>
   <span id="term-wall-grid"><span id="term-grid-presets"></span><button id="term-lock-btn"></button></span>
   <button id="term-new-shell"></button>
-  <div id="term-switcher"></div>
   <div id="term-stage"></div>
   <div id="term-min-dock"></div>
   <div id="term-bar" class="kb-collapsed"><button class="kb-toggle" id="kb-toggle"></button><div class="kb-body" id="kb-body"></div></div>
@@ -75,13 +74,12 @@ function fakeGridStack() {
     return { init: () => grid };
 }
 
-let terminals, util;
+let terminals, agentsStore, viewStore;
 let visState = 'visible';
 
-before(async () => {
+beforeAll(async () => {
     const dom = new JSDOM(`<!doctype html><html><body>${PANEL}</body></html>`,
         { url: 'http://localhost:5005/', pretendToBeVisual: true });
-    dom.window.TERMINALS_ENABLED = true;
     for (const k of ['window', 'document', 'localStorage', 'navigator', 'HTMLElement',
         'Element', 'Node', 'Event', 'MouseEvent', 'KeyboardEvent', 'CustomEvent',
         'getComputedStyle', 'requestAnimationFrame', 'cancelAnimationFrame']) {
@@ -105,11 +103,12 @@ before(async () => {
     Object.defineProperty(document, 'hidden', { get: () => visState === 'hidden', configurable: true });
 
     globalThis.setInterval = () => 0;
-    await import('../chela/dashboard/static/js/main.js');
-    util = await import('../chela/dashboard/static/js/util.js');
-    terminals = await import('../chela/dashboard/static/js/terminals.js');
-    util.setCurrentTab('terminals');
-    util.setAgentsCache(AGENTS);
+    (await import('../chela/dashboard/frontend/src/boot.ts')).start();
+    ({ agents: agentsStore } = await import('../chela/dashboard/frontend/src/shared/store/agents.ts'));
+    ({ view: viewStore } = await import('../chela/dashboard/frontend/src/shared/store/view.ts'));
+    terminals = await import('../chela/dashboard/frontend/src/features/wall/index.ts');
+    viewStore.set('terminals');
+    agentsStore.set(AGENTS);
     await terminals.renderTerminals();
 });
 
@@ -160,7 +159,7 @@ test('foregrounding the tab again reports watching:true', async () => {
 test('minimizing a tile to the dock reports watching:false for THAT wid only', async () => {
     const btn = document.querySelector(
         '#term-stage .grid-stack-item[gs-id="@1"] .gs-min-btn');
-    window.chela.termMinFor(btn);
+    btn.click();
     await Promise.resolve();
 
     const calls = watchCalls.filter(c => c.wid === '@1');
@@ -172,11 +171,11 @@ test('minimizing a tile to the dock reports watching:false for THAT wid only', a
 test('restoring a docked tile reports watching:true again', async () => {
     const btn = document.querySelector(
         '#term-stage .grid-stack-item[gs-id="@1"] .gs-min-btn');
-    window.chela.termMinFor(btn);
+    btn.click();
     await Promise.resolve();
     watchCalls = [];
 
-    window.chela.toggleDockChip('@1');
+    document.querySelector('#term-min-dock .min-chip[data-wid="@1"]').click();   // the dock's chip
     await Promise.resolve();
 
     const calls = watchCalls.filter(c => c.wid === '@1');

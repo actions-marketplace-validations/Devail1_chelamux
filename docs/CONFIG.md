@@ -1,10 +1,10 @@
-# Config — the environment is the single source of truth
+# Config: the environment is the single source of truth
 
 chela is configured by environment variables (the full table is in the
 [the docs site](https://chela.pages.dev/docs#config)). This document is about *where those variables
 are written down*, which is a separate question, and one chela got wrong.
 
-**One file: `$CHELA_DIR/chela.env`.** Everything reads it — `chela` itself sources it at
+**One file: `$CHELA_DIR/chela.env`.** Everything reads it. `chela` itself sources it at
 import (`chela/config.py`), and `scripts/run-chela.sh` sources it for anything a process
 manager starts. Nothing else may carry a copy.
 
@@ -15,17 +15,17 @@ chela doctor                                 # does what's running still match t
 
 ## Precedence
 
-1. **An exported variable** — `CHELA_TMUX_SESSION=other chela status` still works. An
+1. **An exported variable**: `CHELA_TMUX_SESSION=other chela status` still works. An
    override has to stay possible.
-2. **`$CHELA_DIR/chela.env`** — the source of truth for an install.
-3. **The built-in defaults** — chela runs correctly from a plain shell with nothing
+2. **`$CHELA_DIR/chela.env`**, the source of truth for an install.
+3. **The built-in defaults**: chela runs correctly from a plain shell with nothing
    exported and no env file at all. A fresh install is not a broken one.
 
 Python (`os.environ.setdefault`) and shell (`scripts/chela-env.sh`) implement exactly this
 order, so a value resolves the same whichever reads it.
 
 Two variables are about the file itself and can only come from the environment:
-`CHELA_DIR` (which is how the file is *found* — it cannot relocate itself) and
+`CHELA_DIR` (which is how the file is *found*, since it cannot relocate itself) and
 `CHELA_ENV_FILE` (a different path; empty disables the file, which is what the test suite
 does so a developer's real config can never leak into a unit test).
 
@@ -34,7 +34,7 @@ does so a developer's real config can never leak into a unit test).
 Because config in two places drifts, and the drift is silent.
 
 chela's `ecosystem.config.js` duplicated `CHELA_TMUX_SESSION` into three `env:` blocks.
-When the tmux session was renamed, all three still named the old one — for a day. Nothing
+When the tmux session was renamed, all three still named the old one, for a day. Nothing
 broke, because the *running* processes had been fixed by hand; a clean `pm2 start` would
 have brought the entire fleet up against a session that no longer existed.
 
@@ -44,7 +44,7 @@ it carries a pointer to the thing that does.
 
 ### Migrating an ecosystem file that has `env:` blocks
 
-`pm2 restart --update-env` **merges** the environment — it will not remove a variable you
+`pm2 restart --update-env` **merges** the environment; it will not remove a variable you
 deleted from the file. Clearing one really does require:
 
 ```bash
@@ -54,8 +54,24 @@ pm2 start ~/.chela/ecosystem.config.js && pm2 save
 
 and it must be run from a shell that is **not inside tmux**: `config.current_session()`
 falls back to deriving the session from `$TMUX_PANE`, so a leaked pane makes a service
-silently target whatever session that pane was in — a `webterm_*` *mirror*, in the case
+silently target whatever session that pane was in: a `webterm_*` *mirror*, in the case
 that bit us. `run-chela.sh` strips `TMUX`/`TMUX_PANE` for exactly this reason.
+
+Nor from a shell that descends from a PM2-run service: an agent window chela spawned
+before CMX-191, or one the daemon's tmux server was born under. PM2 exports each process's
+app config into its environment (`args`, `exec_mode`, `name`, `status`, `pm_id`, …), and a
+`pm2 start` reads those env vars **over** the ecosystem file: an inherited empty `args=`
+starts every service with no subcommand, so each prints `chela`'s help and exits.
+`chela doctor` warns (`process.pm2_app_env`) when the current shell carries them. When in
+doubt, run PM2 from a clean environment:
+
+```bash
+env -i HOME="$HOME" PATH="$PATH" pm2 start ~/.chela/ecosystem.config.js
+```
+
+chela now strips those keys from every window and child it spawns
+(`envutil.PM2_APP_ENV_KEYS`), but a window that is already running keeps the env it was
+born with.
 
 ## The dashboard port, and why it is the case that proves the rule
 
@@ -65,7 +81,7 @@ renders that manifest from a **different process** than the dashboard.
 
 `chela dashboard --port 5005` put the port in *one process's* `os.environ`. `chela plugin`
 saw nothing, fell back to the default 5001, and wrote `http://127.0.0.1:5001/hooks/…` into
-the manifest. Every hook then POSTed into a closed socket — and a hook that cannot reach
+the manifest. Every hook then POSTed into a closed socket, and a hook that cannot reach
 the daemon **fails open by design** (it must never wedge a live agent), so nothing
 surfaced. The whole feature did nothing, silently, for a day.
 
@@ -74,8 +90,8 @@ Two things fix it:
 * **The env file is where the port lives.** The dashboard binds `CHELA_DASHBOARD_PORT`.
   `--port` still works as a one-off override, but it is then *not* the source of truth.
 * **The dashboard publishes the port it actually bound** to `$CHELA_DIR/dashboard.port`
-  at startup. `config.live_dashboard_port()` — what `chela plugin` renders, and what
-  `chela doctor` checks — prefers that over the configured value, so the manifest names a
+  at startup. `config.live_dashboard_port()`, which `chela plugin` renders, and what
+  `chela doctor` checks, prefers that over the configured value, so the manifest names a
   port something is really listening on **even when someone passes `--port` by hand**. A
   file whose pid is gone is treated as no dashboard at all, so a crashed instance cannot
   keep pointing hooks at a dead port.
@@ -89,7 +105,7 @@ The dispatcher was off for nine hours and every surface said healthy: `chela doc
 all-green, the daemon logged nothing, the dashboard showed a workflow. `CHELA_DISPATCH_WORKFLOWS`
 had gone missing from the env file, so `DISPATCH_WORKFLOWS` was `[]`, so the daemon's
 `if DISPATCH_WORKFLOWS:` guard skipped the dispatcher **and the reconcile loop that rides
-the same tick** — no task was ever claimed, and a merged PR's run sat in `awaiting_review`
+the same tick**: no task was ever claimed, and a merged PR's run sat in `awaiting_review`
 forever, holding the only concurrency slot. **The single tell was the ABSENCE of a log
 line. Nobody reads an absence.** Doctor was green because the running environment agreed
 with the env file: they did agree, and they were both wrong. *Checking that two copies of
@@ -97,21 +113,21 @@ a fact match is not checking the fact.*
 
 So chela treats "what the daemon can DO" as a first-class, observable thing:
 
-* **The daemon announces every capability at startup — ON *and* OFF** (`chela/capabilities.py`).
+* **The daemon announces every capability at startup, ON *and* OFF** (`chela/capabilities.py`).
   Anything behind an `if <config>:` guard says which it is; the ones whose absence is a
   foot-gun (dispatch, and the reconciliation coupled to it) say so at **WARNING**, naming
   the variable and the fix. An empty config stays a *valid* state; it stops being an
-  *invisible* one. Startup only — a per-tick line would bury the log by morning.
-* **The daemon publishes what it really came up with** to `$CHELA_DIR/daemon.json` — the
+  *invisible* one. It fires at startup only, since a per-tick line would bury the log by morning.
+* **The daemon publishes what it really came up with** to `$CHELA_DIR/daemon.json`, the
   same pattern as `dashboard.port`, and for the same reason: `chela doctor` and the
   dashboard are **different processes**, and their env is not evidence about the daemon's.
   A file whose pid is gone is no daemon at all.
 * **`chela doctor` asserts the capability, not the config**: the dispatcher is on (a
   `WARN`, never a silent pass, when it is not), each configured `WORKFLOW.md` exists and
-  parses, its tracker file is there, and the daemon *that is actually running* has it on —
+  parses, its tracker file is there, and the daemon *that is actually running* has it on,
   an ERROR if the running daemon and the config disagree. With no daemon running, doctor
   says out loud that it is **inferring** from config rather than observing.
-* **The dashboard's Settings drawer shows it too** — a *Daemon* row, and a *Work dispatcher*
+* **The dashboard's Settings drawer shows it too**: a *Daemon* row, and a *Work dispatcher*
   row that reads `Off` when the running daemon has it off, however many `WORKFLOW.md` files
   are lying around on disk.
 
@@ -125,14 +141,14 @@ The same bug landed nine times: **a fact lives in two places across a process bo
 the checker reads the copy it OWNS instead of the copy that GOVERNS BEHAVIOUR.** The plugin
 we rendered said port 5001 while the dashboard had *bound* 5005; the env file said dispatch
 ON while the *daemon* had come up OFF; the rendered manifest said `timeout: 120` while the
-*installed* one — the only one agents load — still said `2`; `pytest -q` said 980 green
+*installed* one (the only one agents load) still said `2`; `pytest -q` said 980 green
 while three JS suites were executed by nothing and one of them was red. Every one of them
 was green everywhere while the feature was dead.
 
 `chela/runtime_truth.py` is the answer: **one entry per fact chela depends on**, naming both
-halves — `declared_by` (where *we* write it) and `owned_by` (who actually governs the
+halves, `declared_by` (where *we* write it) and `owned_by` (who actually governs the
 behaviour: the bound socket, the running daemon, Claude Code's plugin cache, tmux, the
-pytest collector) — plus a `read_back` that asks the owner. Two rules, in code:
+pytest collector), plus a `read_back` that asks the owner. Two rules, in code:
 
 * **A fact chela owns: the process that ACTS publishes what it actually DID.** Not what it
   was configured to do (`dashboard.port`, `daemon.json`, the run row's `window_id`). Every
@@ -140,18 +156,36 @@ pytest collector) — plus a `read_back` that asks the owner. Two rules, in code
 * **A fact another system owns: read back from the owner.** You cannot infer the installed
   plugin manifest, or whether a tmux window is still alive, from your own copy. You ask.
 
-**`chela doctor` is generated from it** — for every fact: read the declared value, read back
+**`chela doctor` is generated from it**: for every fact: read the declared value, read back
 the owned value, compare, report. There is no hand-written check left, because every
 hand-written check acquires a private blind spot (the drift check that compared only the
 *first* hook read green on a stale manifest; the test wrapper that named *one* `.mjs` file
 left three suites unrun). An enumerated check structurally cannot. **An owner that cannot be
-read is reported LOUDLY as `CANNOT VERIFY` — never as a silent pass:** a doctor that goes
+read is reported LOUDLY as `CANNOT VERIFY`, never as a silent pass:** a doctor that goes
 green because it could not look is the bug, one level up.
 
 The registry is an artifact too, so it is fenced by the bar it exists to enforce: every
 entry must have a test in `tests/test_runtime_truth.py` that **corrupts the owned value and
 asserts doctor goes red, naming the fact**. A check that has never been seen to go red is
 not a check.
+
+## Letting the orchestrator pause the fleet
+
+`chela dispatch --pause --all` interrupts dispatched agents for you, so an orchestrator
+session does not have to send keys or signals itself (Claude Code's auto-mode classifier
+may deny those). Allow the command in the orchestrator's `.claude/settings.json`:
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "Bash(chela dispatch --pause:*)",
+      "Bash(chela dispatch --resume:*)",
+      "Bash(chela dispatch --hold-status:*)"
+    ]
+  }
+}
+```
 
 ## `chela doctor`
 
@@ -163,19 +197,19 @@ $ chela doctor
 ✗ dashboard is LISTENING on 5098, but the config says 5099
     A --port flag beats the env, and the env is supposed to be the source of truth. …
 ✓ rendered plugin posts to port 5098
-✗ the INSTALLED plugin disagrees with the one chela renders — THE HOOKS THAT RUN ARE STALE
+✗ the INSTALLED plugin disagrees with the one chela renders: THE HOOKS THAT RUN ARE STALE
     Agents do not read the manifest chela renders. They read: …
-✓ daemon running (pid 4242, session chela) — capabilities read from it, not from config
+✓ daemon running (pid 4242, session chela): capabilities read from it, not from config
 ✓ Scheduler: ON
 ! Work dispatcher: OFF
-    CHELA_DISPATCH_WORKFLOWS is empty — NO task will ever be claimed from a tracker — fix: …
+    CHELA_DISPATCH_WORKFLOWS is empty, so NO task will ever be claimed from a tracker; fix: …
 ! Run reconciliation: OFF
-    OFF FOR THE SAME REASON — reconciliation rides the dispatch tick, so a merged PR's run
+    OFF FOR THE SAME REASON: reconciliation rides the dispatch tick, so a merged PR's run
     sits in `awaiting_review` forever, holding its concurrency slot
 ! run CMX-70 claims window @31, but tmux has no such window
 ✓ pytest executes all 6 JS suite(s)
 
-2 problem(s) — see above.
+2 problem(s), see above.
 ```
 
 Every line is one registry fact, asked of its owner: the env file vs the environment the
@@ -184,15 +218,15 @@ renders vs **the one Claude Code installed and agents load**, this shell's confi
 capabilities the **running** daemon published, each `WORKFLOW.md` and the tracker it claims
 to read, the dispatch hold, the tmux session and the windows in-flight runs claim, and the
 `.test.mjs` suites the **pytest collector** actually executes. Exit code `1` means something
-is broken **right now**; warnings are differences worth knowing about — including a
+is broken **right now**; warnings are differences worth knowing about, including a
 subsystem that is off, which is never reported as green.
 
 Adding a fact is one entry in `runtime_truth.facts()` (plus its red test). No new doctor
-code, and — the point — no way to forget the check.
+code, and (the point) no way to forget the check.
 
 ## Secrets
 
-`chela.env` is the pasteable file — you diff it, template it, copy it from
+`chela.env` is the pasteable file: you diff it, template it, copy it from
 `examples/chela.env`. A bot token has no business in it.
 
 Secrets go in **`$CHELA_DIR/secrets.env`** (`chmod 600`), which `run-chela.sh` sources
@@ -203,6 +237,33 @@ umask 077 && printf 'TELEGRAM_BOT_TOKEN=…\nTELEGRAM_CHAT_ID=…\n' > ~/.chela/
 ```
 
 Neither file is ever committed. Both live under `$CHELA_DIR`, which is not the repo.
+
+### Telegram: who may drive your agents
+
+`TELEGRAM_CHAT_ID` only fixes *which chat* the bridge listens to. Every member of that
+group could otherwise type into every bound agent, send it keys, answer its permission
+prompts and request `/screenshot`. Name the people allowed to do that:
+
+```bash
+# chela.env or secrets.env — numeric Telegram user ids, comma separated
+CHELA_TELEGRAM_ALLOWED_USERS=123456789
+```
+
+To find your id, message `@userinfobot`. Then `pm2 restart chela-telegram`. Every inbound
+update (text, `/commands`, button taps, photos and documents) whose sender is not on the
+list is dropped before any handler runs. It is never forwarded or downloaded and never
+answered, so the sender gets no sign the bot is listening. The drop is logged with the
+sender's id and a short hash of the text (never the text itself), at most once a minute
+per sender.
+
+**Unset, the bridge keeps the old chat-only behaviour**, so upgrading doesn't lock you
+out. It logs a loud warning at start-up, and `chela doctor` reports
+`telegram.sender_allowlist` as a warning until the list is set. A non-numeric entry (an
+`@username`) is ignored and named by doctor.
+
+The bridge resolves the variable the same way `chela doctor` does: the process environment
+wins, then `chela.env`, then `secrets.env`. So doctor's verdict holds however
+`chela-telegram` was started, with or without `scripts/chela-env.sh`.
 
 ### Secrets stay out of the children chela launches
 
@@ -220,21 +281,21 @@ another one, for example a token an `after_done` hook needs, name it in
 
 An agent or judge **window** gets less than that: its pane keeps only an allowlist (shell
 basics, terminal, locale, chela's own `CHELA_DIR` / `CHELA_TMUX_SESSION` / `CHELA_WID`, and the
-credentials above) and every other inherited name — including the rest of your `chela.env`
-settings — is unset before the agent starts. A name in `CHELA_CHILD_ENV_FORWARD` is kept there
+credentials above) and every other inherited name, including the rest of your `chela.env`
+settings, is unset before the agent starts. A name in `CHELA_CHILD_ENV_FORWARD` is kept there
 too, except `CHELA_NOTIFY_URL`. See
 [TRUST_AND_APPROVAL_POSTURE.md §2](TRUST_AND_APPROVAL_POSTURE.md#2-what-a-dispatched-agent-can-do-execution--sandbox).
 
 ### Don't clone someone else's `chela.env`
 
-`chela.env` carries no secrets, but it does carry **per-install** values — start from
+`chela.env` carries no secrets, but it does carry **per-install** values, so start from
 `examples/chela.env` and set your own rather than copying another machine's verbatim:
 
-- **`CHELA_NOTIFY_URL`** is *yours*. An `ntfy.sh` topic is **unauthenticated** — anyone who
-  knows the topic name can both read and publish to it — so it is effectively a shared
+- **`CHELA_NOTIFY_URL`** is *yours*. An `ntfy.sh` topic is **unauthenticated**: anyone who
+  knows the topic name can both read and publish to it, so it is effectively a shared
   secret. Inherit someone else's and your update / needs-input pings land on *their* phone
   (and they can read yours). Pick your own topic (`ntfy.sh/chela-<you>-<random>`).
-- **Paths** (`CHELA_DISPATCH_WORKFLOWS`, …) are absolute and machine-specific — another
+- **Paths** (`CHELA_DISPATCH_WORKFLOWS`, …) are absolute and machine-specific, so another
   install's point at directories you don't have.
 - `CHELA_COLLAB_RELAY` is the one value that is *meant* to be shared: two installs that want
   to share terminal sessions point at the **same** relay on purpose.

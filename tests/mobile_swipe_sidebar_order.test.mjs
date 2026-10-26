@@ -1,0 +1,223 @@
+// CMX-165 / CMX-202 - THE PHONE'S HEADER SWIPE FOLLOWS THE SIDEBAR'S ORDER.
+//
+// Liav, 2026-10-16 (phone screenshot): the pill strip over the phone's single terminal
+// listed sessions in the pane list's order (/api/agents), not the sidebar's. The sidebar's order
+// (group order, Move up / Move down, custom groups, each group's sort) is the one order;
+// the sidebar controller exposes it (sidebarOrder) and the Wall steps the header swipe by it.
+// CMX-202 removed the pill strip (the sidebar is the phone's switcher), so the order is
+// read off the swipe: from the last session, swipe left once per session and record what
+// opens.
+//
+// The real dashboard boots in jsdom at phone width, in single mode; the sidebar renders off
+// the fake layout server (js_helpers/fake_archive.mjs). The live panes (the agents store) are
+// deliberately in a DIFFERENT order from every layout below, so a swipe that follows them
+// fails each test.
+//
+// Run: pnpm exec vitest run tests/mobile_swipe_sidebar_order.test.mjs  (pytest runs it via tests/test_js_suites.py)
+import { beforeAll, beforeEach, test } from 'vitest';
+import assert from 'node:assert/strict';
+import { APP_BODY, bootDashboardDom, flush, SIDEBAR, WALL, NAV } from './js_helpers/dashboard_dom.mjs';
+import { fakeArchiveServer } from './js_helpers/fake_archive.mjs';
+
+const BASE = [
+    { name: 'a', window_id: '@201', online: true, claude_running: true, session_status: 'idle', cwd: '/srv/code/alpha' },
+    { name: 'b', window_id: '@202', online: true, claude_running: true, session_status: 'idle', cwd: '/srv/code/beta' },
+    { name: 'c', window_id: '@203', online: true, claude_running: true, session_status: 'idle', cwd: '/srv/code/gamma' },
+];
+// A dispatched run, its JUDGE window listed BEFORE its agent window: the run's ONE row is
+// drawn from its primary window (the agent, @204), so the agent's window must lead the judge's.
+const runRows = (status = 'running') => [
+    { name: 'j', window_id: '@205', online: true, claude_running: false, session_status: 'idle', cwd: '/srv/code/delta',
+        dispatched: true, run: { task_id: 'CMX-7', status, role: 'judge' } },
+    { name: 'w', window_id: '@204', online: true, claude_running: status === 'running', session_status: 'idle', cwd: '/srv/code/delta',
+        dispatched: true, run: { task_id: 'CMX-7', status, role: 'agent' } },
+];
+let ROWS = BASE;
+// The panes' order: none of the layouts below. @299, @298: windows the sidebar has not
+// drawn yet (its last render did not have them), so the tail must read @299, @298. A run window
+// that falls out of the sidebar order lands between them, where no expected strip has it.
+const OPTIONS = ['@299', '@205', '@204', '@203', '@202', '@201', '@298'];
+const TAIL = ['@299', '@298'];
+
+// The REAL page (the shell), so a switch's renderTerminals runs on the shipped markup. Its
+// live panes are re-seeded with OPTIONS before each step.
+// The agents store holds a pane for every listed window plus the two undrawn ones, in
+// OPTIONS' order (publishing it does not redraw the sidebar); useRows() swaps the /api/agents
+// answer and re-seeds the store to match, and swipe() puts /api/agents' rows back after.
+const panes = () => {
+    const listed = new Set([...ROWS.map(a => a.window_id), ...TAIL]);
+    return OPTIONS.filter(w => listed.has(w));
+};
+const seedOptions = () => {
+    window.chelaBridge.agents.set(panes().map(w => ROWS.find(a => a.window_id === w) || { name: w, window_id: w, online: true }));
+};
+const useRows = rows => { ROWS = rows; seedOptions(); };
+
+const server = fakeArchiveServer(() => ROWS);
+const json = body => Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(body) });
+function fetchImpl(url, opts) {
+    const faked = server.handle(url, opts);
+    const u = String(url);
+    const body = faked !== undefined ? faked
+        : /\/api\/agents$/.test(u) ? ROWS
+        : /\/api\/agents\/context/.test(u) ? []
+        : /\/api\/summary/.test(u) ? [] : {};
+    return json(body);
+}
+
+let nav, terminals, sidebar;
+beforeAll(async () => {
+    const booted = await bootDashboardDom({
+        body: APP_BODY, phone: true, canvasStub: true, fetchImpl,
+        seedLocalStorage: { pc_term_mode: 'single' },
+        extraModules: [NAV, WALL, SIDEBAR],
+    });
+    nav = booted.modules.nav;
+    sidebar = booted.modules.sidebar;
+    terminals = booted.modules.terminals;
+    globalThis.fetch = fetchImpl;
+    await settle();   // the boot's own refresh lands before any test seeds the options
+});
+
+async function settle() { for (let i = 0; i < 8; i++) await flush(); }
+async function setLayout(fields) {
+    server.handle('/api/sidebar/layout', { method: 'POST', body: JSON.stringify(fields) });
+    await sidebar.refreshSidebar();
+    await settle();
+}
+// The swipe's full cycle: what the swipe CHOSE is the open pane right after the step (a
+// switch sets it before its render). The panes are re-seeded before every step. Starting on
+// @298 (always last), N steps open every session once, in order.
+function swipe() {
+    const n = panes().length;
+    let cur = '@298';
+    const seen = [];
+    for (let i = 0; i < n; i++) {
+        seedOptions();
+        void terminals.showPane(cur);
+        terminals.stepAgentMobile(1);
+        cur = terminals.activePane();
+        seen.push(cur);
+    }
+    window.chelaBridge.agents.set(ROWS);   // the undrawn windows leave: a sidebar redraw must not draw them
+    return seen;
+}
+const groupKeys = () => [...document.querySelectorAll('#sidebar-agents .side-group')].map(g => g.dataset.g);
+
+beforeEach(async () => {
+    server.reset();
+    useRows(BASE);
+    void terminals.showPane('@201');
+    await setLayout({ order: [], custom: { groups: [], assign: {} }, view: { groupBy: 'folder' } });
+});
+
+test('custom groups: the swipe goes in the sidebar order, not the options order', async () => {
+    await setLayout({
+        view: { groupBy: 'custom' },
+        custom: { groups: [{ id: 'x', name: 'First' }, { id: 'y', name: 'Second' }], assign: { 'w:@202': 'x', 'w:@201': 'y' } },
+    });
+    // sidebar: First [b], Second [a], Ungrouped [c]
+    assert.deepEqual(sidebar.sidebarOrder(), ['@202', '@201', '@203']);
+    assert.deepEqual(swipe(), ['@202', '@201', '@203', ...TAIL]);
+    assert.notDeepEqual(swipe(), panes(), 'the swipe must not follow the pane list');
+});
+
+test('a group order saved in the layout orders the swipe', async () => {
+    await setLayout({ order: ['/srv/code/gamma', '/srv/code/alpha', '/srv/code/beta'] });
+    assert.deepEqual(groupKeys(), ['/srv/code/gamma', '/srv/code/alpha', '/srv/code/beta']);
+    assert.deepEqual(swipe(), ['@203', '@201', '@202', ...TAIL]);
+});
+
+test('wids the sidebar has not drawn are appended at the END, in their own order, never dropped', async () => {
+    assert.deepEqual(sidebar.sidebarOrder(), ['@201', '@202', '@203']);
+    assert.deepEqual(swipe(), ['@201', '@202', '@203', ...TAIL]);
+});
+
+test('Move up in the sidebar re-orders the swipe on the next render, no reload', async () => {
+    assert.deepEqual(swipe(), ['@201', '@202', '@203', ...TAIL]);
+    sidebar.groupMenuAction('/srv/code/gamma', 'up');
+    await settle();
+    assert.deepEqual(groupKeys(), ['/srv/code/alpha', '/srv/code/gamma', '/srv/code/beta']);
+    assert.deepEqual(swipe(), ['@201', '@203', '@202', ...TAIL]);
+});
+
+test('a collapsed group keeps its sessions in the swipe, at the group position', async () => {
+    await setLayout({ order: ['/srv/code/beta', '/srv/code/alpha', '/srv/code/gamma'] });
+    sidebar.toggleGroup('/srv/code/beta');
+    await settle();
+    assert.ok(document.querySelector('#sidebar-agents .side-group.collapsed'), 'the group is collapsed');
+    assert.deepEqual(swipe(), ['@202', '@201', '@203', ...TAIL]);
+    sidebar.toggleGroup('/srv/code/beta');
+});
+
+test('the header swipe steps through the sessions in the sidebar order', async () => {
+    await setLayout({ order: ['/srv/code/gamma', '/srv/code/alpha', '/srv/code/beta'] });
+    void terminals.showPane('@203');
+    terminals.stepAgentMobile(1);   // next after gamma's @203 is alpha's @201 (the pane list: @202)
+    assert.equal(terminals.activePane(), '@201');
+    terminals.stepAgentMobile(-1);
+    assert.equal(terminals.activePane(), '@203');
+    await settle();   // let the switch's renderTerminals finish inside this test
+});
+
+test('a row blocked on you is lifted to Needs you, and it leads the swipe', async () => {
+    useRows(BASE.map(a => a.window_id === '@203' ? { ...a, session_status: 'waiting' } : a));
+    await setLayout({ order: [] });
+    assert.ok(document.querySelector('#sidebar-agents .side-needs-you [data-item="w:@203"]'), '@203 is in Needs you');
+    assert.deepEqual(swipe(), ['@203', '@201', '@202', ...TAIL]);
+});
+
+// CMX-276: Dispatched is always the LAST group, whatever the stored order says.
+test("a dispatched run's windows sit at its group's position (last), its agent window before its judge", async () => {
+    useRows([...BASE, ...runRows()]);
+    await setLayout({ order: ['/srv/code/beta', '~dispatched', '/srv/code/alpha', '/srv/code/gamma'] });
+    assert.deepEqual(groupKeys(), ['/srv/code/beta', '/srv/code/alpha', '/srv/code/gamma', '~dispatched']);
+    assert.deepEqual(swipe(), ['@202', '@201', '@203', '@204', '@205', ...TAIL]);
+});
+
+test('a session the View filters out of the sidebar keeps its swipe slot at its group position', async () => {
+    useRows([...BASE, ...runRows()]);
+    await setLayout({
+        order: ['/srv/code/beta', '~dispatched', '/srv/code/alpha', '/srv/code/gamma'],
+        view: { groupBy: 'folder', env: ['interactive'] },   // Environment: Dispatched agents off
+    });
+    assert.deepEqual(groupKeys(), ['/srv/code/beta', '/srv/code/alpha', '/srv/code/gamma'], 'the run is not drawn');
+    assert.deepEqual(swipe(), ['@202', '@201', '@203', '@204', '@205', ...TAIL]);
+});
+
+test('an archived run keeps its windows, at the Archived section (the bottom), not its old group', async () => {
+    useRows([...BASE, ...runRows('done')]);
+    await setLayout({ order: ['~dispatched', '/srv/code/alpha', '/srv/code/beta', '/srv/code/gamma'] });
+    assert.deepEqual(groupKeys(), ['/srv/code/alpha', '/srv/code/beta', '/srv/code/gamma', '~dispatched']);
+    assert.deepEqual(swipe(), ['@201', '@202', '@203', '@204', '@205', ...TAIL]);
+    server.handle('/api/sidebar/archive', { method: 'POST', body: JSON.stringify({ keys: ['run:CMX-7'] }) });
+    await sidebar.refreshSidebar();
+    await settle();
+    assert.ok(!groupKeys().includes('~dispatched'), 'the run left its group');
+    assert.deepEqual(swipe(), ['@201', '@202', '@203', '@204', '@205', ...TAIL]);
+});
+
+test('a re-order of the sidebar leaves the open session open', async () => {
+    void terminals.showPane('@203');
+    await setLayout({ order: [] });
+    assert.equal(terminals.activePane(), '@203');
+    sidebar.groupMenuAction('/srv/code/gamma', 'up');
+    await settle();
+    assert.equal(terminals.activePane(), '@203', 'the re-order did not switch sessions');
+    assert.deepEqual(swipe(), ['@201', '@203', '@202', ...TAIL]);
+    await settle();
+});
+
+test('View ▸ Status ▸ Archived (only the archive drawn) keeps every live session in its group order', async () => {
+    await setLayout({ order: ['/srv/code/gamma', '/srv/code/alpha', '/srv/code/beta'], view: { groupBy: 'folder', status: 'archived' } });
+    assert.deepEqual(groupKeys().filter(k => k.startsWith('/')), [], 'no folder group is drawn');
+    assert.deepEqual(swipe(), ['@203', '@201', '@202', ...TAIL]);
+});
+
+test('View ▸ Last activity hides a stale row from the sidebar, not from the swipe', async () => {
+    const old = (Date.now() - 10 * 86400000) / 1000;   // 10 days ago, outside "1d"
+    useRows(BASE.map(a => a.window_id === '@202' ? { ...a, last_activity: old } : a));
+    await setLayout({ order: ['/srv/code/beta', '/srv/code/gamma', '/srv/code/alpha'], view: { groupBy: 'folder', activity: '1d' } });
+    assert.ok(!groupKeys().includes('/srv/code/beta'), 'the stale row is not drawn');
+    assert.deepEqual(swipe(), ['@202', '@203', '@201', ...TAIL]);
+});

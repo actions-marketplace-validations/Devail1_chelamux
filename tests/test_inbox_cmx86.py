@@ -505,6 +505,19 @@ def test_hold_expiry_through_the_tick_is_one_notice(monkeypatch):
     assert len(_queued("dispatch_hold_expired")) == 1
 
 
+
+def test_the_tick_tells_the_stall_detector_whether_a_hold_is_live(monkeypatch):
+    """CMX-214: ``stuck_events`` is muted only by a LIVE hold; an expired or absent one
+    never mutes it."""
+    seen = []
+    monkeypatch.setattr(inbox, "stuck_events", lambda *a, **k: seen.append(k["held"]) or [])
+    inbox.tick({}, runs=[])                                       # no hold
+    held = hold.take(ttl_seconds=60, by=ORCH)
+    inbox.tick({}, runs=[])                                       # live
+    monkeypatch.setattr(inbox.time, "time", lambda: held.expires_at + 5)
+    inbox.tick({}, runs=[])                                       # lapsed, not yet swept
+    assert seen == [False, True, False]
+
 # --- 4. CI red on the head --------------------------------------------------------------
 
 _GH_LOG = (
@@ -611,7 +624,7 @@ def test_a_cas_refused_ci_rework_retracts_the_echo_at_the_call_site(tmp_path, mo
     wf = _red_row(tmp_path)
     refused = []
     monkeypatch.setattr(dispatcher, "request_changes",
-                        lambda t, b: refused.append(t) or {"ok": False, "error": "moved"})
+                        lambda t, b, **_: refused.append(t) or {"ok": False, "error": "moved"})
     _tick(wf, _FakeGh(rollup=[_check_run("test", conclusion="FAILURE")]))
     assert refused == ["abc123"]                       # the refused branch really ran
     assert len(_queued("run_ci_red")) == 1
@@ -626,7 +639,7 @@ def test_a_db_refused_ci_rework_retracts_the_echo_at_the_call_site(tmp_path, mon
     from tests.test_dispatcher_ci import _check_run, _FakeGh, _tick
     wf = _red_row(tmp_path)
 
-    def busy(t, b):
+    def busy(t, b, **_):
         raise sqlite3.OperationalError("database is locked")
     monkeypatch.setattr(dispatcher, "request_changes", busy)
     _tick(wf, _FakeGh(rollup=[_check_run("test", conclusion="FAILURE")]))
@@ -640,7 +653,7 @@ def test_an_accepted_ci_rework_keeps_the_echo(tmp_path, monkeypatch):
     announced, so the ``changes_requested`` it causes is not a second notice."""
     from tests.test_dispatcher_ci import _check_run, _FakeGh, _tick
     wf = _red_row(tmp_path)
-    monkeypatch.setattr(dispatcher, "request_changes", lambda t, b: {"ok": True})
+    monkeypatch.setattr(dispatcher, "request_changes", lambda t, b, **_: {"ok": True})
     _tick(wf, _FakeGh(rollup=[_check_run("test", conclusion="FAILURE")]))
     assert inbox.load()["expected_edges"]["abc123"]["why"] == inbox.CI_RED_ECHO
 
@@ -1141,3 +1154,19 @@ def test_marker_unread_is_attributed_to_the_runs_window(monkeypatch):
     probe = {"T9": {"activity": now, "markers": {"task-finished": now - 3600}}}
     [e] = inbox.stuck_events([run], inbox._empty(), probe, now, now_epoch="e1")
     assert e["kind"] == "run_marker_unread" and e["wid"] == "@41"
+
+
+@pytest.mark.parametrize("failing", [(), ("",), ("  ",)])
+def test_a_ci_red_that_names_no_job_is_not_announced(failing, caplog):
+    """⛔ CMX-256: a red names its failing job. "CI RED — job ?" means a caller met a
+    rollup shape it did not classify — that is PENDING, never a notice (and never latched,
+    so the real red on this head still gets said)."""
+    run = _run("awaiting_review", pr_head_sha="5d44118")
+    assert inbox.ci_red(run, sha="5d44118", failing=failing, run_ids=("42",), log_tail="",
+                        sent_back=True) is False
+    assert _queued("run_ci_red") == []
+    assert "named no failing job" in caplog.text
+    assert inbox.ci_red(run, sha="5d44118", failing=("", "CI / lint"), run_ids=(),
+                        log_tail="", sent_back=True) is True
+    [event] = _queued("run_ci_red")
+    assert "job CI / lint —" in event["summary"]

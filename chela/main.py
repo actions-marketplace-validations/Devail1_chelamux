@@ -35,6 +35,7 @@ from chela import (
     doctor,
     epoch,
     event_log,
+    fleet,
     hold,
     hooks,
     inbox,
@@ -44,6 +45,8 @@ from chela import (
     messenger,
     notify,
     okf,
+    ops,
+    park,
     orchestrator,
     rc_rename,
     restore,
@@ -53,8 +56,10 @@ from chela import (
     sessionids,
     sidebar_archive,
     spawn,
+    sweep_nightly,
     ticklock,
     update,
+    userconfig,
     wait,
     workflow,
 )
@@ -253,6 +258,10 @@ def cmd_run(args) -> None:
     # doctor.check_and_notify, same shape as waiting_seen above.
     last_doctor_check = 0.0
     doctor_red_seen: set[tuple[str, str]] = set()
+    # CMX-260: the ops scan is a detached child — the loop only ever starts it.
+    last_ops_scan = 0.0
+    ops_child = None
+    nightly_child = None      # CMX-303: the nightly sweep — one detached child at a time
     # Held in memory, exactly like `waiting_seen`: it is the PREVIOUS status snapshot
     # the inbox edge-triggers against. Starting empty means a fresh daemon baselines
     # silently on its first tick instead of announcing every already-idle agent. (A
@@ -271,6 +280,8 @@ def cmd_run(args) -> None:
     # CMX-83: {window_id: folder} seen moved last tick — the rename waits one tick.
     folder_moves: dict[str, str] = {}
     stop = GracefulShutdown("chela daemon").install()
+    # CMX-263: a signal mid-tick lets the launch in progress finish, then launches nothing new.
+    dispatcher.set_shutdown_check(lambda: stop.stopping)
 
     while not stop.stopping:
         # CMX-95: a restart of this daemon waits for the tick in progress, never more.
@@ -309,6 +320,7 @@ def cmd_run(args) -> None:
             try:
                 from chela import overrides
                 overrides.sweep()
+                overrides.retry_approved()       # CMX-205: daemon-only, may poll ≤30s
             except Exception:
                 log.exception("Override request sweep failed")
 
@@ -416,6 +428,22 @@ def cmd_run(args) -> None:
                     log.exception("Doctor red-finding check failed")
                 last_doctor_check = now
 
+            # 🔎 Ops scan (CMX-260): spawned niced and detached, never waited on — a slow or
+            # crashing scan cannot touch this tick.
+            if now - last_ops_scan >= ops.INTERVAL_S:
+                try:
+                    ops_child = ops.spawn(ops_child)
+                except Exception:
+                    log.exception("Ops scan spawn failed")
+                last_ops_scan = now
+
+            # ⚖️🧹🌙 CMX-303: the nightly sweep of what the standard tier merged unjudged —
+            # spawned detached at `sweep.nightly_at`, one at a time, never waited on.
+            try:
+                nightly_child = sweep_nightly.daemon_tick(DISPATCH_WORKFLOWS, nightly_child)
+            except Exception:
+                log.exception("Nightly sweep spawn failed")
+
             # Self-update: informs by default (CMX-142 part 1) — `chela update` is a
             # human-run act, and `update.check_and_notify` never pulls. `CHELA_AUTO_UPDATE`
             # (CMX-148 part 2, off by default — see capabilities.py's loud ON-warning at
@@ -483,6 +511,7 @@ def cmd_run(args) -> None:
         stop.wait(config.scheduler_poll_interval())
 
     capabilities.clear()   # nothing is providing these any more; don't let doctor say so
+    dispatcher.set_shutdown_check(lambda: False)   # CMX-263: never outlive this loop's flag
     stop.log_exit()
 
 
@@ -1301,6 +1330,17 @@ def cmd_dispatch_hold(args) -> bool:
             mine = inbox.caller_is_orchestrator()
         except Exception:  # noqa: BLE001 — a release must never fail on the inbox
             mine = False
+        # CMX-214: resume a --pause --all fleet first, while the hold still stands.
+        fleet_resumed = fleet.resume_all()
+        if fleet_resumed is not None:
+            sent = fleet_resumed["resumed"]
+            print(f"Fleet RESUMED — sent 'resume' to {sum(sent.values())} of {len(sent)} "
+                  "interrupted agent(s).")
+            for task, ok in sorted(sent.items()):
+                if not ok:
+                    print(f"  ⚠ {task}: 'resume' was NOT delivered — tell it by hand")
+            for task, ok in sorted(fleet_resumed["thawed"].items()):
+                print(f"  judge {task}: " + ("thawed" if ok else "⚠ NOT fully thawed — check it"))
         released = hold.release(by=orchestrator.self_wid() or "", orchestrator=mine)
         if released is None:
             print("Dispatch was not held. Nothing to resume.")
@@ -1325,6 +1365,9 @@ def cmd_dispatch_hold(args) -> bool:
                   file=sys.stderr)
             raise SystemExit(1) from None
         _print_hold(held)
+        if getattr(args, "all", False):
+            for line in fleet.status_lines(fleet.pause_all(by=held.by)):
+                print(line)
         return True
 
     if args.hold_status:
@@ -1336,8 +1379,13 @@ def cmd_dispatch_hold(args) -> bool:
                   "releases it and resumes, loudly.")
         else:
             _print_hold(held)
+        for line in fleet.status_lines():
+            print(line)
         return True
 
+    if getattr(args, "all", False):
+        print("error: --all goes with --pause (chela dispatch --pause --all)", file=sys.stderr)
+        raise SystemExit(2)
     return False
 
 
@@ -1380,6 +1428,7 @@ def cmd_dispatch(args) -> None:
         return
     log.info("Dispatcher starting (workflow=%s, interval=%ds)", args.workflow, interval)
     stop = GracefulShutdown("chela dispatcher").install()
+    dispatcher.set_shutdown_check(lambda: stop.stopping)
     while not stop.stopping:
         try:
             summary = dispatcher.tick(args.workflow)
@@ -1396,6 +1445,7 @@ def cmd_dispatch(args) -> None:
             log.exception("Could not refresh the poll interval; keeping %ds", interval)
         stop.wait(interval)
 
+    dispatcher.set_shutdown_check(lambda: False)
     stop.log_exit()
 
 
@@ -1475,8 +1525,10 @@ def _format_awaiting_run(r: dict, *, now: datetime | None = None) -> str:
     retry_n = r.get("retry_count") or 0
     reopen_chip = f"reopen={reopen_n}  " if reopen_n else ""
     retry_chip = f"retry={retry_n}  " if retry_n else ""
+    infra_n = r.get("infra_restarts") or 0      # 🏗️🔁 CMX-192
+    infra_chip = f"infra={infra_n}  " if infra_n else ""
     return (f"  {task_id}  {status:<16}  {_ci_chip(r):<11}  age={age:<5}  "
-            f"{reopen_chip}{retry_chip}{pr:<45}  {title}")
+            f"{reopen_chip}{retry_chip}{infra_chip}{pr:<45}  {title}")
 
 
 def cmd_dispatch_runs(args) -> None:
@@ -1499,10 +1551,80 @@ def cmd_dispatch_runs(args) -> None:
     if status:
         for r in runs:
             print(_format_awaiting_run(r))
+            _print_park(r)
         return
     for r in runs:
         title = (r["title"] or "")[:60]
         print(f"  {r['task_id']}  {r['status']:<16}  attempt={r['attempt']}  {r.get('window_name') or '-':<24}  {title}")
+        _print_park(r)
+
+
+def _park_line(p: dict, now: float) -> str:
+    """⏸️ CMX-318: the line under a parked run — what holds it, since when, and why."""
+    since = p.get("since")
+    when = (f"since {datetime.fromtimestamp(since, timezone.utc):%Y-%m-%d %H:%M}Z "
+            f"({hold.human_duration(now - since)} ago)" if since is not None else "since ?")
+    if p.get("kind") == park.SLOT:
+        return f"      ⏳ waiting {when}: {p.get('reason')}"
+    extra = "".join(f"  {k}={p[k]}" for k in ("until", "by") if p.get(k))
+    return f"      ⏸️ parked {when}: {p.get('reason')}{extra}"
+
+
+def _print_park(r: dict) -> None:
+    p = park.state(r)
+    if p:
+        print(_park_line(p, time.time()))
+
+
+def _parker() -> tuple[bool, str]:
+    """(is this the orchestrator?, who to record as the parker)."""
+    try:
+        mine = inbox.caller_is_orchestrator()
+    except Exception:  # noqa: BLE001 — unknown is not the orchestrator
+        log.warning("park: could not tell whether this is the orchestrator", exc_info=True)
+        mine = False
+    if mine:
+        return True, "orchestrator"
+    return False, os.environ.get("USER") or os.environ.get("USERNAME") or "operator"
+
+
+def cmd_park(args) -> None:
+    """⏸️ CMX-318: `chela park <run> --reason "…" [--until <time|run:ID>]` — hold a running
+    agent on purpose. The stuck detector skips it; one notice if it outlives --until or
+    the max. An agent cannot park itself (`park.refusal`)."""
+    run = dispatcher.resolve_run(args.run)
+    if run is None:
+        print(f"park: no run matches {args.run!r} (task id, branch, or window name)")
+        sys.exit(1)
+    is_orch, by = _parker()
+    why = park.refusal(run, is_orchestrator=is_orch)
+    if why:
+        print(f"park: refused — {why}")
+        sys.exit(1)
+    try:
+        until = park.parse_until(args.until, datetime.now(timezone.utc))
+    except ValueError as e:
+        print(f"park: {e}")
+        sys.exit(1)
+    result = dispatcher.park_run(run["task_id"], args.reason, until=until, by=by)
+    if not result.get("ok"):
+        print(f"park: {result.get('error', 'unknown error')}")
+        sys.exit(1)
+    cap = hold.human_duration(config.park_max_s())
+    print(f"⏸️ {result['task_id']} parked by {by}: {result['reason']}"
+          + (f" — until {until}" if until else "")
+          + ". No stuck notice while parked; one notice past "
+          + ("--until or " if until else "") + f"{cap}. `chela unpark {result['task_id']}`.")
+
+
+def cmd_unpark(args) -> None:
+    """⏸️ CMX-318: lift a park — the stuck clock restarts from now."""
+    _, by = _parker()
+    result = dispatcher.unpark_run(args.run, by=by)
+    if not result.get("ok"):
+        print(f"unpark: {result.get('error', 'unknown error')}")
+        sys.exit(1)
+    print(f"▶️ {result['task_id']} unparked — the stuck detector watches it again.")
 
 
 def cmd_knowledge_export(args) -> None:
@@ -1669,7 +1791,7 @@ def _override_loop(relay, interval: int, stop) -> None:
         stop.wait(interval)
 
 
-def _reconcile_loop(registry, topic_api, interval: int, stop) -> None:
+def _reconcile_loop(registry, topic_api, interval: int, stop, ledger=None) -> None:
     """Auto-topics: reconcile the registry against the live fleet, until stopped.
 
     Each tick diffs live agent windows against the persisted bindings
@@ -1698,8 +1820,21 @@ def _reconcile_loop(registry, topic_api, interval: int, stop) -> None:
     """
     from chela.discovery import get_window_cwd_by_id
     from chela import telegram as tg
+    from chela import topic_ledger as topics
 
+    # CMX-204: every topic made, so a folder's old one is reused. Passed in when the
+    # inbound close/reopen handlers write it too: one instance, or each clobbers the other.
+    ledger = ledger if ledger is not None else tg.TopicLedger()
     while not stop.is_set():
+        try:
+            if userconfig.get(topics.CLEANUP_KEY):
+                # Settings "Delete archived topics": the dashboard only stores the request.
+                # Cleared only once it ran, so a failure retries next tick, not lost.
+                n = tg.delete_archived_topics(ledger, registry, topic_api)
+                userconfig.set_(topics.CLEANUP_KEY, None)
+                log.info("auto-topics: deleted %d archived topic(s) on request", n)
+        except Exception:
+            log.exception("Telegram archived-topic cleanup failed; retrying next tick")
         try:
             live, agents = tg.live_agent_windows()
             # The tmux server issuing window ids right now (CMX-77). A binding — and a run
@@ -1727,6 +1862,9 @@ def _reconcile_loop(registry, topic_api, interval: int, stop) -> None:
                 bind_dispatched=BIND_DISPATCHED,
                 now_epoch=now_epoch,
                 rebinds=rebinds,
+                ledger=ledger,
+                delete_on_close=userconfig.get(topics.DELETE_ON_CLOSE_KEY) is True,
+                session_for=tg.window_session_id,
             )
             if had_rebinds:
                 sidebar_archive.settle_rebinds(rebinds, now_epoch)
@@ -1740,6 +1878,25 @@ def _reconcile_loop(registry, topic_api, interval: int, stop) -> None:
         except Exception:
             log.exception("Telegram auto-topics reconcile failed")
         stop.wait(interval)
+
+
+def _topic_reopened_handler(registry, ledger, topic_api):
+    """The production :class:`~chela.telegram.TopicReopenedHandler` (CMX-267): resumes through
+    :func:`chela.spawn.spawn_window`, the one window-creation path ``chela spawn`` and
+    Telegram ``/new`` share, so env, Remote Control and ``CHELA_WID`` are identical."""
+    from chela import sessionids, sessions, spawn
+    from chela.telegram import TopicReopenedHandler
+
+    return TopicReopenedHandler(
+        registry, ledger,
+        spawn=spawn.spawn_window,
+        session_exists=lambda sid: sessions.transcript_for_session(sid) is not None,
+        session_live=sessions.wid_for_session,
+        self_reopened=topic_api.reopened_by_chela,
+        pin_session=sessionids.set_session_id,
+        now_epoch=epoch.current,
+        on_change=registry.save,
+    )
 
 
 def _build_bindings_registry(args, chat: str):
@@ -2002,14 +2159,20 @@ def cmd_telegram(args) -> None:
         return
 
     try:
-        from chela.telegram import RegistryRouter, TopicClosedHandler, build_application
+        from chela.telegram import (
+            RegistryRouter, TopicClosedHandler, TopicLedger, build_application,
+            window_session_id,
+        )
         router = RegistryRouter(registry)
         # Topic-closed → unbind only (never kill the agent), and persist the drop.
-        on_topic_closed = (
-            TopicClosedHandler(registry, on_change=registry.save).handle
-            if auto_topics
-            else None
-        )
+        # Topic-reopened → resume the session it was closed on (CMX-267).
+        on_topic_closed = on_topic_reopened = ledger = None
+        if auto_topics:
+            ledger = TopicLedger()
+            on_topic_closed = TopicClosedHandler(
+                registry, on_change=registry.save, ledger=ledger,
+                session_for=window_session_id).handle
+            on_topic_reopened = _topic_reopened_handler(registry, ledger, topic_api).handle
         # The mirror's D-pad (CMX-52): a tap sends its key, then asks the pane watcher to
         # re-draw the mirrored dialog IN PLACE, so the ❯ cursor moves in the chat. The
         # watcher owns that message's id and its de-dup signature, so the re-render must
@@ -2019,6 +2182,7 @@ def cmd_telegram(args) -> None:
         application = build_application(
             token, router,
             on_topic_closed=on_topic_closed,
+            on_topic_reopened=on_topic_reopened,
             refresh_mirror=gate_watcher.refresh_mirror,
             toggle_mirror=gate_watcher.toggle_mirror,
             refresh_overrides=override_relay.tick,
@@ -2048,7 +2212,7 @@ def cmd_telegram(args) -> None:
     if topic_api is not None:
         threading.Thread(
             target=_reconcile_loop,
-            args=(registry, topic_api, reconcile_interval, stop),
+            args=(registry, topic_api, reconcile_interval, stop, ledger),
             daemon=True,
         ).start()
         log.info("auto-topics reconcile every %ds", reconcile_interval)
@@ -2116,15 +2280,21 @@ def cmd_doctor(args) -> None:
 
     Exits 1 on an error-level finding — a drift that is breaking something right now (the
     dashboard on a port the plugin does not know about, say), as against a warning, which
-    is a difference that is merely worth knowing about.
+    is a difference that is merely worth knowing about. An ERROR from an optional
+    integration (Telegram, Linear) is printed but does not fail the run: a first install has
+    neither (CMX-92).
     """
     findings = doctor.check()
     for finding in findings:
         print(finding.render())
-    errors = [f for f in findings if f.level == doctor.ERROR]
+    errors = [f for f in findings if f.level == doctor.ERROR and f.required]
+    optional = [f for f in findings if f.level == doctor.ERROR and not f.required]
+    if optional:
+        print(f"\n{len(optional)} optional problem(s) — not needed for a first run.")
     if errors:
         print(f"\n{len(errors)} problem(s) — see above.")
         sys.exit(1)
+    print("\nrequired checks: all pass")
 
 
 def cmd_restore(args) -> None:
@@ -2182,16 +2352,24 @@ def cmd_restore(args) -> None:
     try:
         runs = dispatcher.list_runs()
     except Exception:  # noqa: BLE001 — a DB hiccup must never crash a status report
-        runs = []
+        runs = None
     orphans = restore.scan_all(store["watches"], runs, sessionids.entries(), now_epoch)
 
     bindings_reg = BindingRegistry.load()
     bindings = {wid: bindings_reg.epoch_for(wid) for wid in bindings_reg.windows()}
     verdicts = restore.plan(store, bindings, sessionids.entries(), now_epoch)
+    closed = restore.closed_before_crash(now_epoch)
 
     if now_epoch is None:
         print("⚠ CANNOT VERIFY — tmux is unreachable right now, so no stamped row can be "
               "proven dangling (or current). This is not a clean bill of health.")
+
+    if closed:
+        print(f"{len(closed)} session(s) skipped because the user closed them before the "
+              "crash — never resumed:\n")
+        for sid, info in closed.items():
+            print(f"  {info.get('name') or info.get('wid') or '?'}  {sid}  {restore.closed_note(info)}")
+        print()
 
     if not orphans and not verdicts:
         print("restore: nothing orphaned — every stamped row matches the running tmux epoch.")
@@ -2212,7 +2390,7 @@ def cmd_restore(args) -> None:
     elif retire_flag and verdicts:
         results = restore.retire_empty(verdicts)
     elif resume_flag and verdicts:
-        results = restore.resume(verdicts, runs)
+        results = restore.resume(verdicts, runs, closed=closed)
     else:
         results = []
 
@@ -2225,8 +2403,15 @@ def cmd_restore(args) -> None:
                         f"(session {v.session_id} is alive there now)")
             else:
                 cmd = v.manual_command()
+                # CMX-156: a session a run still owns is never offered as a relaunch line.
+                held = cmd and (restore.closed_note(closed[v.session_id])
+                                if v.session_id in closed
+                                else restore.not_offered_reason(v.cwd, runs) if runs is not None
+                                else "the dispatcher's runs table is unreadable — a run may "
+                                     "still own this worktree")
                 line = (f"  [{v.store}] {v.wid}  MANUAL"
-                        + (f"  — {cmd}" if cmd else " (no cwd/session on record)"))
+                        + (f"  — not offered: {held}" if held
+                           else f"  — {cmd}" if cmd else " (no cwd/session on record)"))
             if r is not None:
                 line += f"  => {r.action}" + (f" ({r.detail})" if r.detail else "")
             print(line)
@@ -2315,15 +2500,32 @@ def cmd_task_finished(args) -> None:
     if experiments and no_new_guards:
         print("task-finished: pass at most one of --self-check-experiments / --no-new-guards")
         sys.exit(2)
+    # 🔀 CMX-189: the base-sync gate runs FIRST — before the size gate, self-check and sweep.
+    sync = dispatcher.check_base_sync(args.task_id, getattr(args, "allow_behind", False))
+    if not sync.get("ok"):
+        print(f"task-finished: 🔀 {sync['error']}")
+        sys.exit(1)
     # 📏 CMX-126: the size gate runs FIRST — an oversized diff is refused before its sweep.
     size = dispatcher.check_hand_in_size(args.task_id, getattr(args, "oversize_reason", None),
                                          getattr(args, "split_plan", None))
     if not size.get("ok"):
         print(f"task-finished: 📏 {size['error']}")
         sys.exit(1)
+    # 🔎 CMX-209: a code PR's body must carry its self-review — cheap, so before the sweep.
+    review = dispatcher.check_review_section(args.task_id, getattr(args, "no_review_reason", None))
+    if not review.get("ok"):
+        print(f"task-finished: 🔎 {review['error']}")
+        sys.exit(1)
 
+    # ⚖️🪜 CMX-296: what the hand-in checks follows the diff's risk tier.
+    tier = dispatcher.hand_in_tier(args.task_id)
+    checks = dispatcher.hand_in_checks(tier, experiments=bool(experiments))
     partial = None
-    if experiments:
+    accepted: list[dict] = []
+    if "lint" in checks:
+        _task_finished_standard(args.task_id, experiments,
+                                getattr(args, "sweep_equivalent", None) or [])
+    elif "self_check" in checks:
         check = dispatcher.verify_self_check(args.task_id, experiments)
         if not check.get("ok"):
             print(f"task-finished: self-check could not run — {check.get('error', 'unknown error')}")
@@ -2366,7 +2568,21 @@ def cmd_task_finished(args) -> None:
               "--self-check-experiments <path> (or --no-new-guards if this PR truly adds "
               "no guards) next time.")
 
-    accepted = _task_finished_sweep(args.task_id, getattr(args, "sweep_equivalent", None) or [])
+    if "sweep" in checks:
+        accepted = _task_finished_sweep(args.task_id,
+                                        getattr(args, "sweep_equivalent", None) or [])
+    if sync.get("since"):
+        # ⚖️🔀 CMX-334: the base moved while the checks ran — no second battery for it.
+        move = dispatcher.reconcile_base_move(
+            args.task_id, sync["since"], experiments if "self_check" in checks else None)
+        if not move.get("ok"):
+            print(f"task-finished: 🔀 {move['error']}")
+            sys.exit(1)
+        if move.get("record"):
+            from chela import basesync
+
+            sync["record"] = move["record"]
+            print(basesync.render(move["record"]))
     kwargs = {"handoff": getattr(args, "handoff", None)}
     if accepted:
         kwargs["sweep_equivalents"] = accepted
@@ -2381,12 +2597,40 @@ def cmd_task_finished(args) -> None:
         kwargs["size_gate"] = size["record"]
     if partial:
         kwargs["self_check_partial"] = partial
+    if sync.get("record"):
+        kwargs["base_sync"] = sync["record"]
+    if review.get("record"):
+        kwargs["review_gate"] = review["record"]
     result = dispatcher.request_task_finished(args.task_id, **kwargs)
     if not result.get("ok"):
         print(f"task-finished: {result.get('error', 'unknown error')}")
         sys.exit(1)
     print(f"Task {result['task_id']}: completion requested — chela will transition it to "
           "awaiting review and close this window on its next pass.")
+
+
+def _task_finished_standard(task_id: str, experiments: str | None, notes: list[str]) -> None:
+    """⚖️🪜 CMX-296: a STANDARD-tier hand-in — lint and ONE full-suite run, no experiment
+    battery and no sweep (the PR gets no judge round). Exits 1 on a red or unrunnable step."""
+    print("⚖️🪜 task-finished: standard tier (no core path) — lint + one full-suite run; no "
+          "experiment battery, no sweep, no judge round.", flush=True)
+    if experiments:
+        print(f"   --self-check-experiments {experiments} is not run on a standard-tier PR.")
+    if notes:
+        print("   --sweep-equivalent is ignored: no sweep runs on a standard-tier PR.")
+    result = dispatcher.verify_standard_hand_in(task_id)
+    if result.get("error"):
+        print(f"task-finished: the standard checks could not run — {result['error']}")
+        sys.exit(1)
+    for step in result.get("steps") or []:
+        mark = {True: "PASSED", False: "FAILED", None: "SKIPPED"}[step["passed"]]
+        print(f"  [{mark:8}] {step['name']}: {step['cmd'] or step['detail']}")
+        if step["passed"] is False and step["detail"]:
+            print(step["detail"])
+    if not result.get("ok"):
+        print("task-finished: a standard-tier check is red — fix it, then call task-finished "
+              "again.")
+        sys.exit(1)
 
 
 def _self_check_partial(check: dict) -> dict | None:
@@ -2453,6 +2697,7 @@ def _task_finished_sweep(task_id: str, notes: list[str]) -> list[dict]:
     if skipped:
         print(f"⚠ {skipped} mutation(s) SKIPPED — those lines were never measured; a skip is "
               "unmeasured, not killed.")
+    timeouts = _print_sweep_timeouts(result)
     unrun = _print_sweep_unrun(result)
     survivors = result.get("survivors") or []
     uncovered, stray = sweep.check_equivalents(survivors, equivalents)
@@ -2476,12 +2721,14 @@ def _task_finished_sweep(task_id: str, notes: list[str]) -> list[dict]:
     for e in equivalents:
         e["mutations"] = by_key.get(e["key"], [])
         print(f"  [EQUIVALENT] {e['key']} — {e['why'][:100]}")
-    if unrun:
+    if unrun or timeouts:
         # ⏳ CMX-111: the budget bounds the hand-in, so a partial sweep does not refuse — but
         # it is never reported as a pass: the unrun lines are named, and the judge still runs.
+        # ⏳ CMX-253: a TIMEOUT is unmeasured the same way.
+        unknown = f"{unrun} UNRUN" + (f", {timeouts} TIMEOUT" if timeouts else "")
         print(f"⚠ sweep PARTIAL: {result.get('measured', 0)} of {result.get('mutations', 0)} "
               f"mutation(s) measured — {result.get('killed', 0)} killed, {skipped} skipped "
-              f"(unmeasured), {len(survivors)} survivor(s) declared equivalent; {unrun} UNRUN "
+              f"(unmeasured), {len(survivors)} survivor(s) declared equivalent; {unknown} "
               "= CANNOT VERIFY, not passed — proceeding within the sweep budget.")
         return equivalents
     print(f"✓ sweep: {result.get('mutations', 0)} mutation(s), {result.get('killed', 0)} "
@@ -2543,10 +2790,10 @@ def cmd_rework_disputed(args) -> None:
     if status == "awaiting_review":
         print(f"🔀 Task {result['task_id']} disputed — the head already moved past the "
               "judged verdict, routed back to awaiting_review for automatic re-judging "
-              f"(rework {result.get('rework_count')}/{result.get('max_reworks')})")
+              f"(rework {result.get('review_reworks', result.get('rework_count'))}/{result.get('max_reworks')})")
     else:
         print(f"🔁🚫 Task {result['task_id']} disputed — needs_human "
-              f"(rework {result.get('rework_count')}/{result.get('max_reworks')})")
+              f"(rework {result.get('review_reworks', result.get('rework_count'))}/{result.get('max_reworks')})")
     if result.get("comment_posted"):
         print(f"  PR comment posted: {result.get('pr_url') or ''}")
     else:
@@ -2640,7 +2887,7 @@ def cmd_review(args) -> None:
     task_id, status = result["task_id"], result["status"]
     if args.request_changes:
         print(f"Run {task_id} ({result.get('branch_name') or '?'}) → changes_requested "
-              f"(verdict {result['round']}, rework {result['rework_count']}/{result['max_reworks']})")
+              f"(verdict {result['round']}, rework {result.get('review_reworks', result['rework_count'])}/{result['max_reworks']})")
         for line in _rework_prospects(result.get("workflow_path")):
             print(f"  {line}")
     else:
@@ -2714,6 +2961,9 @@ def cmd_judge(args) -> None:
         # re-judges the new head on its own.
         print(f"⚖️ {result['task_id']}: {result.get('error')} — no rework round was spent "
               "and nothing on the run row was changed; a fresh judge covers the new head.")
+    elif state == judge.J_CANCELLED:
+        # ⏹️⚖️ CMX-286: the daemon stopped this round — its run was sent back or its head moved.
+        print(f"⚖️ {result['task_id']}: {result.get('error')} — no verdict was published.")
     else:
         print(f"⚖️ {result['task_id']}: every guard held. The run stays awaiting_review — "
               "the judge never merges.")
@@ -2759,6 +3009,24 @@ def cmd_judge_self_check(args) -> None:
         sys.exit(2)
     print(f"✓ every guard held ({len(result['outcomes'])} experiment(s), all KILLED) — "
           "safe to commit.")
+
+
+def cmd_judge_nightly_sweep(args) -> None:
+    """⚖️🧹🌙 CMX-303: one nightly sweep of a workflow (see :mod:`chela.sweep_nightly`) — the
+    daemon's detached child, or a hand run. Exit 0 clean/skipped, 1 survivors to file (filed,
+    would file, or refused), 2 CANNOT VERIFY, UNRUN (CMX-304: the budget left mutations
+    unmeasured), UNKNOWN (a merged file no mutator handles) or an unreadable workflow."""
+    try:
+        wf = workflow.load_workflow(args.workflow)
+    except Exception as e:  # noqa: BLE001 — a WORKFLOW.md that does not parse
+        print(f"nightly-sweep: {args.workflow} could not be read: {e}", file=sys.stderr)
+        sys.exit(2)
+    result = sweep_nightly.run(wf)
+    line = f"nightly sweep: {result['status']}" + (f" — {result['why']}" if result.get("why")
+                                                    else "")
+    print(json.dumps(result, indent=2) if args.json else line)
+    sys.exit({sweep_nightly.CANNOT_VERIFY: 2, sweep_nightly.UNRUN: 2, sweep_nightly.UNKNOWN: 2,
+              sweep_nightly.SURVIVORS: 1}.get(result["status"], 0))
 
 
 def cmd_judge_sweep(args) -> None:
@@ -2810,9 +3078,11 @@ def cmd_judge_sweep(args) -> None:
         print(f"  {note}")
     _print_sweep_full_suite(result)
     skipped = _print_sweep_skipped(result)
+    timeouts = _print_sweep_timeouts(result)
     unrun = _print_sweep_unrun(result)
     for r in result["survivors"]:
-        print(f"  [SURVIVED] {r['key']} {r['mutation']}")
+        tag = "UNTESTED" if str(r.get("reason", "")).startswith("UNTESTED") else "SURVIVED"
+        print(f"  [{tag}] {r['key']} {r['mutation']}")
     unsupported = result.get("unsupported", [])
     for f in unsupported:
         print(f"  [UNKNOWN ] {f} — not supported: {sweep.SUPPORTED_NOTE}")
@@ -2821,6 +3091,7 @@ def cmd_judge_sweep(args) -> None:
         sys.exit(2)
     print(f"sweep: {result['mutations']} mutation(s) — {result['killed']} killed, "
           f"{len(result['survivors'])} survived, {skipped} skipped"
+          f"{f', {timeouts} TIMEOUT' if timeouts else ''}"
           f"{f', {unrun} UNRUN' if unrun else ''} ({result['seconds']}s)")
     if verdict == sweep.V_SURVIVORS:
         print("⚖️ Each SURVIVED line is a changed check no test can tell apart from its "
@@ -2834,6 +3105,9 @@ def cmd_judge_sweep(args) -> None:
         print(f"⚠ CANNOT VERIFY — the sweep budget stopped it: {result.get('exhausted', '')}. "
               f"{unrun} mutation(s) never ran. Raise --budget-seconds/--max-mutations (or "
               "judge.sweep_budget_seconds / judge.sweep_max_mutations) to cover them.")
+    elif timeouts:
+        print(f"⚠ CANNOT VERIFY — {timeouts} mutation(s) hit the suite timeout; their "
+              "lines are unknown, not killed.")
     elif verdict == sweep.V_UNKNOWN:
         print(f"⚠ UNKNOWN — {len(unsupported)} changed source file(s) were NOT "
               f"swept ({sweep.SUPPORTED_NOTE}). This is not a pass.")
@@ -2850,6 +3124,16 @@ def _print_sweep_full_suite(result: dict) -> None:
         print(f"  [FULL    ] {r['key']} — ran the full suite: {r['full_suite']}")
     if rows and result.get("selection"):
         print(f"  selection: {result['selection']}")
+
+
+def _print_sweep_timeouts(result: dict) -> int:
+    """⏳ CMX-253: print every mutation whose suite hit its timeout as ``[TIMEOUT ]`` and
+    return how many — its tree was killed, its line is UNKNOWN, never killed or skipped."""
+    rows = result.get("timeout") or []
+    for r in rows:
+        print(f"  [TIMEOUT ] {r['key']} {r['mutation']} — UNKNOWN, not killed: "
+              f"{r['reason'][:120]}")
+    return len(rows)
 
 
 def _print_sweep_unrun(result: dict) -> int:
@@ -2895,6 +3179,9 @@ def cmd_judge_show(args) -> None:
     to_clean = (f"{m['rounds_to_clean']}" if m["rounds_to_clean"]
                 else f"not clean yet ({m['rounds']} round(s))")
     print(f"⚖️ {task_id} — {m['rounds']} judge round(s)")
+    # ⚖️🪜 CMX-288: the run's risk tier (stamped at judge spawn), else the latest round's.
+    tier = (run or {}).get("risk_tier") or records[-1].get("tier") or "unknown"
+    print(f"  risk tier:              {tier}")
     print(f"  rounds-to-clean:        {to_clean}")
     print(f"  visible survival rate:  {pct(m['visible'])}")
     print(f"  held-out survival rate: {pct(m['held_out'])}")
@@ -2911,6 +3198,8 @@ def cmd_judge_show(args) -> None:
               f"{vis.get('total', 0)} survived · held-out {held.get('survived', 0)}/"
               f"{held.get('total', 0)} (quota {held.get('quota', 0)}) · flips "
               f"{cons.get('flipped', 0)}/{cons.get('sampled', 0)}")
+        for path in rec.get("suite_logs") or []:
+            print(f"           📄 suite output: {path}")
         for flip in cons.get("flips") or []:
             print(f"           🎲 {flip.get('guard', '?')[:70]}: {flip.get('first')} → "
                   f"{flip.get('rerun')}{' (held-out)' if flip.get('held_out') else ''}")
@@ -2922,6 +3211,16 @@ def cmd_judge_show(args) -> None:
                     print(f"                - {line}")
                 for line in str(o.get("after", "")).splitlines():
                     print(f"                + {line}")
+
+
+def cmd_ops_scan(args) -> None:
+    """``chela ops scan`` (CMX-260). Without ``--notify`` it writes nothing at all."""
+    if args.notify:
+        result = ops.scheduled()
+    else:
+        result = ops.scan(ops.Sources(config.CHELA_DIR, events_path=event_log.core_path()),
+                          ops.load_state(config.CHELA_DIR))
+    print(json.dumps(result, indent=2) if args.json else ops.render(result))
 
 
 def cmd_judge_ack_blocked_race(args) -> None:
@@ -3150,6 +3449,13 @@ def cmd_release(args) -> None:
     (Telegram button, dashboard, ``chela merge-approve <id>``) pushes main + tag + dev.
     """
     from chela import release
+    if getattr(args, "major_tag_only", False):
+        out = release.major_tag_only(args.version, repo=args.repo)
+        if not out.get("ok"):
+            print(f"release --major-tag-only REFUSED: {out.get('error')}")
+            sys.exit(1)
+        print(f"🏷️ {out['major']} → {out['sha'][:12]} on origin")
+        return
     body = ""
     if args.body_file:
         try:
@@ -3158,11 +3464,18 @@ def cmd_release(args) -> None:
             print(f"release REFUSED: --body-file unreadable: {e}")
             sys.exit(1)
     result = release.prepare(args.version, args.theme, body=body, repo=args.repo,
-                             actor=os.environ.get(config.ACTOR_ENV) or None)
+                             actor=os.environ.get(config.ACTOR_ENV) or None,
+                             dry_run=getattr(args, "dry_run", False))
     if not result.get("ok"):
         print(f"release REFUSED: {result.get('error', 'unknown error')}")
         print("  Nothing was committed, tagged or pushed.")
         sys.exit(1)
+    if result.get("dry_run"):
+        print(f"🏷️ Release {result['tag']} DRY RUN passed — every step before the commit ran "
+              "(notes, bump, uv lock, frontend build, release tests); nothing committed, tagged "
+              "or pushed.")
+        print(f"  would commit: {', '.join(result['staged'])}")
+        return
     ids = result.get("task_ids") or []
     print(f"⏳ Release {result['tag']} is PENDING approval ({result['request_id']}) — "
           "committed and tagged locally, NOTHING pushed:")
@@ -3172,7 +3485,7 @@ def cmd_release(args) -> None:
     print(f"  tasks ({len(ids)}): {', '.join(ids) or 'none'}")
     print(f"  {release.approve_hint(result['request_id'])}")
     print("  On approval chela pushes main, the tag, then dev (fast-forward only, re-checked "
-          "then). A push to dev expires the request.")
+          "then), then moves the major tag. A push to dev expires the request.")
 
 
 def cmd_override(args) -> None:
@@ -3195,7 +3508,8 @@ def cmd_override(args) -> None:
     overrides.sweep()
     recs = overrides.all_requests()
     if not args.all:
-        recs = [r for r in recs if r.get("state") in (overrides.PENDING, overrides.MERGING)]
+        recs = [r for r in recs if r.get("state") in (overrides.PENDING, overrides.MERGING,
+                                                  overrides.APPROVED)]
     if not recs:
         print("No override request is pending." if not args.all else "No override requests.")
         return
@@ -3269,7 +3583,7 @@ def cmd_reopen(args) -> None:
         print(f"reopen: {result.get('error', 'unknown error')}")
         sys.exit(1)
     print(f"🔓 Run {result['task_id']} ({result.get('branch_name') or '?'}) → awaiting_review "
-          f"(rework {result.get('rework_count')}/{result.get('max_reworks')}, "
+          f"(rework {result.get('review_reworks', result.get('rework_count'))}/{result.get('max_reworks')}, "
           f"reopen #{result.get('reopen_count')}) — back under judge/review/merge.")
     if result.get("comment_posted"):
         print(f"  PR comment posted: {result.get('pr_url') or ''}")
@@ -3296,7 +3610,7 @@ def cmd_retry(args) -> None:
         print(f"retry: {result.get('error', 'unknown error')}")
         sys.exit(1)
     print(f"🔁 Run {result['task_id']} ({result.get('branch_name') or '?'}) → "
-          f"changes_requested (rework {result.get('rework_count')}/{result.get('max_reworks')}, "
+          f"changes_requested (rework {result.get('review_reworks', result.get('rework_count'))}/{result.get('max_reworks')}, "
           f"+{result.get('retry_count')} human-granted) — the dispatcher will re-spawn it "
           "next tick.")
     if result.get("comment_posted"):
@@ -3735,6 +4049,11 @@ def main() -> None:
              "(the output lists them). Reconciliation continues. Take this BEFORE "
              "reordering the tracker.",
     )
+    p_disp.add_argument(
+        "--all", action="store_true",
+        help="With --pause: also pause every dispatched agent (Escape + 'start nothing "
+             "until resume'; message only while it runs task-finished or a judge sweep).",
+    )
     p_disp.add_argument("--resume", action="store_true", help="Release the queue hold")
     p_disp.add_argument(
         "--hold-status", action="store_true", help="Print the current queue hold, if any",
@@ -3762,6 +4081,20 @@ def main() -> None:
         help="Every run parked in the review loop — awaiting_review, changes_requested "
              "(sent back) and needs_human (the loop gave up) — with PR URL + age",
     )
+
+    # park / unpark (CMX-318) — hold a running agent on purpose, so it is not called stuck
+    p_park = sub.add_parser(
+        "park", help="Hold a running run on purpose: no stuck notice while parked "
+                     "(orchestrator / operator only — an agent cannot park itself)")
+    p_park.add_argument("run", help="Task id, branch, or window name")
+    p_park.add_argument("--reason", required=True, help="Why it is held (shown everywhere)")
+    p_park.add_argument(
+        "--until", default=None,
+        help="When the park should end: a duration (90m, 2h), an ISO-8601 time, or "
+             "run:<ID> (until that run is done/closed/failed). One notice once it is "
+             "outlived — or past CHELA_PARK_MAX_S (default 6h) either way")
+    p_unpark = sub.add_parser("unpark", help="Lift a park: the stuck detector watches it again")
+    p_unpark.add_argument("run", help="Task id, branch, or window name")
 
     # review — the verdict on a PR under review (the rework loop's carrier)
     p_review = sub.add_parser(
@@ -3898,6 +4231,16 @@ def main() -> None:
         help="Measure at most N mutations (highest priority first); the rest are UNRUN. "
              "Default: judge.sweep_max_mutations, else 60. 0 = the default",
     )
+    p_jnightly = judge_sub.add_parser(
+        "nightly-sweep",
+        help="⚖️🧹🌙 Mutation-sweep the lines STANDARD-tier PRs merged to the base branch in the "
+             "last 24h and file one tracker issue per surviving guard category (the daemon runs it at "
+             "sweep.nightly_at)",
+    )
+    p_jnightly.add_argument("--workflow", metavar="PATH", required=True,
+                            help="The WORKFLOW.md whose base branch, judge suite and sweep "
+                                 "settings to use")
+    p_jnightly.add_argument("--json", action="store_true", help="Print the result as JSON")
     from chela.judge_eval import cli as judge_eval_cli
     judge_eval_cli.add_parser(judge_sub)
     p_jshow = judge_sub.add_parser(
@@ -3911,6 +4254,16 @@ def main() -> None:
         help="Also print every held-out experiment in full (operator-only — never paste "
              "this into a PR or a rework prompt)",
     )
+    p_ops = sub.add_parser("ops", help="🔎 Fleet operations checks")
+    ops_sub = p_ops.add_subparsers(dest="ops_cmd", required=True)
+    p_oscan = ops_sub.add_parser(
+        "scan", help="A read-only, rule-based anomaly scan of the fleet (each rule is a real "
+                     "incident): hung test runs, leaked processes, flakes, notice storms")
+    p_oscan.add_argument("--json", action="store_true", help="Machine-readable output")
+    p_oscan.add_argument(
+        "--notify", action="store_true",
+        help="What the daemon runs: also append to $CHELA_DIR/ops/findings.jsonl and queue "
+             "ONE inbox notice for new findings")
     p_jack = judge_sub.add_parser(
         "ack-blocked-race",
         help="🧊 Acknowledge a blocked_race verdict that can never resolve on its own "
@@ -3992,13 +4345,19 @@ def main() -> None:
              "approval — pushes nothing; the approval pushes main + tag + dev",
     )
     p_release.add_argument("version", help="The release version, X.Y.Z")
-    p_release.add_argument("--theme", required=True,
+    p_release.add_argument("--theme", default="",
                            help="One line — titles the commit (Release X.Y.Z — <theme>) "
-                                "and the tag")
+                                "and the tag (required unless --major-tag-only)")
+    p_release.add_argument("--major-tag-only", action="store_true",
+                           help="Only force-move origin's major tag (v0 for 0.17.0) to the "
+                                "already-released vX.Y.Z — operator-only (CMX-158)")
     p_release.add_argument("--body-file", default=None,
                            help="Optional file whose text becomes the release commit's body")
     p_release.add_argument("--repo", default=None,
                            help="The repository to release (default: the current one)")
+    p_release.add_argument("--dry-run", action="store_true",
+                           help="Run every step, then remove it all: no commit, tag, request "
+                                "or push")
 
     # merge-approve — the OPERATOR's half of `chela merge --override`
     p_mapprove = sub.add_parser(
@@ -4243,8 +4602,16 @@ def main() -> None:
              "Recorded on the run, shown to the judge and in the PR body.",
     )
     p_tf.add_argument(
+        "--allow-behind", action="store_true",
+        help="🔀 CMX-189: hand in a branch behind origin/<base> that merges cleanly (recorded).",
+    )
+    p_tf.add_argument(
         "--oversize-reason", metavar="WHY", default=None,
         help="📏 CMX-126: hand in an oversized diff that cannot be split (recorded).",
+    )
+    p_tf.add_argument(
+        "--no-review-reason", metavar="WHY", default=None,
+        help="🔎 CMX-209: hand in a code PR whose body has no `## Review` section (recorded).",
     )
     p_tf.add_argument(
         "--split-plan", metavar="PATH", default=None,
@@ -4363,6 +4730,10 @@ def main() -> None:
         cmd_dispatch(args)
     elif args.command == "dispatch-runs":
         cmd_dispatch_runs(args)
+    elif args.command == "park":
+        cmd_park(args)
+    elif args.command == "unpark":
+        cmd_unpark(args)
     elif args.command == "knowledge":
         if args.know_cmd == "export":
             cmd_knowledge_export(args)
@@ -4393,6 +4764,8 @@ def main() -> None:
             cmd_judge_self_check(args)
         elif args.judge_cmd == "sweep":
             cmd_judge_sweep(args)
+        elif args.judge_cmd == "nightly-sweep":
+            cmd_judge_nightly_sweep(args)
         elif args.judge_cmd == "ack-blocked-race":
             cmd_judge_ack_blocked_race(args)
         elif args.judge_cmd == "eval":
@@ -4402,6 +4775,8 @@ def main() -> None:
             cmd_judge_show(args)
         else:
             p_judge.print_help()
+    elif args.command == "ops":
+        cmd_ops_scan(args)
     elif args.command == "adopt":
         cmd_adopt(args)
     elif args.command == "merge":

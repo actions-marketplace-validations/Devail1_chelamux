@@ -106,6 +106,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 import time
 from dataclasses import dataclass
@@ -231,6 +232,10 @@ def _classify(store: str, wid: str, stamped_epoch: str | None, session_id: str |
         return None
     roster_row = roster_lookup(stamped_epoch, wid) or {}
     sid = session_id or roster_row.get("session_id")
+    # CMX-337: a store row's id is a launch-time fact (spawn, `chela watch`); a `/clear` in
+    # the window moved the session on. The roster's LIVE-observed id for this window wins.
+    if roster_row.get("session_source") == "live" and roster_row.get("session_id"):
+        sid = roster_row["session_id"]
     cwd = roster_row.get("cwd")
     label = roster_row.get("name") or ""
     new_wid = wid_for_session(sid) if sid else None
@@ -363,6 +368,7 @@ def apply(verdicts: list[Verdict], *,
 RESUMED = "resumed"                 # MANUAL, `claude --resume` relaunched successfully
 RESUME_FAILED = "resume-failed"     # MANUAL, eligible, but the launch itself failed
 SKIPPED = "skipped"                 # MANUAL, eligible, but a guard refused to launch it
+CARRIED = "restore-boot"            # a session an earlier boot pass resumed (CMX-152)
 
 
 # How `_default_check_resumed` waits for a freshly relaunched session to prove itself
@@ -462,16 +468,42 @@ def live_worktree_owner(cwd: str | None, runs: list[dict] | None) -> str | None:
     ``cwd``. CMX-125: a re-spawned run's OLD session no longer joins its row by (wid, epoch),
     but the worktree does not move — while the run is not over, only the run gets a window in it.
     """
+    return _worktree_run(cwd, runs, lambda row: not dispatcher.run_is_terminal(row))
+
+
+def relaunching_run(cwd: str | None, runs: list[dict] | None) -> str | None:
+    """CMX-156: the ``task_id`` of the run in ``cwd``'s worktree that the dispatcher will
+    relaunch ON ITS OWN (:func:`chela.dispatcher.run_will_relaunch` — the claim loop's own
+    predicate, e.g. ``failed`` after a tmux restart, "not counted"). Resuming its old session
+    would put two agents on one task in one worktree once that relaunch lands."""
+    return _worktree_run(cwd, runs, dispatcher.run_will_relaunch)
+
+
+def _worktree_run(cwd: str | None, runs: list[dict] | None, owns) -> str | None:
     if not cwd:
         return None
     target = os.path.normpath(cwd)
     for row in runs or []:
         wt = row.get("worktree_path")
-        if not wt or dispatcher.run_is_terminal(row):
+        if not wt or not owns(row):
             continue
         wt = os.path.normpath(wt)
         if target == wt or target.startswith(wt + os.sep):
             return row.get("task_id") or "?"
+    return None
+
+
+def not_offered_reason(cwd: str | None, runs: list[dict] | None) -> str | None:
+    """Why a session in ``cwd`` is not offered for resume because a run still owns that
+    worktree (``None`` when none does) — the one sentence every restore surface prints."""
+    relaunch = relaunching_run(cwd, runs)
+    if relaunch:
+        return (f"the dispatcher will relaunch run {relaunch} itself in this worktree — "
+                "resuming the old session would put two agents on one task")
+    owner = live_worktree_owner(cwd, runs)
+    if owner:
+        return (f"its worktree belongs to run {owner}, still in flight — the dispatcher "
+                "gives that run its one window")
     return None
 
 
@@ -483,6 +515,7 @@ def resume(verdicts: list[Verdict], runs: list[dict] | None = None, *,
            record_resume_failure=None,
            clear_resume_failure=None,
            kill_window=None,
+           closed=None,
            **apply_kwargs) -> list[ApplyResult]:
     """CMX-350/issue #468: actually relaunch a MANUAL row's dead agent — the one write path
     in this module that starts a NEW process rather than editing a JSON store.
@@ -594,6 +627,9 @@ def resume(verdicts: list[Verdict], runs: list[dict] | None = None, *,
     resumed_sessions: set[tuple[str, str | None]] = set()
     resumed_by_id: dict[int, ApplyResult] = {}
     for v in eligible:
+        if v.session_id in (closed or {}):      # CMX-275: the user closed it — never revive
+            resumed_by_id[id(v)] = ApplyResult(v, SKIPPED, closed_note(closed[v.session_id]))
+            continue
         if not sessions.SESSION_RE.match(v.session_id or ""):
             resumed_by_id[id(v)] = ApplyResult(
                 v, SKIPPED, "session id does not look like a session id — refusing to "
@@ -615,9 +651,7 @@ def resume(verdicts: list[Verdict], runs: list[dict] | None = None, *,
             continue
         owner = live_worktree_owner(v.cwd, runs)
         if owner:
-            resumed_by_id[id(v)] = ApplyResult(
-                v, SKIPPED, f"its worktree belongs to run {owner}, still in flight — the "
-                            "dispatcher gives that run its one window")
+            resumed_by_id[id(v)] = ApplyResult(v, SKIPPED, not_offered_reason(v.cwd, runs))
             continue
 
         blocked = resume_blocked(v.session_id)
@@ -655,6 +689,8 @@ def resume(verdicts: list[Verdict], runs: list[dict] | None = None, *,
             detail = (f"resumed at {result.wid}, orchestrator re-registered" if ok else
                       f"resumed at {result.wid or '?'}, but re-registering the "
                       "orchestrator failed")
+        elif v.store == CARRIED:        # owed by the boot marker — no store row to remove
+            ok, detail = True, f"resumed at {result.wid or '?'}"
         else:
             ok = remove_session(v.wid, v.session_id, v.stamped_epoch)
             detail = f"resumed at {result.wid or '?'}" + (
@@ -704,8 +740,90 @@ def boot_marker_path() -> Path:
     return config.CHELA_DIR / "restore-boot.json"
 
 
+def _source_epochs(previous: str, ended: list[tuple[str, dict]]) -> list[str]:
+    """CMX-152: ``previous`` — plus, ONLY when the roster recorded ``previous`` with no
+    windows (tmux restarted again before it was sampled), the epochs before it back to and
+    including the first one that recorded any. Never further: that is the lookback bound.
+    ``previous`` unrecorded is unknown, not empty — no walk."""
+    order = [ep for ep, _ in ended]
+    if previous not in order or ended[order.index(previous)][1]:
+        return [previous]
+    i = order.index(previous)
+    for j in range(i + 1, len(ended)):
+        if ended[j][1]:
+            return [previous, *order[i + 1:j + 1]]
+    return [previous]
+
+
+def lineage(name: str | None, cwd: str | None) -> tuple[str, str] | None:
+    """CMX-337: a window's lineage across tmux epochs — its name and its cwd. A relaunch is
+    named after its folder with a collision-safe ``-N`` (:func:`chela.spawn.spawn_window`), so
+    ``<folder>-N`` folds back to ``<folder>``; any other name is kept whole (``cmx-337`` stays
+    ``cmx-337``). ``None`` when either is unknown: an unknown lineage never matches another."""
+    if not name or not cwd:
+        return None
+    cwd = os.path.normpath(cwd)
+    m = re.fullmatch(r"(.+)-\d+", name)
+    if m and m.group(1) == os.path.basename(cwd):
+        name = m.group(1)
+    return name, cwd
+
+
+def _write_marker(marker: Path, now_epoch: str, owed: list[dict]) -> None:
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(json.dumps({"epoch": now_epoch, **({"owed": owed} if owed else {})}))
+
+
+def closed_before_crash(now_epoch: str | None, *, roster_epochs=None,
+                        closed_lookup=None) -> dict[str, dict]:
+    """CMX-275: the sessions the user closed in the epoch(s) the last crash ended — the same
+    source epochs :func:`boot_pass` reads — so ``chela restore`` names them as skipped."""
+    if not now_epoch:
+        return {}
+    ended = (roster_epochs or roster.ended)(now_epoch)
+    if not ended:
+        return {}
+    return (closed_lookup or roster.closed)(_source_epochs(ended[0][0], ended))
+
+
+def closed_note(info: dict) -> str:
+    """Why a session the user closed is not resumed — the one sentence every surface prints."""
+    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(info.get("closed_at") or 0))
+    return f"closed by the user at {when} (was {info.get('wid') or '?'})"
+
+
+def _one_per_lineage(rows: list[Verdict], carried: list[Verdict],
+                     sources: list[str]) -> tuple[list[Verdict], list[ApplyResult]]:
+    """CMX-337: never resume two sessions into one window lineage (:func:`lineage`). Rows of
+    the NEWEST epoch win. A carried row was resumed INTO ``sources[0]`` but never sampled
+    there, so it ranks just behind that epoch's own rows and ahead of every older one. Rows
+    of the same epoch never supersede each other — those windows were alive side by side."""
+    carried_ids = {id(v) for v in carried}
+    rank = {ep: float(i if i == 0 else i + 1) for i, ep in enumerate(sources)}
+
+    def age(v: Verdict) -> float:
+        return 1.0 if id(v) in carried_ids else rank.get(v.stamped_epoch, len(sources) + 1.0)
+
+    newest: dict = {}
+    for v in rows:
+        key = lineage(v.label, v.cwd)
+        if key and (key not in newest or age(v) < age(newest[key])):
+            newest[key] = v
+    keep, superseded = [], []
+    for v in rows:
+        winner = newest.get(lineage(v.label, v.cwd))
+        if winner is None or age(winner) == age(v):
+            keep.append(v)
+        else:
+            superseded.append(ApplyResult(v, SKIPPED, (
+                f"superseded by session {winner.session_id} of the same window, from a "
+                "newer tmux epoch")))
+    return keep, superseded
+
+
 def boot_pass(now_epoch: str | None, *, resume_enabled: bool, gather, marker: Path,
-              resume_fn=None, notify=None) -> dict | None:
+              resume_fn=None, notify=None, roster_epochs=None,
+              wid_for_session=None, closed_lookup=None) -> dict | None:
     """CMX-125: run the restore pass at most ONCE per tmux epoch (called every daemon tick).
 
     ``marker`` holds the last epoch seen. Unknown epoch → nothing (a boot can reach the daemon
@@ -713,37 +831,99 @@ def boot_pass(now_epoch: str | None, *, resume_enabled: bool, gather, marker: Pa
     FIRST (once, even if a launch crashes), then the MANUAL rows the ENDED epoch stamped
     (``gather()`` → ``(verdicts, runs)``) go through :func:`resume` if ``resume_enabled``, else
     are only reported; one inbox notice says what came back and what did not.
+
+    CMX-152 — tmux restarting twice before the roster samples the relaunched windows:
+    the source epochs are :func:`_source_epochs` (``roster_epochs``, default
+    :func:`chela.roster.ended`), and the marker's ``owed`` list — the sessions the pass for
+    ``previous`` itself resumed — is carried until a roster sample of ``previous`` shows
+    them. An owed session already live now (``wid_for_session``) is never relaunched, and
+    one session is launched at most once per pass, from its newest epoch.
+
+    CMX-275: a session the roster saw CLOSED in a source epoch (:func:`chela.roster.closed`,
+    ``closed_lookup``) is never resumed — owed or gathered — and drops out of ``owed``; the
+    notice names it under ``skipped_closed``.
     """
     if not now_epoch:
         return None
     try:
-        previous = json.loads(marker.read_text()).get("epoch")
+        state = json.loads(marker.read_text())
+        previous, owed = state.get("epoch"), state.get("owed")
     except (OSError, ValueError, AttributeError):
-        previous = None
+        previous, owed = None, None
     if previous == now_epoch:
         return None
-    marker.parent.mkdir(parents=True, exist_ok=True)
-    marker.write_text(json.dumps({"epoch": now_epoch}))
     if previous is None:
+        _write_marker(marker, now_epoch, [])
         log.info("restore boot pass: baseline tmux epoch %s recorded", now_epoch)
         return None
+    ended = (roster_epochs or roster.ended)(now_epoch)
+    sample = [w for ep, ws in ended if ep == previous for w in ws.values()]
+    sampled = {w.get("session_id") for w in sample}
+    # CMX-337: a sample showing the owed window's LINEAGE retires it too — a `/clear` there
+    # moved the session id on, and that sample, not the older epoch it came from, is the truth.
+    sampled_lineages = {lineage(w.get("name"), w.get("cwd")) for w in sample} - {None}
+    owed = [o for o in (owed if isinstance(owed, list) else [])
+            if isinstance(o, dict) and o.get("session_id") and o.get("cwd")
+            and o["session_id"] not in sampled
+            and lineage(o.get("label"), o["cwd"]) not in sampled_lineages]
+    _write_marker(marker, now_epoch, owed)
+    sources = _source_epochs(previous, ended)
+    closed = (closed_lookup or roster.closed)(sources)
+    live = wid_for_session or sessions.wid_for_session
+    still_live = [o for o in owed if live(o["session_id"])]
+    skipped_closed: dict = {}            # named once, however many rows carry the session
+
+    def not_closed(v: Verdict) -> bool:
+        if v.session_id not in closed:
+            return True
+        skipped_closed.setdefault(
+            v.session_id, f"{v.label or v.wid}: {closed_note(closed[v.session_id])}")
+        return False
+
+    carried = [v for v in (Verdict(o["store"] if o.get("store") == "inbox.orchestrator"
+                                   else CARRIED, o.get("wid") or "?", previous, "MANUAL",
+                                   o["session_id"], None, o["cwd"], o.get("label") or "")
+                           for o in owed if o not in still_live) if not_closed(v)]
     verdicts, runs = gather()
-    rows = [v for v in verdicts if v.stamped_epoch == previous and v.verdict == "MANUAL"]
+    newest: dict = {v.session_id: None for v in carried}
+    rows = list(carried)
+    for v in sorted((v for v in verdicts if v.stamped_epoch in sources
+                     and v.verdict == "MANUAL" and not_closed(v)),
+                    key=lambda v: sources.index(v.stamped_epoch)):
+        if v.manual_command() and newest.setdefault(v.session_id, v.stamped_epoch) != \
+                v.stamped_epoch:
+            continue                     # this session is already owed from a newer epoch
+        rows.append(v)
+    rows, superseded = _one_per_lineage(rows, carried, sources)
     if resume_enabled:
         results = (resume_fn or resume)(rows, runs)
     else:
         results = [ApplyResult(v, SKIPPED, "CHELA_RESTORE_RESUME is off — report only")
                    for v in rows]
+    results = [*results, *superseded]
+    _write_marker(marker, now_epoch, still_live + [
+        {"session_id": r.verdict.session_id, "cwd": r.verdict.cwd, "label": r.verdict.label,
+         "wid": r.verdict.wid, "store": r.verdict.store}
+        for r in results if r.action == RESUMED])
     back = [f"{r.verdict.label or r.verdict.wid} ({r.detail})" for r in results
             if r.action == RESUMED]
     left = [f"{r.verdict.label or r.verdict.wid}: {r.detail or r.action}" for r in results
             if r.action != RESUMED]
     log.info("restore boot pass: tmux epoch %s -> %s, %d resumed, %d not",
              previous, now_epoch, len(back), len(left))
-    if back or left:
+    out = {"previous": previous, "epoch": now_epoch, "resumed": back, "not_resumed": left,
+           **({"skipped_closed": list(skipped_closed.values())} if skipped_closed else {})}
+    recovered = sources[-1] if len(sources) > 1 else previous if carried else None
+    head = "tmux restarted"
+    if recovered:
+        out["recovered_from"] = recovered
+        head = f"tmux restarted twice; recovered from epoch {recovered}"
+    if back or left or skipped_closed:
         (notify or inbox.enqueue)(
             "restore_boot",
-            f"tmux restarted — came back: {', '.join(back) or 'none'}; "
-            f"not resumed: {'; '.join(left) or 'none'}",
-            {"previous": previous, "epoch": now_epoch, "resumed": back, "not_resumed": left})
-    return {"previous": previous, "epoch": now_epoch, "resumed": back, "not_resumed": left}
+            f"{head} — came back: {', '.join(back) or 'none'}; "
+            f"not resumed: {'; '.join(left) or 'none'}"
+            + (f"; skipped, closed: {'; '.join(skipped_closed.values())}"
+               if skipped_closed else ""),
+            out)
+    return out

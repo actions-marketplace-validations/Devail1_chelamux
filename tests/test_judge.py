@@ -313,6 +313,8 @@ def test_a_file_that_cannot_be_RESTORED_takes_the_whole_report_down(tmp_path):
     calls = {"n": 0}
 
     def flaky_write(self, data, *a, **k):
+        if self.name != "guard.py":                  # CMX-162: the recovery marker's own write
+            return real_write(self, data, *a, **k)
         calls["n"] += 1
         if calls["n"] == 2:                          # the RESTORE of the first experiment
             return real_write(self, data + "\n# contamination\n", *a, **k)
@@ -343,6 +345,8 @@ def test_a_restore_write_that_RAISES_names_what_it_raised(tmp_path):
     calls = {"n": 0}
 
     def flaky_write(self, data, *a, **k):
+        if self.name != "guard.py":                  # CMX-162: the recovery marker's own write
+            return real_write(self, data, *a, **k)
         calls["n"] += 1
         if calls["n"] == 2:                          # the RESTORE of the first experiment
             raise OSError("no space left on device")
@@ -574,9 +578,11 @@ def test_judge_prompt_points_at_the_defeat_shapes_catalog(tmp_path):
             "workspace_path": str(tmp_path), "diff_cmd": "git diff", "pr_view_cmd": "gh pr view",
             "experiments_path": str(tmp_path / "experiments.json"), "judge_cmd": "chela judge run",
             "judge_log": str(tmp_path / "judge.log"),            # ⏱️ CMX-411
-            "held_out_pct": 30, "held_out_min": 3,     # ⚖️🙈 CMX-395
+            "held_out_pct": 30, "held_out_min": 3, "held_out_note": "",  # ⚖️🙈 CMX-395, 288
             "risk": "normal", "max_experiments": 8, "risk_guidance": "focused",
             "sweep_equivalents": "",                   # ⚖️🧹 CMX-88
+            "generated_paths": "`uv.lock`",            # 🏭 CMX-284
+            "prior_round": "",                         # ⚖️🔀 CMX-289
         }
         with patch.object(dispatcher, "detached_worktree", return_value=(None, True)), \
              patch.object(dispatcher, "_refresh_judge_worktree", return_value=None), \
@@ -1992,7 +1998,8 @@ def test_a_cannot_verify_run_is_left_alone_AND_says_so(tmp_path):
     result, run, posted = _judge_run(tmp_path, REAL_GUARD_TEST, {"experiments": []})
 
     assert result["state"] == judge.J_CANNOT_VERIFY
-    assert run["status"] == "awaiting_review"       # neither blocked nor cleared
+    # Neither blocked nor cleared — and, CMX-195, parked ONCE: no experiments is final.
+    assert run["status"] == "needs_human" and run["judge_unknown_final"]
     assert run["judge_state"] == judge.J_CANNOT_VERIFY
     assert "CANNOT VERIFY" in posted[0]
     assert "NOT an approval" in posted[0]
@@ -3380,7 +3387,8 @@ def test_a_red_pr_is_not_judged_it_is_already_going_back(tmp_path):
     with dispatcher._db() as conn:
         _run_row(conn, tmp_path, workflow_path=str(wf.path), pr_head_sha=None)
 
-    summary = _tick(wf, lambda *a: True, checks=dispatcher.CI_FAILING)
+    with patch.object(dispatcher, "_rerun_failed_jobs", return_value=False):   # CMX-255
+        summary = _tick(wf, lambda *a: True, checks=dispatcher.CI_FAILING)
 
     assert summary["judged"] == 0                   # the CI gate owns this one
     assert summary["ci_failed"] == 1
@@ -3631,8 +3639,8 @@ def test_cmd_judge_prints_the_stale_head_notice_not_every_guard_held(capsys):
 
 def test_taskmodal_judge_badge_key_matches_j_blocked_race_value():
     """⚖️🧊 CMX-239 round 4: the judge corrupted `J_BLOCKED_RACE`'s VALUE (not a call site)
-    and the suite stayed green. `taskmodal.js`'s `_JUDGE_BADGE` is keyed on the literal
-    ``'blocked_race'``, and `tests/taskmodal_judge_badge.test.mjs` only pins that SAME
+    and the suite stayed green. The task modal's `JUDGE_BADGE` (features/taskmodal/model.ts)
+    is keyed on the literal ``'blocked_race'``, and its Vitest test only pins that SAME
     hardcoded literal against itself — it never looks at `judge.py`. Every Python test, in
     turn, references the SYMBOL `judge.J_BLOCKED_RACE`, never its string value, so neither
     side of the language boundary would notice the two drifting apart. If they do,
@@ -3643,18 +3651,18 @@ def test_taskmodal_judge_badge_key_matches_j_blocked_race_value():
 
     This test is the only thing that reads BOTH sides: it takes `judge.J_BLOCKED_RACE`'s
     live value and requires that exact string to appear as a key in the real
-    `taskmodal.js` source. Corrupt the constant's value in `judge.py` alone (JS untouched)
+    TypeScript source. Corrupt the constant's value in `judge.py` alone (JS untouched)
     and this goes red, because the JS source no longer has a key matching the new value.
     """
-    js_path = (Path(__file__).resolve().parent.parent / "chela" / "dashboard" / "static"
-               / "js" / "taskmodal.js")
+    js_path = (Path(__file__).resolve().parent.parent / "chela" / "dashboard" / "frontend"
+               / "src" / "features" / "taskmodal" / "model.ts")
     src = js_path.read_text()
-    match = re.search(r"const _JUDGE_BADGE = \{(.*?)\n\};", src, re.DOTALL)
-    assert match, "taskmodal.js's _JUDGE_BADGE object literal not found — did it move or get renamed?"
+    match = re.search(r"export const JUDGE_BADGE: Record<string, string> = \{(.*?)\n\};", src, re.DOTALL)
+    assert match, "the task modal's JUDGE_BADGE object literal not found — did it move or get renamed?"
     keys = set(re.findall(r"^\s*(\w+):", match.group(1), re.MULTILINE))
     assert judge.J_BLOCKED_RACE in keys, (
-        f"_JUDGE_BADGE has no key matching judge.J_BLOCKED_RACE ({judge.J_BLOCKED_RACE!r}) — "
-        f"the Python↔JS judge_state contract has drifted. _JUDGE_BADGE keys: {sorted(keys)}"
+        f"JUDGE_BADGE has no key matching judge.J_BLOCKED_RACE ({judge.J_BLOCKED_RACE!r}) — "
+        f"the Python↔JS judge_state contract has drifted. JUDGE_BADGE keys: {sorted(keys)}"
     )
 
 
@@ -3757,7 +3765,7 @@ def test_run_self_check_forwards_the_ENTIRE_judge_config_in_one_call(tmp_path, m
 
     captured = {}
 
-    def fake_self_check(worktree, test_cmd, raw, *, timeout, select_tests, budget):
+    def fake_self_check(worktree, test_cmd, raw, *, timeout, select_tests, budget, **_):
         captured["budget"] = budget
         captured["test_cmd"] = test_cmd
         captured["timeout"] = timeout

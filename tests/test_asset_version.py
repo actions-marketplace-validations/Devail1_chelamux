@@ -7,6 +7,7 @@ and the cache headers match (HTML revalidates, a versioned asset is immutable).
 """
 from __future__ import annotations
 
+import json
 import re
 import shutil
 from html.parser import HTMLParser
@@ -53,11 +54,12 @@ def test_every_script_and_stylesheet_in_the_page_is_versioned(client):
     module = [a["src"] for t, a in refs if t == "script" and a.get("type") == "module" and "src" in a]
     styles = [a["href"] for t, a in refs
               if t == "link" and "stylesheet" in (a.get("rel") or "").split()]
-    # The page as it ships: gridstack + main.js, gridstack.css + style.css. A count that
-    # drops means a tag stopped being recognised — not that it stopped needing a version.
-    assert module == [_prefix() + "js/main.js"]
+    # The page as it ships: gridstack + the Vite bundle (CMX-215, one module script),
+    # gridstack.css + the bundle's stylesheet (CMX-248: style.css, imported by the entry). A
+    # count that drops means a tag stopped being recognised — not that it stopped needing a version.
+    assert module == [_prefix() + dash.APP_ENTRY]
     assert len(scripts) >= 2 and len(styles) >= 2
-    assert _prefix() + "style.css" in styles
+    assert dash.APP_CSS and _prefix() + dash.APP_CSS in styles
     for url in scripts + styles:
         assert url.startswith(_prefix()), f"{url!r} is not versioned — it keeps the pre-deploy cache"
     # ANY reference to a static file — icon, image, script, stylesheet — carries the version.
@@ -66,9 +68,12 @@ def test_every_script_and_stylesheet_in_the_page_is_versioned(client):
     assert len(static_refs) >= len(scripts) + len(styles)
     for url in static_refs:
         assert url.startswith(_prefix()), f"{url!r} names a static file without the version"
-    # The page must tell its JS which version it is, or the reload banner can never compare.
+    # The page must tell its JS which version it is, or the reload banner can never compare
+    # (CMX-217: the #chela-boot JSON block, frontend/src/shared/api readBoot).
     html = client.get("/").get_data(as_text=True)
-    assert f"window.CHELA_ASSET_VERSION = \"{dash.ASSET_VERSION}\"" in html
+    m = re.search(r'<script type="application/json" id="chela-boot">(.*?)</script>', html)
+    assert m, "the page has no boot block"
+    assert json.loads(m.group(1))["assetVersion"] == dash.ASSET_VERSION
 
 
 def test_every_versioned_page_asset_is_served(client):
@@ -101,13 +106,18 @@ _DYN_IMPORT = re.compile(r"\bimport\(\s*([^)]*)\)")
 
 
 def _js_files():
-    return [p for d in JS_DIRS for p in sorted(d.glob("*.js"))]
+    # CMX-236: modules converted to TypeScript in place (static/js/*.ts) import the same way.
+    return [p for d in JS_DIRS for p in sorted([*d.glob("*.js"), *d.glob("*.ts")])]
+
+
+def test_the_import_scan_reaches_modules_converted_to_typescript():
+    assert STATIC / "js" / "wire.ts" in _js_files()
 
 
 def test_every_module_import_inherits_the_version():
     """A relative specifier resolves against the importing module's versioned URL; an
     absolute ``/static/…`` one would escape it. Dynamic imports of our own modules must go
-    through ``staticUrl()`` (util.js), which adds the version."""
+    through ``staticUrl()`` (shared/api), which adds the version."""
     seen = 0
     for p in _js_files():
         src = p.read_text(encoding="utf-8")
@@ -126,7 +136,9 @@ def test_every_module_import_inherits_the_version():
         code = "\n".join(ln for ln in src.splitlines() if not ln.lstrip().startswith(("//", "*")))
         bare = re.findall(r"['\"]/static/[^'\"]+['\"]", code)
         assert not bare, f"{p.name} names a bare static URL: {bare}"
-    assert seen > 50, "the import scan found almost nothing — the regexes no longer match"
+    # CMX-212: each port slice moves imports out of static/js; the floor follows them down
+    # (CMX-248: three pure modules are left, wallmodel.ts, windowid.ts and wire.ts).
+    assert seen >= 5, "the import scan found almost nothing — the regexes no longer match"
 
 
 def test_version_is_stable_within_a_deploy(client):
@@ -177,18 +189,20 @@ def test_running_version_covers_both_static_and_templates(tmp_path):
 
 
 def test_cache_headers(client):
+    """CMX-215: the page's JS is the hashed bundle the manifest names. Its versioned URL is
+    immutable, an older deploy's URL for it revalidates, and the HTML naming it always does."""
     assert client.get("/").headers["Cache-Control"] == "no-cache"
-    r = client.get("/" + _prefix() + "js/main.js")
+    r = client.get("/" + _prefix() + dash.APP_ENTRY)
     assert r.status_code == 200
     assert r.headers["Cache-Control"] == "public, max-age=31536000, immutable"
-    assert b"refresh" in r.get_data()
+    assert b"sidebar-jump-input" in r.get_data(), "the bundle lacks the shell (features/shell)"
     r.close()
-    old = client.get("/static/v/000000000000/js/main.js")
+    old = client.get("/static/v/000000000000/" + dash.APP_ENTRY)
     assert old.status_code == 200
     assert old.headers["Cache-Control"] == "no-cache"
     old.close()
     # Unversioned URLs keep working.
-    plain = client.get("/static/js/main.js")
+    plain = client.get("/static/" + dash.APP_ENTRY)
     assert plain.status_code == 200
     plain.close()
     assert client.get("/api/version").headers["Cache-Control"] == "no-cache"

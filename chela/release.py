@@ -10,7 +10,8 @@ are split the same way an override is (:mod:`chela.overrides`, CMX-79):
   ``origin/dev`` (refused unless ``origin/main`` is an ancestor of it) it runs the release
   steps: :func:`chela.release_notes.promote_unreleased` + fragment deletion, the
   ``pyproject.toml`` bump, ``uv lock`` (which must change ``uv.lock`` to name the new
-  version), and the release tests. Then it commits and creates the annotated tag LOCALLY,
+  version), the frontend build (CMX-177: ``static/app/``, committed so users need no Node),
+  and the release tests. Then it commits and creates the annotated tag LOCALLY,
   records ONE approval request in the override store (``kind: "release"``, bound to the
   ``dev`` commit it was cut from) and RETURNS. It pushes nothing. Any failed or dirty step
   refuses with the reason and leaves nothing behind.
@@ -20,7 +21,10 @@ are split the same way an override is (:mod:`chela.overrides`, CMX-79):
   still the commit the release was cut from and ``origin/main`` an ancestor of the release
   commit, then pushes ``release:main``, the tag, ``release:dev`` — in that order, each a
   plain (never forced) push, so a non-fast-forward is refused by git itself. Any failed
-  check ⇒ nothing pushed.
+  check ⇒ nothing pushed. Then, under the same approval, it force-moves the MAJOR tag
+  (``v0`` for ``0.17.0``, :func:`major_tag`) to the release commit — the one forced push,
+  limited to that one tag, so ``uses: Devail1/chelamux@v0`` follows releases (CMX-158). A
+  failed move is reported loudly; the release it follows stays pushed.
 
 ``dev`` moving after the request expires it (:func:`chela.overrides.sweep` →
 :func:`remote_dev_head`), exactly as a new push expires an override. Whatever the outcome,
@@ -46,12 +50,13 @@ from datetime import date as _date
 from pathlib import Path
 
 from chela import config, event_log, notify, overrides, release_notes
+from chela.dashboard import frontend_build
 
 log = logging.getLogger("chela.release")
 
 KIND = "release"
 BRANCH_PREFIX = "chela-release/"
-_VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
+_VERSION_RE = re.compile(r"([0-9]+)\.([0-9]+)\.([0-9]+)")
 _PYPROJECT_VERSION = re.compile(r'(?m)^version = "([^"]+)"$')
 _PYPROJECT_NAME = re.compile(r'(?m)^name = "([^"]+)"$')
 _TASK_ID = re.compile(r"\bCMX-(\d+)\b", re.IGNORECASE)
@@ -64,7 +69,8 @@ WORKTREE_DIR = "chela-releases"
 # The full output of the last failed release-tests run (chela state, not under test).
 FAILURE_LOG = "last-failure.log"
 # What the release commit may touch — anything else in the worktree is a dirty step.
-RELEASE_PATHS = ("CHANGELOG.md", "pyproject.toml", "uv.lock", "changelog.d")
+FRONTEND_SRC, FRONTEND_BUILT = "chela/dashboard/frontend", "chela/dashboard/static/app"
+RELEASE_PATHS = ("CHANGELOG.md", "pyproject.toml", "uv.lock", "changelog.d", FRONTEND_BUILT)
 # `remote_dev_head` is called from every sweep (the daemon tick, the bridge's relay, the
 # dashboard): one `git ls-remote` per repo per this many seconds is plenty.
 DEV_HEAD_CACHE_S = 60.0
@@ -84,6 +90,11 @@ def is_release(rec: dict | None) -> bool:
 
 def tag_name(version: str) -> str:
     return f"v{version}"
+
+
+def major_tag(version: str) -> str:
+    """The moving major tag a release also points: ``0.17.0`` → ``v0``, ``1.2.0`` → ``v1``."""
+    return f"v{_version_tuple(version)[0]}"
 
 
 # --- seams (tests replace these; never a live GitHub) -------------------------------------
@@ -110,6 +121,22 @@ def _uv_lock(cwd: Path) -> subprocess.CompletedProcess:
                               timeout=600, env=_uv_env())
     except (OSError, subprocess.TimeoutExpired) as e:
         return subprocess.CompletedProcess(["uv", "lock"], 1, "", str(e))
+
+
+def _frontend_build(cwd: Path) -> subprocess.CompletedProcess:
+    """CMX-177: install the lockfile's node packages, then rebuild ``static/app/`` in place.
+    A repo with no dashboard frontend (``--repo`` another project) has nothing to build."""
+    argv = ["pnpm", "install", "--frozen-lockfile"]
+    if not (cwd / FRONTEND_SRC / "package.json").is_file():
+        return subprocess.CompletedProcess(argv, 0, "no dashboard frontend: nothing to build", "")
+    try:
+        install = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=600,
+                                 env=_uv_env())
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return subprocess.CompletedProcess(argv, 1, "", str(e))
+    if install.returncode != 0:
+        return install
+    return frontend_build.build(cwd / FRONTEND_BUILT, frontend=cwd / FRONTEND_SRC)
 
 
 def _release_tests(cwd: Path, *, python: tuple[str, ...] = (
@@ -181,7 +208,7 @@ def _repo_slug(cwd) -> str | None:
 
 
 def _version_tuple(v: str) -> tuple[int, ...] | None:
-    m = _VERSION_RE.match(v or "")
+    m = _VERSION_RE.fullmatch(v or "")
     return tuple(int(x) for x in m.groups()) if m else None
 
 
@@ -248,9 +275,9 @@ def cleanup(rec: dict, *, keep_tag: bool = False) -> None:
 
 # --- the requesting half ------------------------------------------------------------------
 
-def _steps(wt: Path, version: str, theme: str, body: str) -> str | dict:
+def _steps(wt: Path, version: str, theme: str, body: str, dry_run: bool = False) -> str | dict:
     """Run the release steps in ``wt``; the error text on any failure, else a dict with the
-    new CHANGELOG section's task ids."""
+    new CHANGELOG section's task ids. A ``dry_run`` stops before the commit and the tag."""
     pyproject = wt / "pyproject.toml"
     text = pyproject.read_text(encoding="utf-8")
     found = _PYPROJECT_VERSION.findall(text)
@@ -292,11 +319,16 @@ def _steps(wt: Path, version: str, theme: str, body: str) -> str | dict:
                               locked):
         return f"version mismatch — uv.lock does not record {name} {version}"
 
+    built = _frontend_build(wt)
+    if built.returncode != 0:
+        return f"frontend build failed: {_tail(built)}"
+
     tests = _release_tests(wt)
     if tests.returncode != 0:
         return _tests_failed(tests)
 
-    add = _git(wt, "add", "-A", "--", *RELEASE_PATHS)
+    # A path git has never seen (a repo with no frontend) is a pathspec error, so only what exists.
+    add = _git(wt, "add", "-A", "--", *(p for p in RELEASE_PATHS if (wt / p).exists()))
     if add.returncode != 0:
         return f"`git add` failed: {_tail(add)}"
     status = _git(wt, "status", "--porcelain", "--untracked-files=all")
@@ -304,6 +336,9 @@ def _steps(wt: Path, version: str, theme: str, body: str) -> str | dict:
              if not all(_in_release_paths(path) for path in ln[3:].split(" -> "))]
     if status.returncode != 0 or dirty:
         return "the release worktree is dirty after the steps: " + "; ".join(dirty[:10])
+    if dry_run:
+        return {"task_ids": task_ids(section), "staged": _git(
+            wt, "diff", "--cached", "--name-only").stdout.split()}
     msg = f"Release {version} — {theme}" + (f"\n\n{body.strip()}\n" if body.strip() else "")
     commit = _git(wt, "commit", "--quiet", "-m", msg)
     if commit.returncode != 0:
@@ -315,12 +350,13 @@ def _steps(wt: Path, version: str, theme: str, body: str) -> str | dict:
 
 
 def prepare(version: str, theme: str, *, body: str = "", repo: str | Path | None = None,
-            actor: str | None = None) -> dict:
+            actor: str | None = None, dry_run: bool = False) -> dict:
     """Prepare release ``version`` LOCALLY and request the operator's approval — then RETURN.
 
     ``{"ok": True, "pending": True, "request_id", "version", "tag", "dev_sha",
     "release_sha", "task_ids", …}`` or ``{"ok": False, "error"}``. Pushes nothing; on a
-    refusal, nothing it made is left behind (worktree, branch, tag).
+    refusal, nothing it made is left behind (worktree, branch, tag). A ``dry_run`` runs every
+    step, then removes it all: ``{"ok": True, "dry_run": True, "staged", …}``, no tag, no request.
     """
     version = (version or "").strip()
     version = version[1:] if version.startswith("v") else version
@@ -370,13 +406,17 @@ def prepare(version: str, theme: str, *, body: str = "", repo: str | Path | None
             "git_dir": str(git_dir), "worktree": str(wt), "branch": branch,
             "head_sha": dev_sha, "dev_sha": dev_sha, "main_sha": main_sha}
     try:
-        out = _steps(wt, version, theme, body or "")
+        out = _steps(wt, version, theme, body or "", dry_run)
     except Exception as e:                                   # noqa: BLE001 — never leave junk
         log.exception("release steps crashed")
         out = f"internal error: {e}"
     if isinstance(out, str):
         cleanup({**meta, "release_sha": _rev(wt, "HEAD")})
         return _refuse(f"release {version} refused: {out}")
+    if dry_run:
+        cleanup(meta)
+        return {"ok": True, "dry_run": True, "version": version, "tag": tag,
+                "dev_sha": dev_sha, "task_ids": out["task_ids"], "staged": out["staged"]}
     release_sha = _rev(wt, "HEAD")
     slug = _repo_slug(git_dir)
     ids = out["task_ids"]
@@ -464,14 +504,78 @@ def complete(rec: dict, approved_by: str) -> dict:
             return fail(f"pushing {what} failed ({_tail(p, 300)}) — pushed so far: {done}",
                         pushed=pushed)
         pushed.append(what)
+    detail = None
+    err = move_major_tag(git_dir, stored["version"], release_sha)
+    if err:
+        detail = _major_tag_failed(stored, err)
+    else:
+        pushed.append(major_tag(stored["version"]))
     event_log.append("orchestrator.release_pushed",
                      f"release {tag} APPROVED by {approved_by} and pushed ({release_sha[:12]})",
                      payload={"request_id": stored["id"], "tag": tag, "version":
                               stored.get("version"), "release_sha": release_sha,
                               "dev_sha": dev_sha, "approved_by": approved_by,
                               "task_ids": stored.get("task_ids")})
-    return {"ok": True, "state": overrides.RELEASED, "detail": None,
+    return {"ok": True, "state": overrides.RELEASED, "detail": detail,
             "merge_commit_sha": release_sha, "pushed": pushed}
+
+
+def move_major_tag(git_dir, version: str, sha: str) -> str | None:
+    """Force-move origin's major tag to ``sha`` — the release flow's ONLY forced push, and
+    only of that one tag. The error text, or None once it moved."""
+    major = major_tag(version)
+    p = _git(git_dir, "push", "--quiet", "origin", f"+{sha}:refs/tags/{major}", timeout=300)
+    return None if p.returncode == 0 else f"moving {major} failed: {_tail(p, 300)}"
+
+
+def _major_tag_failed(rec: dict, err: str) -> str:
+    """Report a failed major-tag move LOUDLY (log, event, push, inbox); the release itself
+    stays pushed — it is never rolled back for this."""
+    major = major_tag(rec["version"])
+    text = (f"release {rec['tag']} is pushed, but {err} — `@{major}` users still get the "
+            f"previous release; move it by hand: chela release {rec['version']} "
+            "--major-tag-only")
+    log.error(text)
+    event_log.append("orchestrator.release_major_tag_failed", text,
+                     payload={"request_id": rec.get("id"), "tag": rec["tag"], "major": major,
+                              "release_sha": rec.get("release_sha")})
+    try:
+        if notify.enabled():
+            notify.send(text, title=f"chela: {major} NOT moved")
+    except Exception:                                        # noqa: BLE001 — best effort
+        log.debug("major-tag notify failed", exc_info=True)
+    try:
+        from chela import inbox
+        inbox.enqueue("release_major_tag_failed", f"🏷️⚠️ {text}",
+                      {"request_id": rec.get("id"), "tag": rec["tag"], "major": major})
+    except Exception:                                        # noqa: BLE001 — best effort
+        log.debug("major-tag inbox enqueue failed", exc_info=True)
+    return text
+
+
+def major_tag_only(version: str, *, repo: str | Path | None = None, env=None) -> dict:
+    """``chela release X.Y.Z --major-tag-only``: point the major tag at the ALREADY-RELEASED
+    ``vX.Y.Z`` on origin, through :func:`move_major_tag` — for a release that predates the
+    major tag, or a failed move. Human-only, like an approval."""
+    why = overrides.agent_refusal(env)
+    if why:
+        return _refuse(why)
+    version = (version or "").strip().removeprefix("v")
+    if _version_tuple(version) is None:
+        return _refuse(f"{version!r} is not a release version (X.Y.Z)")
+    git_dir = _git_common_dir(Path(repo) if repo else Path.cwd())
+    if git_dir is None:
+        return _refuse("not inside a git repository")
+    tag = tag_name(version)
+    fetch = _git(git_dir, "fetch", "--quiet", "origin", f"refs/tags/{tag}", timeout=300)
+    p = _git(git_dir, "ls-remote", "origin", f"refs/tags/{tag}", f"refs/tags/{tag}^{{}}",
+             timeout=60)
+    refs = dict(reversed(ln.split()) for ln in p.stdout.splitlines() if ln.strip())
+    sha = refs.get(f"refs/tags/{tag}^{{}}") or refs.get(f"refs/tags/{tag}")
+    if fetch.returncode != 0 or p.returncode != 0 or not sha:
+        return _refuse(f"{tag} could not be read on origin — nothing pushed")
+    err = move_major_tag(git_dir, version, sha)
+    return _refuse(err) if err else {"ok": True, "major": major_tag(version), "sha": sha}
 
 
 # --- the sweep's and the relay's reads ----------------------------------------------------

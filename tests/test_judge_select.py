@@ -578,9 +578,12 @@ def test_a_baseline_red_only_under_coverage_is_re_run_plain_never_CANNOT_VERIFY(
     a repo whose suite dislikes coverage. The plain re-run wrote no coverage data, so the map
     must not be read off it either."""
     root = _repo(tmp_path / "repo", {**FILES, **COV_SENSITIVE})
-    baseline, selector, why = judge.run_baseline(root, TEST_CMD, 120, tmp_path)
+    fails: list = []
+    baseline, selector, why = judge.run_baseline(root, TEST_CMD, 120, tmp_path, failures=fails)
 
     assert baseline.green, baseline.tail
+    # 📄 CMX-163: the red coverage run is kept for a failure log, though the verdict is green.
+    assert len(fails) == 1 and not fails[0].green
     assert selector is not None, why
     assert [env for _, env in fake_cov["runs"]] == [COV_ENV, {}]
     assert fake_cov["parsed"] == []                  # nothing read off the plain re-run
@@ -596,7 +599,8 @@ def test_a_baseline_red_even_plain_is_red_and_selects_nothing(tmp_path, fake_cov
     baseline, selector, _ = judge.run_baseline(root, TEST_CMD, 120, tmp_path)
 
     assert not baseline.green and selector is None
-    assert [env for _, env in fake_cov["runs"]] == [COV_ENV, {}]
+    # CMX-195: the third run is the ONE re-run of just the failing test — red again, so red.
+    assert [env for _, env in fake_cov["runs"]] == [COV_ENV, {}, {}]
 
 
 def test_a_red_baseline_WITHOUT_coverage_is_not_re_run(tmp_path, fake_cov, monkeypatch):
@@ -604,10 +608,14 @@ def test_a_red_baseline_WITHOUT_coverage_is_not_re_run(tmp_path, fake_cov, monke
     re-running it costs a full suite and can only flake it green."""
     monkeypatch.setattr(judge, "_has_pytest_cov", lambda wt: False)
     root = _repo(tmp_path / "repo", {**FILES, "test_red.py": "def test_red():\n    assert 0\n"})
-    baseline, selector, _ = judge.run_baseline(root, TEST_CMD, 120, tmp_path)
+    fails: list = []
+    baseline, selector, _ = judge.run_baseline(root, TEST_CMD, 120, tmp_path, failures=fails)
+    # 📄 CMX-163: no coverage run happened. CMX-195: the one log kept is the re-run of just
+    # `test_red`, which proves it red twice — never a full-suite re-run.
+    assert [(f.failed, f.passed) for f in fails] == [(1, 0)]
 
     assert not baseline.green and selector is None
-    assert [env for _, env in fake_cov["runs"]] == [{}]
+    assert [env for _, env in fake_cov["runs"]] == [{}, {}]
 
 
 def test_a_green_coverage_baseline_builds_the_map_and_caches_it_per_head_sha(

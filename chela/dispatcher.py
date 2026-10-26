@@ -1,8 +1,10 @@
 from __future__ import annotations
 import json
 import logging
+import math
 import os
 import re
+import shlex
 import sqlite3
 import subprocess
 import time
@@ -11,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from typing import NamedTuple
 
-from chela import critic, envutil, epoch, event_log, hold, judge, memcap, mergegate, sizegate, sweep
+from chela import basesync, concurrency, critic, envutil, epoch, event_log, fleet, flaky, generated, handinmove, hold, judge, memcap, mergegate, reviewgate, risktier, sizegate, sweep, verdictcarry
 from chela.config import (
     CHELA_DIR,
     TMUX_SESSION,
@@ -24,6 +26,7 @@ from chela.config import (
     judge_wall_ceiling_seconds,
     judge_wall_grace_seconds,
     judge_wall_per_experiment_seconds,
+    max_infra_restarts,
     max_reworks_for,
     judge_max_experiments,
     worktree_disk_budget_bytes,
@@ -31,6 +34,7 @@ from chela.config import (
 from chela.messenger import messaging_socket_launch_arg, resend_enter, send_tmux
 from chela.sandbox import sandbox_launch_arg
 from chela.sources import Task, get_source, run_risk
+from chela.standing_rules import standing_rules
 from chela import transcripts
 from chela.transcripts import agent_transcript_summary
 from chela.tui_text import sanitize as tui_sanitize
@@ -52,6 +56,8 @@ from chela.worktree import (
     disk_usage_bytes,
     ensure_worktree,
     is_inside_root,
+    reap_run_worktree,
+    reap_strays_in,
     remove_worktree,
 )
 
@@ -85,6 +91,12 @@ PUSH_REQUEST_MAX_ATTEMPTS = 5
 # consequence for the rework loop is the load-bearing one — a run re-entering `running`
 # RE-CONSUMES a slot and must respect concurrency.max like any other work.
 ACTIVE_STATUSES = ("claimed", "running")
+# ⏹️⚖️ CMX-286: where a send-back (conflict, CI red, request-changes) leaves a run — and the
+# rework it re-spawns. A judge still running there is grading a head that can never merge.
+SENT_BACK_STATUSES = ("changes_requested", *ACTIVE_STATUSES)
+# ⏹️⚖️ CMX-340: a run that left review for good (merged, overridden, closed, failed). Its
+# judge's window id is no one's to signal: a fleet pause never freezes one of these.
+TERMINAL_STATUSES = ("done", "closed", "failed")
 
 # A PR is open and the verdict is out of the agent's hands. `changes_requested` is a
 # rework the dispatcher will pick up; `needs_human` is a rework that hit the cap and
@@ -126,6 +138,20 @@ RECONCILE_MERGE_STATUSES_WITH_RUNNING = (*RECONCILE_MERGE_STATUSES, "running")
 # Readiness poll (see _wait_for_ready) — how long to wait for the agent TUI to
 # accept input before sending the prompt, and how often to re-check.
 READY_TIMEOUT_SECONDS = 60
+
+# 🔁 CMX-263: the daemon's "a shutdown signal arrived" check (`set_shutdown_check`). Once it
+# reads True a tick launches nothing new — no judge, no rework, no claim — so a restart waits
+# only for the launch already in progress (PM2's `kill_timeout` must cover that one).
+_shutdown_check = lambda: False  # noqa: E731
+
+
+def set_shutdown_check(check) -> None:
+    global _shutdown_check
+    _shutdown_check = check
+
+
+def shutting_down() -> bool:
+    return bool(_shutdown_check())
 READY_POLL_INTERVAL = 1.0
 
 # Reconcile watchdog (see tick) — a `running` row stuck at an idle, empty
@@ -275,6 +301,12 @@ CI_POLL_STATUSES = ("awaiting_review", "changes_requested")
 # allowed to give up, but never allowed to go quiet. Six hours is GitHub's own job ceiling,
 # so anything past it is not "still running", it is stuck.
 CI_PENDING_STALE_SECONDS = 6 * 3600
+# 🔀 CMX-264: at most this many conflict reworks per run are free; past it a conflict round is
+# charged like any other, so a run that cannot resolve its conflict still reaches the cap.
+MAX_FREE_CONFLICT_REWORKS = 3
+# 🔁 CMX-255: how long a red that may still be the PRE-re-run one is waited out, when the
+# re-run was never seen unsettled. Past it, the red is taken as the re-run's own.
+CI_RERUN_SETTLE_SECONDS = 15 * 60
 
 # A whole CI log does not fit in a prompt. The tail is where the failure is.
 CI_LOG_TAIL_CHARS = 4000
@@ -310,6 +342,11 @@ JUDGE_TIMEOUT_SECONDS = 60 * 60
 # ⏳⚖️ CMX-431: a full-suite confirmation (CMX-407) is budgeted at this multiple of the run's
 # OWN baseline — the same suite, on the same box, a moment earlier — with headroom for load.
 JUDGE_FULL_SUITE_MARGIN = 1.5
+
+# ⏳⚖️ CMX-271: while a suite may be running, the stall window is never shorter than the
+# run's own `judge.suite_timeout_seconds` plus this — so a mutation that hangs a test is
+# stopped by the SUITE's timeout (a KILLED verdict) before the watchdog calls the run stuck.
+JUDGE_SUITE_TIMEOUT_GRACE_SECONDS = 120.0
 
 # --- agent launch command ---------------------------------------------------
 #
@@ -1021,11 +1058,27 @@ def run_is_terminal(row) -> bool:
     """
     if row.get("pr_state") == "merged":
         return True
-    if row.get("status") == "failed" and (row.get("attempt") or 1) >= MAX_ATTEMPTS:
-        return True
-    if row.get("status") == "closed" and row.get("requeue_pending"):
-        return False                     # CMX-65: requeued — the next tick claims it again
-    return row.get("status") in ("done", "closed")
+    # CMX-156: built on the claim loop's own retry predicate, so a row the claim will take
+    # again (a failed retry, a requeued close) can never read as over here.
+    return not (run_will_relaunch(row)
+                or row.get("status") in (*ACTIVE_STATUSES, *REVIEW_STATUSES))
+
+
+def run_will_relaunch(row) -> bool:
+    """CMX-156 — the claim loop's retry predicate: will the dispatcher's next claim take
+    this EXISTING `runs` row again on its own (a fresh attempt in its worktree)? A `failed`
+    row below MAX_ATTEMPTS (a tmux restart's "not counted" failure included) or a
+    requeued `closed` row (CMX-65); never a merged PR, never a row in flight, in review or
+    done. ``chela.restore`` reads the SAME function, so Restore never offers a session the
+    dispatcher is about to relaunch next to it. Reads with ``.get()`` (a plain dict)."""
+    if row.get("pr_state") == "merged":
+        return False                     # it shipped — never a 2nd run
+    status = row.get("status")
+    if status == "closed":
+        return bool(row.get("requeue_pending"))
+    if status in NOT_CLAIMABLE:
+        return False
+    return not (status == "failed" and (row.get("attempt") or 0) >= MAX_ATTEMPTS)
 
 
 def reconcile_trial_ledger(existing_text: str, rows: list[sqlite3.Row]) -> tuple[str, list[str], list[str]]:
@@ -1341,6 +1394,16 @@ def ensure_schema(conn: sqlite3.Connection) -> sqlite3.Connection:
         # `set_judge_state`, so a non-NULL value always means "the CURRENT `cannot_verify`
         # is a classifier outage" (the inbox reads it that way too).
         ("judge_retry_after", "ALTER TABLE runs ADD COLUMN judge_retry_after TEXT"),
+        # 🔁⚖️ CMX-263. Who is LAUNCHING this run's judge right now: the launching process's
+        # `judge.owner_identity` as JSON. `_spawn_judge` writes it in the same UPDATE that
+        # sets `running`, and clears it once `_launch_agent` returns (`set_judge_state` clears
+        # it too). Non-NULL on a `running` row means the launch never finished: in flight in a
+        # live process, or interrupted when its daemon died (`pm2 restart` mid-launch) — then
+        # the trigger relaunches it as the same round (`_judge_launch_interrupted`).
+        ("judge_launch_owner", "ALTER TABLE runs ADD COLUMN judge_launch_owner TEXT"),
+        # ⚖️🪜 CMX-288: the `chela.risktier` tier of the head the judge was last spawned on —
+        # `judge run` holds nothing out on a `standard` one. NULL ⇒ never stamped (full judge).
+        ("risk_tier", "ALTER TABLE runs ADD COLUMN risk_tier TEXT"),
         # 🤫 CMX-97. The judge's OWN tmux window — `_spawn_judge` calls `_launch_agent` with
         # `judge_window=True` (the run's `window_id` must stay the RUN's window, not a
         # judge that will be gone in twenty minutes; see `_launch_agent`'s docstring), which
@@ -1415,6 +1478,43 @@ def ensure_schema(conn: sqlite3.Connection) -> sqlite3.Connection:
         # budget), reset to 0 the moment CI is next seen passing (see the pr_checks refresh
         # in `tick`) — it counts a STREAK, not a lifetime total.
         ("ci_infra_streak", "ALTER TABLE runs ADD COLUMN ci_infra_streak INTEGER DEFAULT 0"),
+        # 🔁 CMX-255. A red CI re-runs its failed jobs once per head sha (`ci_rerun_sha`; a
+        # new push resets it) before it may spend a rework round. `ci_rerun_state` is
+        # pending → started (seen unsettled) → green | red, `ci_rerun_at` is when it fired,
+        # `ci_rerun_note` says what failed, `ci_flakes` is the JSON list of reds that came
+        # back green on their re-run (the flaky test ids).
+        ("ci_rerun_sha", "ALTER TABLE runs ADD COLUMN ci_rerun_sha TEXT"),
+        ("ci_rerun_state", "ALTER TABLE runs ADD COLUMN ci_rerun_state TEXT"),
+        ("ci_rerun_note", "ALTER TABLE runs ADD COLUMN ci_rerun_note TEXT"),
+        ("ci_rerun_at", "ALTER TABLE runs ADD COLUMN ci_rerun_at TEXT"),
+        ("ci_flakes", "ALTER TABLE runs ADD COLUMN ci_flakes TEXT"),
+        # 🧪 CMX-282. `ci_flake_reruns` counts the extra re-runs of a red that failed ONLY on
+        # registered flaky tests (`tests/flaky.toml`, ≤ flaky.FLAKE_RERUNS per sha); still red,
+        # `ci_known_flake` is the JSON `{sha, tests: [{test, issue}]}` and `ci_known_flake_sha`
+        # lets the judge take that head as CI-passing-with-known-flake.
+        ("ci_flake_reruns", "ALTER TABLE runs ADD COLUMN ci_flake_reruns INTEGER DEFAULT 0"),
+        ("ci_known_flake", "ALTER TABLE runs ADD COLUMN ci_known_flake TEXT"),
+        ("ci_known_flake_sha", "ALTER TABLE runs ADD COLUMN ci_known_flake_sha TEXT"),
+        # 🔀 CMX-262. `conflict_sha` is the head sha whose CONFLICTING was already handled
+        # (once per sha); `conflict_reworks` counts the conflict reworks, each one a round
+        # that is NOT charged against the cap (see `effective_rework_cap`).
+        ("conflict_sha", "ALTER TABLE runs ADD COLUMN conflict_sha TEXT"),
+        ("conflict_reworks", "ALTER TABLE runs ADD COLUMN conflict_reworks INTEGER DEFAULT 0"),
+        # 🏗️🔁 CMX-192. The rework cap bounds a PR that keeps FAILING REVIEW — and CMX-180
+        # hit "rework cap reached 3/3: the PR still fails review" with zero judge rounds (a
+        # clock flake, a human retry, a tmux death), because `rework_count` counts EVERY
+        # re-spawn. It still does (the round number, `_is_rework`); the cap reads these:
+        #   `rework_cause`   — why the run is (or last was) in `changes_requested`: `review`
+        #                      (a verdict — judge, reviewer, conflict) or `infra` (a CI
+        #                      send-back, a rework agent that died without handing in). NULL
+        #                      on a pre-CMX-192 row reads as `review`. `chela retry` keeps it.
+        #   `review_reworks` — re-spawns whose cause was `review`, the number the rework cap
+        #                      bounds. NULL on a pre-CMX-192 row reads as `rework_count`.
+        #   `infra_restarts` — infra EVENTS, counted when they happen, bounded by their own
+        #                      higher cap (`max_infra_restarts`) so a crash loop still stops.
+        ("rework_cause", "ALTER TABLE runs ADD COLUMN rework_cause TEXT"),
+        ("review_reworks", "ALTER TABLE runs ADD COLUMN review_reworks INTEGER"),
+        ("infra_restarts", "ALTER TABLE runs ADD COLUMN infra_restarts INTEGER DEFAULT 0"),
         # ⚖️🔒 CMX-389. The merge gate's BACKSTOP: set on the reconcile tick that finds a
         # run's PR MERGED without a clean judge on its merged head and without an audited
         # override (`merged_outside_gate`) — a human in a plain terminal, a non-Claude
@@ -1490,6 +1590,21 @@ def ensure_schema(conn: sqlite3.Connection) -> sqlite3.Connection:
         # ⏳ CMX-141. JSON {measured, total, exhausted, unrun: [{file, guard}]}: a hand-in
         # whose --self-check-experiments the budget cut short. NULL ⇒ it all ran.
         ("self_check_partial", "ALTER TABLE runs ADD COLUMN self_check_partial TEXT"),
+        # 🔀 CMX-189. JSON {base, behind, allow_behind}: a hand-in let through behind its base.
+        ("base_sync", "ALTER TABLE runs ADD COLUMN base_sync TEXT"),
+        # 🔎 CMX-209. JSON {no_review_reason}: a code hand-in let through with no `## Review`.
+        ("review_gate", "ALTER TABLE runs ADD COLUMN review_gate TEXT"),
+        # 🗂️⏸️ CMX-308. Why reconcile is HOLDING a run whose task left the tracker: its PR
+        # has not merged, so leaving is not done-evidence. Display-only (the Work card
+        # shows it when there is no `last_error`); cleared when the task is open again.
+        ("tracker_note", "ALTER TABLE runs ADD COLUMN tracker_note TEXT"),
+        # ⏸️ CMX-318. `chela park`: when (`parked_at`, NULL ⇒ not parked), why, until what
+        # (an ISO time or `run:<ID>`) and by whom. The stuck detector skips a parked run;
+        # a claim or a rework re-spawn clears all four (`chela/park.py`).
+        ("parked_at", "ALTER TABLE runs ADD COLUMN parked_at TEXT"),
+        ("parked_reason", "ALTER TABLE runs ADD COLUMN parked_reason TEXT"),
+        ("parked_until", "ALTER TABLE runs ADD COLUMN parked_until TEXT"),
+        ("parked_by", "ALTER TABLE runs ADD COLUMN parked_by TEXT"),
     ):
         if _column in existing_columns:
             continue  # already migrated — no DDL attempted, nothing to fail
@@ -1797,6 +1912,19 @@ def _judge_hit_classifier_outage(wf: WorkflowDef, row: sqlite3.Row) -> bool:
     return path is not None and _transcript_shows_classifier_outage(path)
 
 
+def _judge_model_call_failed(wf: WorkflowDef, row: sqlite3.Row) -> bool:
+    """⏸️⚖️ CMX-214: an IDLE judge whose last model call failed: an API error (a timed-out
+    request is one) or the CMX-379 classifier outage, the auto-mode model call."""
+    if _agent_status(row["judge_window_id"] or "") != "idle":
+        return False
+    path = _judge_transcript(wf, row)
+    if path is None:
+        return False
+    last = transcripts.latest_record(path, lambda o: o.get("type") in ("user", "assistant"))
+    return bool(last) and (last.get("isApiErrorMessage") is True
+                           or _transcript_shows_classifier_outage(path))
+
+
 def _dismiss_input_block(window_id: str) -> None:
     """Send Escape to a window whose agent is blocked on an input dialog.
 
@@ -1967,6 +2095,8 @@ def _prompt_vars(
         "repo_path": str(repo_path),
         "project_key": wf.project_key,
         "task_number": task_number,
+        # 📜 CMX-317: `agent.standing_rules` — "" (plus a warning) when the file is missing.
+        "standing_rules": standing_rules(wf),
     }
 
 
@@ -1975,7 +2105,7 @@ def _read_pr_status(pr_url: str | None, repo_dir: str | None) -> tuple[str | Non
 
     `state` is lowercased to match `pr_state in ('open','merged','closed')`.
     `mergeable` is GitHub's MERGEABLE/CONFLICTING/UNKNOWN, kept uppercase. Both
-    fields are advisory — the UI gates the Merge / Merge-all buttons on them —
+    fields are advisory (the UI gates the Merge button on them),
     so each element is None on any failure, leaving the previous value in place
     rather than erasing it. The two come from one `gh` call to keep the
     phase-0 refresh cheap.
@@ -2185,6 +2315,12 @@ def _read_pr_checks(pr_url: str | None, repo_dir: str | None) -> CIStatus:
     state, failing, run_ids, infra, plain_failures = _rollup_state(
         rollup if isinstance(rollup, list) else []
     )
+    if state == CI_FAILING and not failing:
+        # ⛔ CMX-256: a red names its job. None named means a shape the classifier did not
+        # recognise — PENDING (re-read next tick, aged out by 1c′), never an unnamed red.
+        log.warning("CI: %s read as failing with no failing job named — treated as PENDING",
+                    pr_url)
+        return CIStatus(CI_PENDING, sha, detail="a red with no failing job named")
     return CIStatus(state, sha, failing, run_ids, infra=infra, plain_failures=plain_failures)
 
 
@@ -2279,6 +2415,196 @@ def _inbox_forget_ci_edge(task_id: str) -> None:
         inbox.forget_edge(task_id, inbox.CI_RED_ECHO)
     except Exception:  # noqa: BLE001
         log.warning("CI: could not retract the inbox edge for %s", task_id, exc_info=True)
+
+
+# pytest's short-summary line names the test: `FAILED tests/x.py::test_y - AssertionError`.
+_FAILED_TEST_RE = re.compile(r"^(?:FAILED|ERROR) (\S+)")
+
+
+def _ci_failed_test(log_tail: str) -> str:
+    """🔁 CMX-255. The id of the test a red CI failed on — pytest's node id off the first
+    failing line when there is one, else that line itself, else ``?``."""
+    from chela.inbox import first_failure_line
+    line = first_failure_line(log_tail)
+    m = _FAILED_TEST_RE.match(line)
+    return m.group(1) if m else (line or "?")
+
+
+def _rerun_failed_jobs(repo_dir: str | None, run_ids: tuple[str, ...]) -> bool:
+    """🔁 CMX-255. ``gh run rerun <id> --failed`` (only the failed jobs) for every Actions
+    run behind a red rollup. True only when GitHub accepted every one; anything else is
+    False and the red is treated as real: a re-run nobody started must never park the run."""
+    if not repo_dir or not run_ids:
+        return False
+    for run_id in run_ids:
+        try:
+            out = subprocess.run(
+                ["gh", "run", "rerun", run_id, "--failed"],
+                cwd=repo_dir, capture_output=True, text=True, errors="replace", timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired) as e:
+            log.warning("CI: could not re-run the failed jobs of run %s: %s", run_id, e)
+            return False
+        if out.returncode != 0:
+            log.warning("CI: GitHub refused to re-run the failed jobs of run %s: %s", run_id,
+                        (out.stderr or out.stdout or "").strip()[:200])
+            return False
+    return True
+
+
+def _record_ci_flake(conn: sqlite3.Connection, row, sha: str) -> None:
+    """🔁 CMX-255. A red's re-run came back GREEN on the same sha: a flake. Append it to
+    ``runs.ci_flakes`` (the test id comes from the note written when the re-run fired)."""
+    try:
+        flakes = json.loads(row["ci_flakes"] or "[]")
+    except (json.JSONDecodeError, TypeError):
+        flakes = []
+    note = row["ci_rerun_note"] or ""
+    flakes.append({"sha": sha, "test": note.rpartition(" failed on ")[2] or "?",
+                   "note": note, "at": _now()})
+    conn.execute(
+        "UPDATE runs SET ci_rerun_state='green', ci_flakes=? WHERE task_id=?",
+        (json.dumps(flakes), row["task_id"]),
+    )
+    log.warning("CI flake on %s (%s): re-run green — %s", row["task_id"], sha[:12], note)
+
+
+def _record_known_flake(conn: sqlite3.Connection, row, sha: str, known: list[dict]) -> None:
+    """🧪 CMX-282: red ONLY on registered flaky tests after every re-run. Burn the sha (this
+    red is delivered), record ``ci_known_flake`` and say so, naming the issues."""
+    from chela import inbox
+    conn.execute(
+        "UPDATE runs SET ci_failed_sha=?, ci_rerun_state='known_flake', ci_known_flake=?, "
+        "ci_known_flake_sha=? WHERE task_id=?",
+        (sha, json.dumps({"sha": sha, "tests": known}), sha, row["task_id"]))
+    conn.commit()
+    note = ", ".join(f"{k['test']} ({k['issue']})" for k in known)
+    log.warning("CI on %s (%s) is red only on known flakes — %s; to the judge, not rework",
+                row["task_id"], sha[:12], note)
+    try:
+        inbox.ci_flake(dict(row), sha=sha, note=note, known=True)
+    except Exception:  # noqa: BLE001 — the inbox is advisory
+        log.warning("CI: could not queue the known-flake notice for %s", row["task_id"],
+                    exc_info=True)
+
+
+def _inbox_ci_flake(row, sha: str) -> None:
+    """🔁 CMX-255: "CI flake, re-run green" — once, best-effort, never costs the tick."""
+    from chela import inbox
+    try:
+        inbox.ci_flake(dict(row), sha=sha, note=row["ci_rerun_note"] or "")
+    except Exception:  # noqa: BLE001 — the inbox is advisory
+        log.warning("CI: could not queue the flake notice for %s", row["task_id"],
+                    exc_info=True)
+
+
+def _resolve_base_conflict(conn: sqlite3.Connection, wf: WorkflowDef, row, head: str) -> str:
+    """🔀 CMX-262. Merge ``origin/<base>`` into a CONFLICTING PR's branch in a scratch
+    worktree (:func:`chela.basemerge.attempt`): clean and green ⇒ pushed, recorded on the PR
+    ("base merged automatically"), and the judge grades the new head as usual. 🏭 CMX-300: a
+    conflict ONLY in the generated bundle is rebuilt and pushed the same way. A conflict, a
+    failed rebuild or a red merge ⇒ a rework that is NOT charged against the cap. 🏗️ CMX-323:
+    tests that could not START ⇒ :func:`_base_merge_infra`, never a rework. Returns ``merged``,
+    ``rework``, ``infra``, ``escalated``, or ``none`` (nothing could be measured, or nothing
+    to do)."""
+    from chela import basemerge
+    task_id = row["task_id"]
+    base = wf.get("workspace", "base_branch", default="master")
+    repo = str(wf.path.parent)
+    try:
+        res = basemerge.attempt(repo, row["branch_name"], base,
+                                wf.get("judge", "test_cmd", default="") or "")
+    except (RuntimeError, OSError) as e:
+        log.warning("Task %s: PR conflicts with origin/%s but the base merge could not be "
+                    "tried (%s) — retried next tick", task_id, base, e)
+        return "none"
+    if res["outcome"] in (basemerge.MERGED, basemerge.REBUILT, basemerge.CURRENT):
+        conn.execute("UPDATE runs SET conflict_sha=? WHERE task_id=?", (head, task_id))
+        conn.commit()
+        if res["outcome"] == basemerge.CURRENT:
+            return "none"
+        tests = (f"{len(res['files'])} targeted test file(s) green" if res["files"]
+                 else "no targeted tests ran; CI gates it")
+        how = (" (it conflicted only in the generated bundle, so the bundle was rebuilt from "
+               "the merged source and passed the stale-asset check)"
+               if res["outcome"] == basemerge.REBUILT else "")
+        _post_pr_comment(row["pr_url"], repo,
+                         f"🔀 Base merged automatically{how}: origin/{base} "
+                         f"`{res['base_sha'][:12]}` "
+                         f"→ merge commit `{res['merge_sha'][:12]}` ({tests}). A local checkout "
+                         "of this branch needs `git pull --ff-only` before its next commit.")
+        log.warning("Task %s: base merged automatically (origin/%s %s → %s)", task_id, base,
+                    res["base_sha"][:12], res["merge_sha"][:12])
+        return "merged"
+    if res["outcome"] == basemerge.INFRA:
+        return _base_merge_infra(conn, row, res, base, head)
+    # Burn the sha and grant the free round BEFORE the verdict, so 1d (below) never sees this
+    # round as charged; both are undone if the verdict is not written.
+    conn.execute("UPDATE runs SET conflict_sha=?, conflict_reworks=MIN(COALESCE("
+                 "conflict_reworks, 0) + 1, ?) WHERE task_id=?",
+                 (head, MAX_FREE_CONFLICT_REWORKS, task_id))
+    conn.commit()
+    try:
+        # 🔀 CMX-294: tagged free only when this round actually got a grant (the cap is MIN).
+        free = (row["conflict_reworks"] or 0) < MAX_FREE_CONFLICT_REWORKS
+        result = request_changes(task_id, basemerge.rework_body(res, base),
+                                 cause=REWORK_CAUSE_CONFLICT if free else REWORK_CAUSE_REVIEW)
+    except sqlite3.Error as e:
+        result = {"ok": False, "error": str(e)}
+    if not result.get("ok"):
+        conn.execute("UPDATE runs SET conflict_sha=?, conflict_reworks=? WHERE task_id=?",
+                     (row["conflict_sha"], row["conflict_reworks"] or 0, task_id))
+        conn.commit()
+        log.warning("Task %s: conflict rework not written: %s", task_id, result.get("error"))
+        return "none"
+    log.warning("Task %s: PR conflicts with origin/%s (%s) — sent back, not charged: %s",
+                task_id, base, res["outcome"], ", ".join(res["files"]))
+    return "rework"
+
+
+def _base_merge_infra(conn: sqlite3.Connection, row, res: dict, base: str, head: str) -> str:
+    """🏗️ CMX-323. The base merged cleanly but its targeted tests could not START (the scratch
+    worktree could not be provisioned, the runner never spawned, nothing was collected), so
+    nothing about the code was measured. Never sent back: counted as an infra restart (CMX-192,
+    not the review cap), the orchestrator told, and the head burned — ONE infra round per head,
+    so a box that stays broken does not spend the whole infra budget (shared with CI) and flood
+    the inbox in as many ticks. A new push, or a human, takes it from there. At the infra cap
+    the run escalates. A run that left ``awaiting_review`` during the attempt is not charged.
+    Returns ``infra``, ``escalated`` or ``none``."""
+    from chela import inbox
+    task_id = row["task_id"]
+    cur = conn.execute("UPDATE runs SET conflict_sha=?, infra_restarts=COALESCE(infra_restarts, "
+                       "0) + 1 WHERE task_id=? AND status='awaiting_review'", (head, task_id))
+    conn.commit()
+    if cur.rowcount != 1:
+        return "none"
+    restarts, cap = infra_restarts(row) + 1, infra_restart_cap(row)
+    why = tui_sanitize(judge._last_meaningful_line(res["detail"])) or "no detail"
+    log.warning("Task %s: origin/%s merges cleanly but the targeted tests could not start "
+                "(infra restart %s/%s, not sent back, not retried on this head): %s", task_id, base, restarts, cap, why)
+    try:
+        inbox.enqueue("run_base_merge_infra",
+                      f"🏗️ {row['branch_name'] or task_id}: origin/{base} merges cleanly but "
+                      f"its targeted tests could not start (infra {restarts}/{cap}) — NOT sent "
+                      f"back for rework, not retried on this head — {why}",
+                      {"task_id": task_id, "branch_name": row["branch_name"],
+                       "pr_url": row["pr_url"], "base_sha": res["base_sha"],
+                       "head_sha": res["head_sha"], "detail": res["detail"],
+                       "infra_restarts": restarts, "infra_restart_cap": cap})
+    except Exception:  # noqa: BLE001 — the inbox is advisory
+        log.warning("Task %s: could not queue the base-merge infra notice", task_id,
+                    exc_info=True)
+    if restarts < cap:
+        return "infra"
+    _escalate(conn, row,
+              f"infra restart cap reached ({restarts}/{cap}): origin/{base} merges cleanly "
+              f"into the PR but its targeted tests could not start in the scratch worktree: "
+              f"{why}",
+              recommendation="fix the host's test environment (`uv sync`, `pnpm install`), "
+                             "then `chela retry` the run",
+              options=["fix the environment and `chela retry`",
+                       "merge the base into the branch by hand"])
+    return "escalated"
 
 
 def _failing_log_tail(repo_dir: str | None, run_ids: tuple[str, ...]) -> str:
@@ -2628,6 +2954,15 @@ def _kill_window(window_name: str) -> None:
     )
 
 
+def _end_agent(window_name: str | None, row) -> None:
+    """Kill a run's agent window, then reap what its tool calls left running in its worktree
+    (CMX-274: a timed-out Bash call's pytest tree outlives the call AND the window)."""
+    if window_name:
+        _kill_window(window_name)
+    if row["worktree_path"]:
+        reap_run_worktree(row["worktree_path"], row["workflow_path"], graceful=True)
+
+
 def _kill_windows_named(window_name: str) -> None:
     """Kill every existing tmux window in TMUX_SESSION whose name == window_name.
 
@@ -2851,6 +3186,121 @@ def verify_sweep(task_id: str) -> dict:
     return sweep.run_sweep(row["worktree_path"], workflow_path=row["workflow_path"])
 
 
+def hand_in_tier(task_id: str) -> str:
+    """⚖️🪜 CMX-296: the ``chela.risktier`` tier of the run's OWN worktree diff vs
+    ``origin/<base>`` — what ``task-finished`` checks. Anything it cannot read is CORE: an
+    unknown never earns the lighter standard hand-in."""
+    with _db() as conn:
+        row = conn.execute("SELECT * FROM runs WHERE task_id=?", (task_id,)).fetchone()
+    if row is None or not row["worktree_path"] or not row["workflow_path"]:
+        return risktier.CORE
+    try:
+        wf = load_workflow(row["workflow_path"])
+        files = judge._changed_files(Path(row["worktree_path"]),
+                                     wf.get("workspace", "base_branch", default="master"))
+    except Exception as e:  # noqa: BLE001 — an unreadable tier is core, never a crash
+        log.warning("hand-in: %s: could not read the tier: %s", task_id, e)
+        return risktier.CORE
+    return risktier.classify(files, risktier.always_human(wf), risktier.core(wf))[0]
+
+
+def hand_in_checks(tier: str, *, experiments: bool) -> tuple[str, ...]:
+    """⚖️🪜 CMX-296: the checks ``task-finished`` runs, in order. A STANDARD run gets lint and
+    ONE full-suite run — no experiment battery, no sweep (it gets no judge round either). Every
+    other tier keeps the self-check (when an experiments file was given) and the sweep."""
+    if tier == risktier.STANDARD:
+        return ("lint", "suite")
+    return ("self_check", "sweep") if experiments else ("sweep",)
+
+
+def verify_standard_hand_in(task_id: str) -> dict:
+    """⚖️🪜 CMX-296: a STANDARD run's hand-in — the workflow's ``hand_in.lint_cmd``, then its
+    ``judge.test_cmd`` once, under ``judge.suite_timeout_seconds``, in the run's OWN worktree.
+    ``{"ok", "steps": [{name, cmd, passed, detail}]}``; ``ok`` is False when a step ran red
+    or could not run. An unset lint is skipped, and says so; an unset suite fails CLOSED —
+    a standard PR gets no judge round, so its one suite run is the only measurement."""
+    with _db() as conn:
+        row = conn.execute("SELECT * FROM runs WHERE task_id=?", (task_id,)).fetchone()
+    if row is None or not row["worktree_path"] or not row["workflow_path"]:
+        return {"ok": False, "error": f"no run with a worktree on record for {task_id}"}
+    try:
+        wf = load_workflow(row["workflow_path"])
+    except Exception as e:
+        return {"ok": False, "error": f"{row['workflow_path']} could not be read: {e}"}
+    lint = wf.get("hand_in", "lint_cmd", default=None)
+    lint = lint.strip() if isinstance(lint, str) else ""
+    timeout = judge.judge_suite_timeout(wf)
+    steps = []
+    for name, cmd in (("lint", lint), ("suite", judge.judge_test_cmd(wf))):
+        if not cmd and name == "suite":
+            steps.append({"name": name, "cmd": "", "passed": False,
+                          "detail": "the workflow sets no `judge.test_cmd` — nothing to run"})
+            return {"ok": False, "steps": steps}
+        if not cmd:
+            steps.append({"name": name, "cmd": "", "passed": None,
+                          "detail": "the workflow sets no `hand_in.lint_cmd` — skipped"})
+            continue
+        res = judge.run_suite(cmd, Path(row["worktree_path"]), timeout=timeout)
+        passed = res.ok and res.exit_code == 0
+        detail = res.detail or ("" if passed else f"exit {res.exit_code}\n{res.tail[-2000:]}")
+        steps.append({"name": name, "cmd": cmd, "passed": passed, "detail": detail})
+        if not passed:
+            return {"ok": False, "steps": steps}
+    return {"ok": True, "steps": steps}
+
+
+def check_base_sync(task_id: str, allow_behind: bool = False) -> dict:
+    """🔀 CMX-189: run FIRST in task-finished. Refuses a branch conflicting with, or (without
+    ``allow_behind``) behind, a fresh ``origin/<base>``; fails CLOSED when git cannot say.
+    ``{"ok", "record"}``; record is None unless ``allow_behind`` let a stale branch through."""
+    with _db() as conn:
+        row = conn.execute("SELECT * FROM runs WHERE task_id=?", (task_id,)).fetchone()
+    if row is None or not row["worktree_path"] or not row["workflow_path"]:
+        return {"ok": False, "error": f"no run with a worktree on record for {task_id}"}
+    try:
+        base = load_workflow(row["workflow_path"]).get("workspace", "base_branch",
+                                                       default="master")
+        state = basesync.check(row["worktree_path"], base)
+    except Exception as e:
+        return {"ok": False, "error": f"could not check this branch against its base — {e}. "
+                                      "Unknown is not in sync: fix the remote and re-run."}
+    if state["conflicts"] or (state["behind"] and not allow_behind):
+        return {"ok": False, "error": basesync.refusal(base, state["behind"], state["conflicts"])}
+    if state["behind"]:
+        return {"ok": True, "record": {"base": base, "behind": state["behind"],
+                                       "allow_behind": True}}
+    try:
+        since = basesync.base_sha(row["worktree_path"], base)
+    except RuntimeError as e:
+        return {"ok": False, "error": f"could not check this branch against its base — {e}"}
+    return {"ok": True, "record": None, "since": since}
+
+
+def reconcile_base_move(task_id: str, since: str, experiments: str | None) -> dict:
+    """⚖️🔀 CMX-334: after task-finished's checks — :func:`chela.handinmove.reconcile` on the
+    run's own worktree. A base it merged in is pushed: a push request is filed unless one is
+    still pending (the daemon pushes the branch as it stands when it applies that one)."""
+    with _db() as conn:
+        row = conn.execute("SELECT * FROM runs WHERE task_id=?", (task_id,)).fetchone()
+    if row is None or not row["worktree_path"] or not row["workflow_path"]:
+        return {"ok": False, "error": f"no run with a worktree on record for {task_id}"}
+    try:
+        wf = load_workflow(row["workflow_path"])
+    except Exception as e:
+        return {"ok": False, "error": f"{row['workflow_path']} could not be read: {e}"}
+    base = wf.get("workspace", "base_branch", default="master")
+    out = handinmove.reconcile(Path(row["worktree_path"]), wf, row["workflow_path"], base,
+                               since, experiments)
+    if out.get("moved"):
+        out["record"] = {"base": base, "moved": out["moved"]}
+        if not _push_request_path(row["worktree_path"]).exists():
+            pushed = request_push(task_id)
+            if not pushed.get("ok"):
+                return {"ok": False, "error": f"merged origin/{base}, but could not request "
+                                              f"its push: {pushed.get('error')}"}
+    return out
+
+
 def check_hand_in_size(task_id: str, oversize_reason: str | None = None,
                        plan_path: str | None = None) -> dict:
     """📏 CMX-126: the hand-in size gate — run BEFORE the sweep, so an oversized diff is
@@ -2889,6 +3339,30 @@ def check_hand_in_size(task_id: str, oversize_reason: str | None = None,
     return {"ok": False, "error": (
         f"this branch changes {lines} lines (limit {limit}; docs/media excluded). Split it "
         "into ≤-limit PRs (--split-plan); only if it truly cannot be split, pass --oversize-reason '<why>'.")}
+
+
+def check_review_section(task_id: str, no_review_reason: str | None = None) -> dict:
+    """🔎 CMX-209: the self-review gate — a code PR's body must carry ``## Review`` (see
+    :mod:`chela.reviewgate`). ``{"ok", "record"}``; a prose-only diff needs none, and
+    ``--no-review-reason`` lets the hand-in through with the reason as the record."""
+    with _db() as conn:
+        row = conn.execute("SELECT * FROM runs WHERE task_id=?", (task_id,)).fetchone()
+    if row is None or not row["worktree_path"] or not row["workflow_path"]:
+        return {"ok": False, "error": f"no run with a worktree on record for {task_id}"}
+    if reason := (no_review_reason or "").strip():
+        return {"ok": True, "record": {"no_review_reason": reason[:HANDOFF_MAX_CHARS]}}
+    worktree = row["worktree_path"]
+    try:
+        base = load_workflow(row["workflow_path"]).get("workspace", "base_branch", default="master")
+        if judge._docs_only_diff(Path(worktree), base) is True:
+            return {"ok": True, "record": None}
+        body = reviewgate.read_body(worktree, row["pr_url"], _push_request_path(worktree))
+    except Exception as e:
+        return {"ok": False, "error": f"could not read this PR's body — {e}. Unknown is not "
+                                      "reviewed."}
+    if reviewgate.has_review(body):
+        return {"ok": True, "record": None}
+    return {"ok": False, "error": reviewgate.REFUSAL}
 
 
 def file_split(task_id: str, record: dict, slices: list[dict]) -> dict:
@@ -3035,6 +3509,7 @@ def _clean_handoff(value) -> str | None:
 def mark_awaiting_review(
     task_id: str, *, handoff: str | None = None, sweep_equivalents: list[dict] | None = None,
     size_gate: dict | None = None, self_check_partial: dict | None = None,
+    base_sync: dict | None = None, review_gate: dict | None = None,
 ) -> dict:
     """Transition a run from running → awaiting_review and kill its tmux window.
 
@@ -3085,8 +3560,16 @@ def mark_awaiting_review(
         pr_url = row["pr_url"] or _read_pr_url(window_name, repo_dir)
         effective_pr_url = pr_url
         pr_state, pr_mergeable = _read_pr_status(effective_pr_url, repo_dir)
+        # ⚖️🔀 CMX-280: `pr_head_sha=NULL` — the head is UNKNOWN until tick step 0b reads it.
+        # A `running` row's checks are never polled, so the column still holds the head from
+        # BEFORE this round's push; kept, it equals the old round's `judge_sha`, and the
+        # same tick's 1e′ escalated a rework of a spent `cannot_verify` on the OLD head's
+        # verdict and try count (CMX-251, 10-19) — the new head was never judged. NULL
+        # matches neither the judge trigger nor 1e′ until the next tick's poll fills it in
+        # (an unreadable poll just retries, like any CI UNKNOWN); the merge gate is not
+        # affected — `contract.merge` compares the verdict to the head GitHub reports.
         conn.execute(
-            "UPDATE runs SET status='awaiting_review', ended_at=?, "
+            "UPDATE runs SET status='awaiting_review', ended_at=?, pr_head_sha=NULL, "
             "pr_url=COALESCE(?, pr_url), pr_state=COALESCE(?, pr_state), "
             "pr_mergeable=COALESCE(?, pr_mergeable) WHERE task_id=?",
             (_now(), pr_url, pr_state, pr_mergeable, task_id),
@@ -3100,10 +3583,14 @@ def mark_awaiting_review(
                      (json.dumps(size_gate) if size_gate else None, task_id))
         conn.execute("UPDATE runs SET self_check_partial=? WHERE task_id=?",
                      (json.dumps(self_check_partial) if self_check_partial else None, task_id))
+        conn.execute("UPDATE runs SET base_sync=? WHERE task_id=?",
+                     (json.dumps(base_sync) if base_sync else None, task_id))
+        conn.execute("UPDATE runs SET review_gate=? WHERE task_id=?",
+                     (json.dumps(review_gate) if review_gate else None, task_id))
         conn.commit()
         note = sizegate.render(size_gate or {})
         for what, text in (("size-gate", note), ("self-check", judge.render_self_check_partial(
-                self_check_partial or {}))):
+                self_check_partial or {})), ("review", reviewgate.render(review_gate or {}))):
             if text and effective_pr_url:
                 ok, detail = _append_pr_body(effective_pr_url, repo_dir, text)
                 if not ok:
@@ -3119,8 +3606,7 @@ def mark_awaiting_review(
             if not ok:
                 log.warning("Task %s: sweep-equivalent notes not added to the PR body — %s",
                             task_id, detail)
-        if window_name:
-            _kill_window(window_name)
+        _end_agent(window_name, row)
         return {
             "ok": True,
             "task_id": task_id,
@@ -3187,6 +3673,7 @@ def _read_task_finished_size_gate(worktree_path: str | Path,
 def request_task_finished(
     task_id: str, *, handoff: str | None = None, sweep_equivalents: list[dict] | None = None,
     size_gate: dict | None = None, self_check_partial: dict | None = None,
+    base_sync: dict | None = None, review_gate: dict | None = None,
 ) -> dict:
     """Record that a dispatched agent believes its work is done — called by `chela
     task-finished`, IN PLACE OF the direct `mark_awaiting_review` call it used to make.
@@ -3241,6 +3728,10 @@ def request_task_finished(
         request["size_gate"] = size_gate
     if self_check_partial:
         request["self_check_partial"] = self_check_partial
+    if base_sync:
+        request["base_sync"] = base_sync
+    if review_gate:
+        request["review_gate"] = review_gate
     _task_finished_request_path(worktree_path).write_text(
         json.dumps(request), encoding="utf-8",
     )
@@ -3517,6 +4008,7 @@ def mark_rework_disputed(task_id: str, reason: str) -> dict:
                          "— nothing was changed. Re-read it and decide again.",
             }
         rework_count = fresh["rework_count"] or 0
+        review_round = review_reworks(fresh)        # 🏗️🔁 CMX-192: what the cap counts
         reviews = reviews_of(dict(fresh))
         reviews.append({
             "round": len(reviews) + 1, "at": _now(), "body": reason, "verdict": "disputed",
@@ -3528,7 +4020,7 @@ def mark_rework_disputed(task_id: str, reason: str) -> dict:
         if head_moved:
             new_status = "awaiting_review"
             text = (
-                f"🔀 Rework round {rework_count}/{_rework_cap(fresh)} disputed by the agent, "
+                f"🔀 Rework round {review_round}/{_rework_cap(fresh)} disputed by the agent, "
                 f"but the PR's head already moved past the disputed verdict "
                 f"(`{judge_sha[:12]}` → `{ci.head_sha[:12]}`) — routed back to automatic "
                 f"review instead of a human; the new head still goes through the judge "
@@ -3542,7 +4034,7 @@ def mark_rework_disputed(task_id: str, reason: str) -> dict:
         else:
             new_status = "needs_human"
             text = _format_escalation(
-                f"🔁🚫 Rework round {rework_count}/{_rework_cap(fresh)} disputed by the agent — "
+                f"🔁🚫 Rework round {review_round}/{_rework_cap(fresh)} disputed by the agent — "
                 f"nothing was pushed: {reason}",
                 recommendation="Read the agent's reasoning against the verdict. If it's right, "
                                 "`chela retry` to send the same head through the loop again "
@@ -3561,8 +4053,7 @@ def mark_rework_disputed(task_id: str, reason: str) -> dict:
                 (_now(), text, json.dumps(reviews), task_id),
             )
         conn.commit()
-        if window_name:
-            _kill_window(window_name)
+        _end_agent(window_name, fresh)
     repo_dir = str(Path(wf_path).parent) if wf_path else None
     posted, detail = _post_pr_comment(pr_url, repo_dir, text)
     if head_moved:
@@ -3589,6 +4080,7 @@ def mark_rework_disputed(task_id: str, reason: str) -> dict:
         "ok": True, "task_id": task_id, "status": new_status,
         "branch_name": row.get("branch_name"), "pr_url": pr_url,
         "rework_count": rework_count, "max_reworks": _rework_cap(row),
+        "review_reworks": review_round,
         "comment_posted": posted, "comment_detail": detail,
         "head_moved": head_moved,
     }
@@ -3661,7 +4153,7 @@ def merged_outside_gate(run: dict) -> bool:
     """
     judge_sha = run.get("judge_sha")
     head = run.get("pr_head_sha")
-    if run.get("judge_state") == judge.J_CLEAN and not (judge_sha and head and judge_sha != head):
+    if run.get("judge_state") in judge.MERGE_READY and not (judge_sha and head and judge_sha != head):
         return False
     for override in merge_overrides(run):
         sha = override.get("head_sha")
@@ -3966,6 +4458,7 @@ def adopt_pr(pr_ident: str, workflow_path: str | Path, *, reason: str = "") -> d
 
 def request_changes(
     ident: str, body: str, *, post_comment: bool = True, mutations: list[dict] | None = None,
+    judge_state: str | None = None, cause: str = "review",
 ) -> dict:
 
     """FAIL a PR under review: the run goes to ``changes_requested`` and the loop turns.
@@ -3999,6 +4492,12 @@ def request_changes(
     It increments nothing. ``rework_count`` is spent when the dispatcher actually spawns
     the rework (:func:`_respawn_rework`) — a verdict that never gets a concurrency slot
     must not burn a round of the cap.
+
+    🏗️🔁 CMX-192: ``cause`` is written to ``rework_cause`` in the same write — ``review``
+    (the default: a judge, a reviewer, a conflict) spends a rework-cap round when it is
+    re-spawned; ``infra`` (the CI send-back) does not, and is counted in ``infra_restarts``.
+    ``conflict`` (CMX-294) is a free conflict round: a review round to the budgets, kept
+    distinct only so the inbox notice does not word it as a charged rework.
     """
     body = (body or "").strip()
     if not body:
@@ -4025,10 +4524,16 @@ def request_changes(
         # while the reviewer was typing) in between, an unconditional UPDATE would RESURRECT
         # a merged run — and the next tick would dutifully re-spawn an agent onto a branch
         # whose PR is closed. The row moves only if it is still the row we judged.
+        # ⏹️⚖️ CMX-286: ``judge_state`` (the judge's own send-back) moves in the SAME write,
+        # so the row is never `changes_requested` under a `running` judge that
+        # `_cancel_moot_judges` would read as sent back by someone else and kill mid-verdict.
         cur = conn.execute(
-            "UPDATE runs SET status='changes_requested', review_history=? "
+            "UPDATE runs SET status='changes_requested', review_history=?, "
+            "judge_state=COALESCE(?, judge_state), rework_cause=? "
             "WHERE task_id=? AND status='awaiting_review'",
-            (json.dumps(reviews), task_id),
+            (json.dumps(reviews), judge_state,
+             cause if cause in (REWORK_CAUSE_INFRA, REWORK_CAUSE_CONFLICT) else REWORK_CAUSE_REVIEW,
+             task_id),
         )
         conn.commit()
         if cur.rowcount == 0:
@@ -4062,6 +4567,7 @@ def request_changes(
         "ok": True, "task_id": task_id, "status": "changes_requested",
         "branch_name": run.get("branch_name"), "pr_url": run.get("pr_url"),
         "round": len(reviews), "rework_count": run.get("rework_count") or 0,
+        "review_reworks": review_reworks(run),
         "max_reworks": _rework_cap(run), "comment_posted": posted, "comment_detail": detail,
         # The CLI checks that SOMETHING will actually come and pick this run up before it
         # tells the reviewer so (main._rework_prospects). It needs the workflow to check.
@@ -4131,6 +4637,11 @@ def approve(ident: str, body: str = "", force: bool = False) -> dict:
     }
 
 
+# 🗂️⏸️ CMX-308: the prefix of `tracker_note` — reconcile holding a run whose task left the
+# tracker while its PR is not merged (the rest names the PR's state).
+TRACKER_LEFT_NOTE = "issue left the tracker's ready states; "
+
+
 # 🧊🔓 CMX-387: the statuses `reopen` accepts. `done` only under `_done_reopen_refusal`.
 REOPENABLE_STATUSES = ("needs_human", "done")
 
@@ -4151,6 +4662,8 @@ def _done_reopen_refusal(run: dict) -> str | None:
     * the task must not be struck ``- [x]`` in its tracker — the dispatcher strikes only on
       merge, so a struck line says this task is finished whatever the PR says. A tracker
       this cannot read (or a tracker kind with no notion of a struck line) is refused.
+      🗂️🔓 CMX-308: except ``linear``, which chela never strikes — its issues close on
+      GitHub's say-so, even for another task's PR — so its OPEN PR above is the evidence.
     """
     wf_path = run.get("workflow_path")
     repo_dir = str(Path(wf_path).parent) if wf_path else None
@@ -4163,7 +4676,15 @@ def _done_reopen_refusal(run: dict) -> str | None:
         return (f"run is `done` and its PR is {pr_state.upper()} — only a `done` run whose PR "
                 "is still OPEN can be reopened; a merged or closed PR stays closed.")
     try:
-        source = get_source(load_workflow(wf_path))
+        wf = load_workflow(wf_path)
+        # 🗂️🔓 CMX-308: a linear tracker has no struck line — chela never strikes a Linear
+        # issue on merge; its state moves on GitHub's say-so (Linear's own integration closes
+        # an issue a merged PR NAMES, even another task's PR). The PR state read above is the
+        # finished-or-not evidence there, so an OPEN PR is enough. Other kinds keep the
+        # struck-line check below (gh_issues, with no `closed_ids_from_text`, stays refused).
+        if wf.get("tracker", "kind") == "linear":
+            return None
+        source = get_source(wf)
     except Exception as e:  # noqa: BLE001 — any failure to read the tracker is a refusal
         return (f"run is `done` and its tracker could not be loaded ({e}) — refusing to reopen "
                 "without knowing whether the task was struck done.")
@@ -4293,10 +4814,14 @@ def reopen(ident: str, reason: str = "") -> dict:
         # resurrected out of `done`.
         cur = conn.execute(
             "UPDATE runs SET status='awaiting_review', review_history=?, last_error=NULL, "
-            "pr_head_sha=?, reopen_count=?, first_reopen_head_sha=? "
-            "WHERE task_id=? AND status=?",
-            (json.dumps(reviews), ci.head_sha, new_reopen_count, first_reopen_sha, task_id,
-             from_status),
+            "pr_head_sha=?, pr_checks=?, ci_pending_since=?, reopen_count=?, "
+            "first_reopen_head_sha=? WHERE task_id=? AND status=?",
+            # ⛔ CMX-256: the checks read above is about THIS head — store it with the head.
+            # Moving `pr_head_sha` while keeping the old head's `pr_checks='failing'` is a
+            # red the CI loop could act on before anyone read the new head's checks.
+            (json.dumps(reviews), ci.head_sha, ci.state,
+             _now() if ci.state == CI_PENDING else None, new_reopen_count, first_reopen_sha,
+             task_id, from_status),
         )
         conn.commit()
         if cur.rowcount == 0:
@@ -4352,6 +4877,7 @@ def reopen(ident: str, reason: str = "") -> dict:
         "ok": True, "task_id": task_id, "status": "awaiting_review",
         "branch_name": run.get("branch_name"), "pr_url": run.get("pr_url"),
         "rework_count": run.get("rework_count") or 0, "max_reworks": _rework_cap(run),
+        "review_reworks": review_reworks(run),
         "reopen_count": new_reopen_count,
         "comment_posted": posted, "comment_detail": detail,
     }
@@ -4413,8 +4939,11 @@ def retry(ident: str, reason: str = "") -> dict:
     with _db() as conn:
         cur = conn.execute(
             "UPDATE runs SET status='changes_requested', review_history=?, last_error=NULL, "
-            "retry_count=? WHERE task_id=? AND status='needs_human'",
-            (json.dumps(reviews), new_retry_count, task_id),
+            "retry_count=?, rework_cause=CASE WHEN rework_cause=? THEN ? ELSE rework_cause "
+            "END WHERE task_id=? AND status='needs_human'",
+            # 🔀 CMX-294: a human-granted round is never a free conflict round.
+            (json.dumps(reviews), new_retry_count, REWORK_CAUSE_CONFLICT, REWORK_CAUSE_REVIEW,
+             task_id),
         )
         conn.commit()
         if cur.rowcount == 0:
@@ -4450,6 +4979,7 @@ def retry(ident: str, reason: str = "") -> dict:
         "ok": True, "task_id": task_id, "status": "changes_requested",
         "branch_name": run.get("branch_name"), "pr_url": run.get("pr_url"),
         "rework_count": run.get("rework_count") or 0, "max_reworks": cap,
+        "review_reworks": review_reworks(run),
         "retry_count": new_retry_count,
         "comment_posted": posted, "comment_detail": detail,
     }
@@ -4664,6 +5194,7 @@ def close_run(ident: str, reason: str, *, force: bool = False, close_pr: bool = 
     if run.get("window_name") and live_wid:
         _kill_windows_named(run["window_name"])
         window_killed = True
+    _end_agent(None, run)
 
     wf_path = run.get("workflow_path")
     repo_dir = str(Path(wf_path).parent) if wf_path else None
@@ -4754,14 +5285,15 @@ def set_judge_state(task_id: str, state: str, detail: str = "", *, sha: str | No
         if sha:
             conn.execute(
                 "UPDATE runs SET judge_state=?, judge_detail=?, judge_sha=?, "
-                "judge_no_verdict=?, judge_retry_after=NULL, judge_unknown_final=0 "
-                "WHERE task_id=?",
+                "judge_no_verdict=?, judge_retry_after=NULL, judge_unknown_final=0, "
+                "judge_launch_owner=NULL WHERE task_id=?",
                 (state, (detail or "")[:2000], sha, int(no_verdict), task_id),
             )
         else:
             conn.execute(
                 "UPDATE runs SET judge_state=?, judge_detail=?, judge_no_verdict=?, "
-                "judge_retry_after=NULL, judge_unknown_final=0 WHERE task_id=?",
+                "judge_retry_after=NULL, judge_unknown_final=0, judge_launch_owner=NULL "
+                "WHERE task_id=?",
                 (state, (detail or "")[:2000], int(no_verdict), task_id),
             )
         conn.commit()
@@ -4887,6 +5419,56 @@ def acknowledge_blocked_race(ident: str, by: str = "", note: str = "") -> dict:
         "ok": True, "task_id": task_id, "pr_url": run.get("pr_url"),
         "by": who, "at": when, "sha": sha,
     }
+
+
+def park_run(ident: str, reason: str, until: str | None = None, by: str = "") -> dict:
+    """⏸️ CMX-318: park a claimed/running run — the stuck detector skips it until
+    ``unpark_run`` or until the park outlives ``until`` / ``config.park_max_s()`` (then ONE
+    notice). The run keeps its slot and its window: nothing here touches tmux or the
+    worktree. Who may call it is the CLI's check (``park.refusal``); ``until`` is already
+    parsed (``park.parse_until``). Re-parking a parked run restarts its clock."""
+    run = resolve_run(ident)
+    if run is None:
+        return {"ok": False, "error": f"no run matches {ident!r} (task id, branch, or window name)"}
+    task_id = run["task_id"]
+    reason = (reason or "").strip()
+    if not reason:
+        return {"ok": False, "task_id": task_id, "error": "a park needs a --reason"}
+    when = _now()
+    with _db() as conn:
+        cur = conn.execute(
+            "UPDATE runs SET parked_at=?, parked_reason=?, parked_until=?, parked_by=? "
+            "WHERE task_id=? AND status IN ('claimed', 'running')",
+            (when, reason, until, by or None, task_id))
+        conn.commit()
+    if cur.rowcount == 0:
+        return {"ok": False, "task_id": task_id,
+                "error": f"{task_id} is {run.get('status')!r} — only a claimed or running "
+                         "run's agent can be parked"}
+    event_log.append("run_parked", f"{task_id}: parked by {by or 'unknown'} — {reason}",
+                     payload={"task_id": task_id, "by": by, "at": when, "reason": reason,
+                              "until": until})
+    return {"ok": True, "task_id": task_id, "at": when, "reason": reason, "until": until,
+            "by": by}
+
+
+def unpark_run(ident: str, by: str = "") -> dict:
+    """⏸️ CMX-318: clear a park. The stuck clock restarts from now (the inbox kept the run
+    active while parked), so an unparked agent gets the full quiet budget again."""
+    run = resolve_run(ident)
+    if run is None:
+        return {"ok": False, "error": f"no run matches {ident!r} (task id, branch, or window name)"}
+    task_id = run["task_id"]
+    with _db() as conn:
+        cur = conn.execute(
+            "UPDATE runs SET parked_at=NULL, parked_reason=NULL, parked_until=NULL, "
+            "parked_by=NULL WHERE task_id=? AND parked_at IS NOT NULL", (task_id,))
+        conn.commit()
+    if cur.rowcount == 0:
+        return {"ok": False, "task_id": task_id, "error": f"{task_id} is not parked"}
+    event_log.append("run_unparked", f"{task_id}: unparked by {by or 'unknown'}",
+                     payload={"task_id": task_id, "by": by})
+    return {"ok": True, "task_id": task_id}
 
 
 def _cleanup_worktree_on_done(wf: WorkflowDef, row: sqlite3.Row) -> None:
@@ -5078,7 +5660,8 @@ def _refused(error: str | None, refused: bool = False) -> dict:
         "dispatched": 0,
         "pr_state_refreshed": 0, "watchdog_renudged": 0, "tracker_struck": 0,
         "reworked": 0, "escalated": 0, "ci_failed": 0, "ci_infra_failed": 0,
-        "judged": 0, "judge_lost": 0, "judge_stranded": 0,
+        "ci_rerun": 0, "ci_flake": 0, "ci_known_flake": 0, "base_merged": 0, "base_conflict": 0,
+        "base_infra": 0, "judged": 0, "judge_cancelled": 0, "judge_lost": 0, "judge_stranded": 0,
         "trial_ledger": 0, "disk_budget_exceeded": False, "window_reaped": 0,
         "blocked": True, "error": error, "held": False, "hold_expired": False,
         "refused": refused,
@@ -5240,6 +5823,7 @@ def tick(workflow_path: str | Path) -> dict:
         "reconciled_done": 0,
         "reconciled_closed": 0,
         "reconciled_failed": 0,
+        "tracker_left_pr_open": 0,
         "push_applied": 0,
         "task_finished_applied": 0,
         "dispatched": 0,
@@ -5252,7 +5836,14 @@ def tick(workflow_path: str | Path) -> dict:
         "escalated": 0,
         "ci_failed": 0,
         "ci_infra_failed": 0,
+        "ci_rerun": 0,
+        "ci_flake": 0,
+        "ci_known_flake": 0,
+        "base_merged": 0,
+        "base_conflict": 0,
+        "base_infra": 0,
         "judged": 0,
+        "judge_cancelled": 0,
         "judge_lost": 0,
         "judge_stranded": 0,
         "trial_ledger": 0,
@@ -5280,7 +5871,7 @@ def tick(workflow_path: str | Path) -> dict:
         # Kanban only gates the Merge button on `pr_state === 'open'`, so once
         # we've seen a terminal state there's nothing to recheck. mergeable can
         # flip CONFLICTING/MERGEABLE as sibling PRs land, so refreshing it on
-        # every tick (for still-open PRs) keeps the Merge-all count honest.
+        # every tick (for still-open PRs) keeps the Merge button honest.
         # Runs against rows of any status that carry a pr_url (done cards still
         # surface a Merge button in the UI).
         #
@@ -5289,7 +5880,8 @@ def tick(workflow_path: str | Path) -> dict:
         # a cycle, and the reward for hitting the rate limit is CI_UNKNOWN on everything,
         # which (correctly, and catastrophically) refuses every merge at once.
         pr_rows = conn.execute(
-            "SELECT task_id, status, pr_url, workflow_path, pr_head_sha, ci_pending_since "
+            "SELECT task_id, status, pr_url, workflow_path, pr_head_sha, ci_pending_since, "
+            "ci_rerun_sha, ci_rerun_state, ci_rerun_note, ci_flakes, pr_mergeable "
             "FROM runs WHERE workflow_path=? AND pr_url IS NOT NULL "
             "AND (pr_state IS NULL OR pr_state='open')",
             (str(wf.path),),
@@ -5331,6 +5923,8 @@ def tick(workflow_path: str | Path) -> dict:
                     )
             reads.append((pr_row, state, mergeable, ci))
 
+        flaked: list[tuple] = []     # (row, sha) re-run green this tick — told after commit
+        conflicted: list[str] = []   # 🔀 CMX-262: CONFLICTING on this tick AND the last one
         for pr_row, state, mergeable, ci in reads:
             if ci is not None:
                 # The unsettled clock: started when a pending spell begins, restarted when a
@@ -5353,6 +5947,20 @@ def tick(workflow_path: str | Path) -> dict:
                         "UPDATE runs SET ci_infra_streak=0 WHERE task_id=?",
                         (pr_row["task_id"],),
                     )
+                # 🔁 CMX-255: the re-run of this sha is in flight (seen unsettled), or green
+                # on the SAME sha whose red was re-run ⇒ it was a flake.
+                head = ci.head_sha or pr_row["pr_head_sha"]
+                rerun_live = (pr_row["ci_rerun_state"] in ("pending", "started")
+                              and head and head == pr_row["ci_rerun_sha"])
+                if rerun_live and ci.state == CI_PENDING:
+                    conn.execute("UPDATE runs SET ci_rerun_state='started' WHERE task_id=?",
+                                 (pr_row["task_id"],))
+                if rerun_live and ci.state == CI_PASSING:
+                    _record_ci_flake(conn, pr_row, head)
+                    flaked.append((pr_row, head))
+                    summary["ci_flake"] += 1
+            if mergeable == "CONFLICTING" and pr_row["pr_mergeable"] == "CONFLICTING":
+                conflicted.append(pr_row["task_id"])
             if state is None and mergeable is None:
                 continue
             # COALESCE so a partial read (e.g. mergeable still UNKNOWN right
@@ -5365,6 +5973,8 @@ def tick(workflow_path: str | Path) -> dict:
             )
             summary["pr_state_refreshed"] += 1
         conn.commit()
+        for pr_row, sha in flaked:
+            _inbox_ci_flake(pr_row, sha)
 
         # 1. Reconcile
         live_windows = _tmux_windows()
@@ -5413,6 +6023,11 @@ def tick(workflow_path: str | Path) -> dict:
         if tracker_gone is None:
             tracker_gone = set()
         for row in rows:
+            if row["tracker_note"] and row["task_id"] in open_ids:
+                # 🗂️⏸️ CMX-308: the held task is open in the tracker again — the note is moot.
+                conn.execute("UPDATE runs SET tracker_note=NULL WHERE task_id=?",
+                             (row["task_id"],))
+                conn.commit()
             # ⛔🏃‍♂️💀 issue #491: `RECONCILE_MERGE_STATUSES_WITH_RUNNING`, not
             # `RECONCILE_MERGE_STATUSES` — a `running` row whose rework spawn raced an
             # out-of-band merge (`_respawn_rework` flips an EXISTING row that already owns
@@ -5427,8 +6042,7 @@ def tick(workflow_path: str | Path) -> dict:
                 # the very tick it lands. The tracker strike happens in 1b, after
                 # this transition is durable — if it fails, this row stays `done`
                 # and the strike is simply retried on the next tick.
-                if row["window_name"]:
-                    _kill_window(row["window_name"])
+                _end_agent(row["window_name"], row)
                 # ⚖️🕳️ CMX-358 (#480): a merge can land while a judge was never even
                 # SCHEDULED for this row — `judge_state` is still the initial `''`
                 # sentinel, indistinguishable from "not yet judged". Stamp a distinct
@@ -5454,15 +6068,17 @@ def tick(workflow_path: str | Path) -> dict:
                         )
                         if note:
                             judge_detail += f" — also: {note['body']}"
+                # 🗂️⏸️ CMX-308: `tracker_note=NULL` — a hold note is moot once the PR merged.
                 if unjudged:
                     conn.execute(
-                        "UPDATE runs SET status='done', judge_state=?, judge_detail=? "
-                        "WHERE task_id=?",
+                        "UPDATE runs SET status='done', judge_state=?, judge_detail=?, "
+                        "tracker_note=NULL WHERE task_id=?",
                         (judge.J_UNJUDGED_MERGED, judge_detail[:2000], row["task_id"]),
                     )
                 else:
                     conn.execute(
-                        "UPDATE runs SET status='done' WHERE task_id=?", (row["task_id"],)
+                        "UPDATE runs SET status='done', tracker_note=NULL WHERE task_id=?",
+                        (row["task_id"],),
                     )
                 if outside:
                     conn.execute(
@@ -5512,10 +6128,10 @@ def tick(workflow_path: str | Path) -> dict:
                 # matters: it does not fire `hooks.after_done` (see above) and it renders
                 # in its own `archived` board lane, never Review or Done — kanban.js's
                 # STATUS_CHIPS['closed'] pill + kanbanlanemodel.js's STATUS_LANE map.
-                if row["window_name"]:
-                    _kill_window(row["window_name"])
+                _end_agent(row["window_name"], row)
                 conn.execute(
-                    "UPDATE runs SET status='closed' WHERE task_id=?", (row["task_id"],)
+                    "UPDATE runs SET status='closed', tracker_note=NULL WHERE task_id=?",
+                    (row["task_id"],),
                 )
                 conn.commit()
                 _cleanup_worktree_on_done(wf, row)
@@ -5593,6 +6209,9 @@ def tick(workflow_path: str | Path) -> dict:
                     size_gate=_read_task_finished_size_gate(row["worktree_path"]),
                     self_check_partial=_read_task_finished_size_gate(
                         row["worktree_path"], "self_check_partial"),
+                    base_sync=_read_task_finished_size_gate(row["worktree_path"], "base_sync"),
+                    review_gate=_read_task_finished_size_gate(row["worktree_path"],
+                                                              "review_gate"),
                 )
                 # ⚖️🔀 issue #502 rework round 1 (hazard 3 of the brief): `ok=False` used to
                 # be ONE outcome — unlink the marker and log.warning, no matter why the
@@ -5661,13 +6280,42 @@ def tick(workflow_path: str | Path) -> dict:
                 # the original ended_at so the timestamp reflects when the agent
                 # finished, not when the human merged the PR.
                 wf_path = row["workflow_path"]
-                pr_url = row["pr_url"] or _read_pr_url(
-                    row["window_name"], str(Path(wf_path).parent) if wf_path else None)
-                if row["window_name"]:
-                    _kill_window(row["window_name"])
+                repo_dir = str(Path(wf_path).parent) if wf_path else None
+                pr_url = row["pr_url"] or _read_pr_url(row["window_name"], repo_dir)
+                # 🗂️⏸️ CMX-308: leaving the tracker is done-evidence only for a PR that has
+                # MERGED. Linear's GitHub integration moves an issue to Done when ANY merged
+                # PR names it (CMX-119 was closed by another task's PR while its own sat
+                # OPEN, green and mergeable) — and `done` is terminal: no reopen, adopt or
+                # requeue brought it back. So the PR is read live here, and a row whose PR is
+                # not merged keeps its status, window and worktree, with a visible note. Its
+                # end comes from the PR: the merged / closed-PR branches above, once phase 0
+                # sees it. An unreadable state holds too — unknown never reads as merged.
+                live_state = None
+                if pr_url:
+                    live_state, _mergeable = _read_pr_status(pr_url, repo_dir)
+                if pr_url and live_state != "merged":
+                    note = TRACKER_LEFT_NOTE + (
+                        "PR still open" if live_state == "open" else
+                        "PR state could not be read" if live_state is None else
+                        f"PR is {live_state}")
+                    cur = conn.execute(
+                        "UPDATE runs SET tracker_note=?, pr_url=COALESCE(?, pr_url), "
+                        "pr_state=COALESCE(?, pr_state) WHERE task_id=? "
+                        "AND tracker_note IS NOT ?",
+                        (note, pr_url, live_state, row["task_id"], note),
+                    )
+                    conn.commit()
+                    summary["tracker_left_pr_open"] += 1
+                    if cur.rowcount:
+                        log.warning("Task %s left the tracker but its PR is not merged (%s) — "
+                                    "kept %s, not done", row["task_id"], live_state or "state "
+                                    "unreadable", row["status"])
+                    continue
+                _end_agent(row["window_name"], row)
                 conn.execute(
-                    "UPDATE runs SET status='done', pr_url=COALESCE(?, pr_url) WHERE task_id=?",
-                    (pr_url, row["task_id"]),
+                    "UPDATE runs SET status='done', pr_url=COALESCE(?, pr_url), "
+                    "pr_state=COALESCE(?, pr_state), tracker_note=NULL WHERE task_id=?",
+                    (pr_url, live_state, row["task_id"]),
                 )
                 conn.commit()
                 _cleanup_worktree_on_done(wf, row)
@@ -5693,8 +6341,7 @@ def tick(workflow_path: str | Path) -> dict:
                 if pr_state != "merged" and effective_pr_url:
                     pr_state, _mergeable = _read_pr_status(effective_pr_url, repo_dir)
                 if pr_state == "merged":
-                    if row["window_name"]:
-                        _kill_window(row["window_name"])
+                    _end_agent(row["window_name"], row)
                     conn.execute(
                         "UPDATE runs SET status='done', ended_at=?, pr_url=COALESCE(?, pr_url), "
                         "pr_state=COALESCE(?, pr_state) WHERE task_id=?",
@@ -5943,13 +6590,32 @@ def tick(workflow_path: str | Path) -> dict:
         ).fetchall():
             task_id = row["task_id"]
             ci = ci_now.get(task_id)
-            sha = (ci.head_sha if ci else None) or row["pr_head_sha"]
+            # ⛔ CMX-256. Only a red GitHub reported THIS tick, naming a job, is a red. The
+            # row's `pr_checks` is a cache: `chela reopen` (or any write landing between the
+            # 0b poll and here) can leave it saying `failing` about a commit that is no
+            # longer the head, and the fresh head's checks were never read. Acting on that
+            # fired "CI RED … — job ?" at an IN_PROGRESS head and, at the rework cap, sent
+            # the run straight to needs_human. Unread is PENDING: no rework, no notice,
+            # re-read next tick. (An unnamed red never gets here: `_read_pr_checks`.)
+            if ci is None or ci.state != CI_FAILING:
+                log.warning("CI: %s reads `failing` on its row, but this tick's read is %s "
+                            "— treated as PENDING, re-read next tick",
+                            task_id, ci.state if ci else "missing")
+                continue
+            sha = ci.head_sha or row["pr_head_sha"]
             if not sha:
                 log.warning("CI: %s is red but GitHub named no head commit — not firing a "
                             "verdict that could not be fired exactly once", task_id)
                 continue
             if row["ci_failed_sha"] == sha:
                 continue        # this red has already been delivered. Each red fires ONCE.
+            # 🔁 CMX-255: a re-run fired but never yet seen unsettled ⇒ this red may still be
+            # the one it replaces. Wait it out (bounded), before the heavy log fetch below.
+            if row["ci_rerun_sha"] == sha and row["ci_rerun_state"] == "pending":
+                fired = _parse_ts(row["ci_rerun_at"])
+                now = _parse_ts(_now())
+                if fired and now and (now - fired).total_seconds() < CI_RERUN_SETTLE_SECONDS:
+                    continue
             wf_dir = str(wf.path.parent)
             # The heavy read (a whole log archive) happens HERE and nowhere else: once, on
             # the transition into red — never on the poll. ⛔ BEFORE the sha is burned: the
@@ -5957,14 +6623,13 @@ def tick(workflow_path: str | Path) -> dict:
             # FETCHING the log (and the fetch is a subprocess reading a stranger's bytes)
             # took the verdict with it — the red was marked delivered and never fired again,
             # and the run sat red in awaiting_review until a human happened to look.
-            log_tail = _failing_log_tail(wf_dir, ci.run_ids if ci else ())
+            log_tail = _failing_log_tail(wf_dir, ci.run_ids)
             # 🚦🏗️ CMX-245 (re-scope of CMX-243). Same "once, on the transition" rule as the
             # log fetch above: a plain FAILURE is only reclassified as infra here, by its
             # job's own steps — never on the poll that produced `ci_now`.
-            if ci is not None:
-                ci = _ci_infra_by_steps(ci, wf_dir)
+            ci = _ci_infra_by_steps(ci, wf_dir)
 
-            if ci is not None and ci.infra:
+            if ci.infra:
                 # NOT evidence about the code — see the module note above :data:`CI_INFRA_
                 # CONCLUSIONS`. Burn the sha first, same crash-safety rule as the real-
                 # failure path below: a crash before this line re-fires the same red every
@@ -6010,19 +6675,69 @@ def tick(workflow_path: str | Path) -> dict:
                     summary["escalated"] += 1
                 continue
 
-            body = _ci_verdict_body(ci or CIStatus(CI_FAILING, sha), log_tail, row["pr_url"])
+            # 🔁 CMX-255. A FLAKE MUST NOT BURN A REWORK ROUND. The first red on a sha re-runs
+            # its failed jobs once and spends nothing; green records the flake (the refresh
+            # above), red again lands here with `ci_rerun_sha == sha` and is sent back. ⛔
+            # `ci_failed_sha` is NOT burned here, so the re-run's own red can still fire.
+            if row["ci_rerun_sha"] != sha:
+                jobs = ", ".join(ci.failing) if ci and ci.failing else "?"
+                note = f"CI re-run once: {jobs} failed on {_ci_failed_test(log_tail)}"
+                if _rerun_failed_jobs(wf_dir, ci.run_ids if ci else ()):
+                    conn.execute(
+                        "UPDATE runs SET ci_rerun_sha=?, ci_rerun_state='pending', "
+                        "ci_rerun_note=?, ci_rerun_at=?, ci_flake_reruns=0 WHERE task_id=?",
+                        (sha, note, _now(), task_id),
+                    )
+                    conn.commit()
+                    summary["ci_rerun"] += 1
+                    log.warning("CI is RED on %s (%s) — %s; waiting on that before any "
+                                "rework", row["pr_url"] or "?", sha[:12], note)
+                    continue
+            else:
+                # 🧪 CMX-282: red again, but ONLY on registered flaky tests ⇒ re-run up to
+                # FLAKE_RERUNS more times, then proceed to the judge — never a rework round.
+                # Only ONE failed Actions run: the log tail is `run_ids[0]`'s alone.
+                known = flaky.classify(wf, log_tail) if len(ci.run_ids) == 1 else None
+                if (known and (row["ci_flake_reruns"] or 0) < flaky.FLAKE_RERUNS
+                        and _rerun_failed_jobs(wf_dir, ci.run_ids)):
+                    conn.execute(
+                        "UPDATE runs SET ci_rerun_state='pending', ci_rerun_at=?, "
+                        "ci_flake_reruns=COALESCE(ci_flake_reruns, 0) + 1 WHERE task_id=?",
+                        (_now(), task_id))
+                    conn.commit()
+                    summary["ci_rerun"] += 1
+                    continue
+                if known:
+                    _record_known_flake(conn, row, sha, known)
+                    summary["ci_known_flake"] += 1
+                    continue
+                if row["ci_rerun_state"] in ("pending", "started"):
+                    conn.execute("UPDATE runs SET ci_rerun_state='red' WHERE task_id=?",
+                                 (task_id,))
+            body = _ci_verdict_body(ci, log_tail, row["pr_url"])
+            if row["ci_rerun_sha"] == sha:
+                body += (f"\n_{row['ci_rerun_note']} — and it failed AGAIN on the re-run, so "
+                         "this is a real failure, not a flake._\n")
             # ⛔ NOW record the fired sha — after the tail is in hand, before the one step
             # that cannot be taken back. The failure modes are not symmetric: a crash after
             # this line costs at most ONE missed verdict (a human still sees the red PR),
             # while a crash before it would re-fire the same red every tick and burn the
             # whole rework budget on a single commit — the very bug this guard exists for.
-            conn.execute("UPDATE runs SET ci_failed_sha=? WHERE task_id=?", (sha, task_id))
+            # 🏗️🔁 CMX-192: a CI send-back is an INFRA restart, not a review round — charged
+            # in the same write, BEFORE the verdict (as 1c″ grants its conflict round), so 1d
+            # never sees this round as a review one; undone below if the verdict is not
+            # written. The dispatcher cannot tell a flake that failed its re-run twice (the
+            # CMX-188 clock flake, on CMX-180) from a real red, so every CI send-back counts
+            # here; a PR that keeps going red is still stopped, by `max_infra_restarts`.
+            conn.execute("UPDATE runs SET ci_failed_sha=?, "
+                         "infra_restarts=COALESCE(infra_restarts, 0) + 1 WHERE task_id=?",
+                         (sha, task_id))
             conn.commit()
             # CMX-86: tell the orchestrator NOW, with the failing job and line — and mark the
             # rework edge below as already said, so it does not hear the same red twice.
             _inbox_ci_red(row, sha, ci, log_tail, sent_back=True)
             try:
-                result = request_changes(task_id, body)
+                result = request_changes(task_id, body, cause=REWORK_CAUSE_INFRA)
             except sqlite3.Error as e:
                 _inbox_forget_ci_edge(task_id)
                 # request_changes opens its OWN connection, and a busy DB can refuse it. Two
@@ -6034,25 +6749,49 @@ def tick(workflow_path: str | Path) -> dict:
                 log.error("CI: %s is red but the verdict could not be written: %s — the sha is "
                           "un-burned and this red will be retried next tick", task_id, e)
                 try:
-                    conn.execute("UPDATE runs SET ci_failed_sha=? WHERE task_id=?",
-                                 (row["ci_failed_sha"], task_id))
+                    conn.execute("UPDATE runs SET ci_failed_sha=?, infra_restarts=? "
+                                 "WHERE task_id=?",
+                                 (row["ci_failed_sha"], infra_restarts(row), task_id))
                     conn.commit()
                 except sqlite3.Error:
                     pass   # the DB is the thing that is broken; next tick re-reads the red
                 continue
             if not result.get("ok"):
                 # The CAS refused it — the row moved (a human merged it, or a reviewer got
-                # there first). Nothing was written, and nothing should be.
+                # there first). Nothing was written, and nothing should be — so the infra
+                # restart charged above is handed back (CMX-192).
+                conn.execute("UPDATE runs SET infra_restarts=? WHERE task_id=?",
+                             (infra_restarts(row), task_id))
+                conn.commit()
                 _inbox_forget_ci_edge(task_id)
                 log.info("CI: %s is red, but the verdict was not written: %s",
                          task_id, result.get("error"))
                 continue
             summary["ci_failed"] += 1
             log.warning(
-                "CI is RED on %s (%s) — run %s sent back for rework (round %s, cap %s): %s",
+                "CI is RED on %s (%s) — run %s sent back for rework (round %s, infra restart "
+                "%s/%s, not charged to the review cap): %s",
                 row["pr_url"] or "?", sha[:12], task_id, result.get("round"),
-                result.get("max_reworks"), ", ".join(ci.failing) if ci else "?",
+                infra_restarts(row) + 1, infra_restart_cap(row), ", ".join(ci.failing),
             )
+
+        # 1c″. 🔀 CMX-262: A PR THAT CONFLICTS WITH ITS BASE IS MERGED FORWARD, OR SENT BACK.
+        # Only once GitHub has said CONFLICTING on two ticks running (its transient states
+        # pass), once per head sha. ABOVE 1d for the same reason as 1c.
+        for task_id in conflicted:
+            row = conn.execute(
+                "SELECT * FROM runs WHERE task_id=? AND status='awaiting_review'", (task_id,),
+            ).fetchone()
+            ci = ci_now.get(task_id)
+            head = (ci.head_sha if ci else None) or (row["pr_head_sha"] if row else None)
+            if row is None or not row["branch_name"] or not head or row["conflict_sha"] == head:
+                continue
+            outcome = _resolve_base_conflict(conn, wf, row, head)
+            if outcome in ("merged", "rework"):
+                summary["base_merged" if outcome == "merged" else "base_conflict"] += 1
+            elif outcome in ("infra", "escalated"):
+                summary["base_infra"] += 1
+                summary["escalated"] += outcome == "escalated"
 
         # 1c′. A CHECK THAT NEVER SETTLES IS NOT A CHECK WE ARE STILL WAITING FOR.
         #
@@ -6111,12 +6850,34 @@ def tick(workflow_path: str | Path) -> dict:
             # 🔁🚪 CMX-237: a `chela retry` grants extra rounds ON TOP of that budget — see
             # `effective_rework_cap`, which the inbox reads too (CMX-58).
             effective_cap = effective_rework_cap(row)
-            if rework_cap_reached(row):
+            # 🏗️🔁 CMX-192: the infra budget FIRST, and with its own reason — a run that
+            # never failed a review must not be told it "still fails review".
+            if infra_cap_reached(row):
                 _escalate(
                     conn, row,
-                    f"rework cap reached ({row['rework_count'] or 0}/{effective_cap}) — the "
-                    "PR still fails review. Branch, worktree and PR are preserved; every "
-                    "verdict is on the run row (review_history).",
+                    f"infra restart cap reached ({infra_restarts(row)}/"
+                    f"{infra_restart_cap(row)}) — CI failures and rework agents that died "
+                    "without handing in (window gone, stalled, launch failed), not review "
+                    f"verdicts (review reworks: {review_reworks(row)}/{effective_cap}). "
+                    "Branch, worktree and PR are preserved; every verdict is on the run row "
+                    "(review_history).",
+                    recommendation="Fix the infrastructure, then `chela retry` — check the "
+                                    "PR's Checks tab for a red that is not the PR's fault and "
+                                    "`chela doctor` for tmux or launch trouble first.",
+                    options=[
+                        "Fix the infrastructure, then `chela retry`",
+                        "Fix it yourself on the branch and `chela reopen`",
+                        "Close the PR and let the task be redispatched fresh",
+                    ],
+                )
+                summary["escalated"] += 1
+            elif review_cap_reached(row):
+                _escalate(
+                    conn, row,
+                    f"rework cap reached ({review_reworks(row)}/{effective_cap}; infra "
+                    f"restarts: {infra_restarts(row)}) — the PR still fails review. Branch, "
+                    "worktree and PR are preserved; every verdict is on the run row "
+                    "(review_history).",
                     recommendation="Fix it yourself on the branch and `chela reopen` — read "
                                     "the review history on the run first for what every rework "
                                     "round already tried, then push the fix and reopen to put "
@@ -6136,6 +6897,9 @@ def tick(workflow_path: str | Path) -> dict:
         # from being stuck believing it is under review. ⛔ A judge that died is CANNOT
         # VERIFY — it does NOT block and it does NOT approve; the run stays exactly where it
         # was, and a human is told why.
+        # ⏹️⚖️ CMX-286: FIRST, stop a judge whose run was sent back (1c above, or a human)
+        # or whose head moved — else the watchdog below holds its slot up to its wall.
+        summary["judge_cancelled"] = _cancel_moot_judges(conn, wf, live_windows)
         summary["judge_lost"] = _judge_watchdog(conn, wf, live_windows)
 
         # 1e′. ⚖️🧊 CMX-253: a `cannot_verify` that SPENT its retry budget on the CURRENT
@@ -6206,6 +6970,13 @@ def tick(workflow_path: str | Path) -> dict:
                 f" ({expired.reason})" if expired.reason else "",
             )
         held = hold.active()
+        # CMX-214: the fleet pause rides the hold — resumed when the hold is gone. Never
+        # takes the tick down.
+        try:
+            for line in fleet.tick(held):
+                log.warning("%s", line)
+        except Exception:  # noqa: BLE001
+            log.exception("fleet pause tick failed")
         if held:
             summary["held"] = True
             summary["hold"] = held.as_dict()
@@ -6215,7 +6986,9 @@ def tick(workflow_path: str | Path) -> dict:
             # it: a paused dispatcher is a disabled subsystem, and CMX-53's rule applies.
             return summary
 
-        max_concurrent = wf.get("concurrency", "max", default=1) or 1
+        # CMX-164: a Settings override for THIS workflow wins over WORKFLOW.md, read per
+        # tick. Lowering it stops new claims only; nothing in flight is touched.
+        max_concurrent = concurrency.agents_at_once(wf)
         # ⛔ ONLY claimed/running. `awaiting_review` does NOT hold a slot — that is why a
         # new task is claimed the moment a PR opens — and neither do `changes_requested`
         # (waiting for a slot) or `needs_human` (stopped, and it must never pin the queue
@@ -6250,13 +7023,22 @@ def tick(workflow_path: str | Path) -> dict:
         # operator who paused the queue (or whose WORKFLOW.md does not parse) has not asked
         # for new agents. It resumes when they do — nothing is lost, the PR simply waits.
         if judge.judge_enabled(wf):
-            judging = conn.execute(
-                "SELECT COUNT(*) FROM runs WHERE workflow_path=? AND judge_state=?",
+            # 🔁⚖️ CMX-263: an interrupted launch holds no slot — it is relaunched below.
+            judging = sum(1 for r in conn.execute(
+                "SELECT * FROM runs WHERE workflow_path=? AND judge_state=?",
                 (str(wf.path), judge.J_RUNNING),
-            ).fetchone()[0]
+            ).fetchall() if not _judge_launch_interrupted(r))
             for row in _judge_candidates(conn, wf):
+                if _judge_launch_owner(row) is not None and not _judge_launch_interrupted(row):
+                    continue     # 🔁⚖️ CMX-263: a launch still in flight in another process
                 if _judge_backoff_pending(row):
                     continue     # ⚖️🌩️ CMX-379: sitting out a classifier outage
+                if shutting_down():
+                    break        # 🔁⚖️ CMX-263: a restart is waiting — launch nothing new
+                if _carry_base_only_verdict(wf, row, conn):
+                    continue     # ⚖️🔀 CMX-289: a base-only head move keeps its clean verdict
+                if _stamp_prose_only(wf, row):
+                    continue     # ⚖️🪜 CMX-265: a prose-only PR never needs a judge slot
                 if judging >= judge_max_concurrent():
                     break        # it waits a tick; each judge re-runs a whole test suite
                 if _spawn_judge(wf, row, row["pr_head_sha"], conn, tasks_by_id.get(row["task_id"])):
@@ -6282,7 +7064,7 @@ def tick(workflow_path: str | Path) -> dict:
             "ORDER BY COALESCE(started_at, '')",
             (str(wf.path),),
         ).fetchall():
-            if active >= max_concurrent:
+            if active >= max_concurrent or shutting_down():
                 continue                     # waits its turn — it does not jump the queue
             # ⛔🏃‍♂️💀 issue #491: no `pr_state == "merged"` check belongs here. `pr_state`
             # was already refreshed in phase 0 of THIS SAME tick, and step 1's reconcile
@@ -6342,42 +7124,27 @@ def tick(workflow_path: str | Path) -> dict:
                  if (active < max_concurrent and not over_budget) else [])
 
         for task in queue:
-            if active >= max_concurrent:
+            if active >= max_concurrent or shutting_down():
                 break
             existing = conn.execute(
                 "SELECT status, attempt, pr_state, requeue_pending FROM runs WHERE task_id=?",
                 (task.id,),
             ).fetchone()
-            # 🗂️🔁 CMX-65: the ONE `closed` row a claim may take — a human ran
-            # `chela close --requeue`. It gets a FRESH attempt (attempt 1, its own
-            # `-r<N>` branch and worktree, see `_spawn`), never the closed run's.
-            requeue = bool(existing and existing["status"] == "closed"
-                           and existing["requeue_pending"])
-            if existing and requeue:
-                if existing["pr_state"] == "merged":
-                    continue                   # it shipped after all — never a 2nd run
-                attempt = 1
-            elif existing:
-                # Fresh tasks only: anything already in flight (claimed/running), parked in
-                # review (awaiting_review / changes_requested / needs_human — each of which
-                # already owns a branch, a worktree and a PR), or already shipped (done) is
-                # excluded. ⛔ A `changes_requested` row claimed here as a fresh task would
-                # fork a NEW worktree off the base branch and abandon the PR under review.
-                # Only `failed` rows are eligible for a retry, and only until MAX_ATTEMPTS.
-                if existing["status"] in NOT_CLAIMABLE:
-                    continue
-                # Belt-and-suspenders out-of-band-merge guard: whatever status this row
-                # reads THIS tick, a `pr_state='merged'` row is never re-dispatched — the
-                # reconcile pass above (1.) should already have flipped it to `done` before
-                # we ever got here, but a surviving stale status (a race, a schema this
-                # tick's reconcile didn't cover) must not fall through to a duplicate spawn.
-                if existing["pr_state"] == "merged":
-                    continue
-                if existing["status"] == "failed" and existing["attempt"] >= MAX_ATTEMPTS:
-                    continue
-                attempt = existing["attempt"] + 1
-            else:
-                attempt = 1
+            existing = dict(existing) if existing else None
+            # Fresh tasks only, unless `run_will_relaunch` (CMX-156 — the ONE retry
+            # predicate, shared with `chela.restore`) says the row is the dispatcher's to
+            # retry: a `failed` row below MAX_ATTEMPTS, or the ONE `closed` row a claim may
+            # take — a human ran `chela close --requeue` (CMX-65). Anything in flight
+            # (claimed/running), parked in review (awaiting_review / changes_requested /
+            # needs_human — each owns a branch, a worktree and a PR), done, or carrying a
+            # merged PR is excluded. ⛔ A `changes_requested` row claimed here as a fresh
+            # task would fork a NEW worktree off the base branch and abandon its PR.
+            if existing and not run_will_relaunch(existing):
+                continue
+            # 🗂️🔁 CMX-65: a requeue gets a FRESH attempt (attempt 1, its own `-r<N>`
+            # branch and worktree, see `_spawn`), never the closed run's.
+            requeue = bool(existing and existing["status"] == "closed")
+            attempt = existing["attempt"] + 1 if existing and not requeue else 1
 
             try:
                 # `requeue` only when set: a plain claim keeps `_spawn`'s 4-arg call shape.
@@ -6681,19 +7448,86 @@ def _rework_cap(row) -> int:
     return max_reworks_for(_row_risk(row))
 
 
+def _col(row, name: str):
+    """An optional column, tolerantly: a hand-built dict or an old Row may lack it."""
+    try:
+        return row[name]
+    except (IndexError, KeyError):
+        return None
+
+
+REWORK_CAUSE_REVIEW = "review"
+REWORK_CAUSE_INFRA = "infra"
+# 🔀 CMX-294: a conflict send-back that took one of the MAX_FREE_CONFLICT_REWORKS free rounds.
+# Stored on the row only so the notice can say so; for the budgets it IS a review round.
+REWORK_CAUSE_CONFLICT = "conflict"
+
+
+def rework_cause(row) -> str:
+    """🏗️🔁 CMX-192. Why the run was last sent back — ``infra`` only when it says so; a
+    NULL (a pre-CMX-192 row) is a review verdict, which is what every send-back was then.
+    A free conflict round (CMX-294) reads as ``review`` here: it spends a review round, and
+    its grant in ``conflict_reworks`` is what keeps it off the cap."""
+    return REWORK_CAUSE_INFRA if _col(row, "rework_cause") == REWORK_CAUSE_INFRA \
+        else REWORK_CAUSE_REVIEW
+
+
+def free_conflict_round(row) -> bool:
+    """🔀 CMX-294. Is the round this run was last sent back for a FREE conflict round — one
+    that granted itself a ``conflict_reworks`` slot, so it is not charged against the cap?"""
+    return _col(row, "rework_cause") == REWORK_CAUSE_CONFLICT
+
+
+def review_reworks(row) -> int:
+    """🏗️🔁 CMX-192. The re-spawns a REVIEW verdict caused (judge blocked, a reviewer's
+    changes_requested, a conflict) — the number the rework cap bounds. A pre-CMX-192 row
+    never split its rounds, so it reads as ``rework_count``, exactly the old cap's count."""
+    value = _col(row, "review_reworks")
+    return (row["rework_count"] or 0) if value is None else value
+
+
+def infra_restarts(row) -> int:
+    """🏗️🔁 CMX-192. How many times this run was sent round again by infrastructure, not
+    review: CI send-backs plus rework agents that died without handing in."""
+    return _col(row, "infra_restarts") or 0
+
+
 def effective_rework_cap(row) -> int:
     """🔁🚪 CMX-237. THIS run's rework budget INCLUDING human-granted rounds: its risk cap
     plus every ``chela retry`` grant. The grant is never folded into :func:`_rework_cap`
     itself, so a run with no grant escalates at EXACTLY its risk cap."""
-    return _rework_cap(row) + (row["retry_count"] or 0)
+    free = _col(row, "conflict_reworks") or 0   # 🔀 CMX-262: conflict rounds are free
+    return _rework_cap(row) + (row["retry_count"] or 0) + free
+
+
+def infra_restart_cap(row) -> int:
+    """🏗️🔁 CMX-192. THIS run's infra budget: ``max_infra_restarts`` plus every ``chela
+    retry`` grant (a retry after an infra escalation buys a round, as one does for review)."""
+    return max_infra_restarts() + (row["retry_count"] or 0)
+
+
+def infra_cap_reached(row) -> bool:
+    """🏗️🔁 CMX-192. Has this run restarted on infrastructure as often as it may — and is the
+    round it is waiting for an infra one? A review verdict on a run with a spent infra budget
+    is the review cap's call, with the review reason: the infra budget is not what it spends."""
+    return (rework_cause(row) == REWORK_CAUSE_INFRA
+            and infra_restarts(row) >= infra_restart_cap(row))
+
+
+def review_cap_reached(row) -> bool:
+    """Has this run spent every round a REVIEW verdict may spend — and is the round it is
+    waiting for a review one? An infra send-back is not stopped by the review cap: that is
+    what spent CMX-180's whole budget without a single judge round (CMX-192)."""
+    return (rework_cause(row) == REWORK_CAUSE_REVIEW
+            and review_reworks(row) >= effective_rework_cap(row))
 
 
 def rework_cap_reached(row) -> bool:
     """Is a ``changes_requested`` run out of rounds — will the next tick ESCALATE it to
     ``needs_human`` instead of re-spawning it? The tick's own cap check (1d) and the inbox's
     "sent back for rework" notice (CMX-58) both ask THIS, so the notice can never promise a
-    round the dispatcher is about to refuse."""
-    return (row["rework_count"] or 0) >= effective_rework_cap(row)
+    round the dispatcher is about to refuse. Either budget counts (CMX-192)."""
+    return infra_cap_reached(row) or review_cap_reached(row)
 
 
 # 🗂️🔁 CMX-65. The columns a requeued claim KEEPS from the closed run's row: the task's own
@@ -6808,7 +7642,8 @@ def _spawn(wf: WorkflowDef, task: Task, attempt: int, conn: sqlite3.Connection, 
              task_number=excluded.task_number, idle_nudged_at=NULL, window_id=NULL,
              window_epoch=NULL, brief=excluded.brief, risk=excluded.risk,
              risk_reason=excluded.risk_reason, tracker_url=excluded.tracker_url,
-             tracker_edge=NULL""",
+             tracker_edge=NULL, parked_at=NULL, parked_reason=NULL, parked_until=NULL,
+             parked_by=NULL""",
         (task.id, str(wf.path), task.title, window_name, str(worktree), branch, _now(), attempt,
          task_number, _task_brief(task), run_risk(task.risk), task.risk_reason, task.url),
     )
@@ -6997,6 +7832,10 @@ def _launch_agent(
 
     Returns the window target (the ``@id``, or the bare name if the id was unreadable).
     """
+    # CMX-274: a respawn starts clean of the last round's strays — before the hooks, which
+    # may start something of their own in the worktree.
+    if not judge_window:
+        reap_strays_in(Path(worktree), resolve_workspace_root(wf))
     if fresh_worktree:
         after_create = wf.get("hooks", "after_create")
         if after_create:
@@ -7068,6 +7907,15 @@ def _launch_agent(
     subprocess.run(
         ["tmux", "send-keys", "-t", f"{TMUX_SESSION}:{target_id}",
          _strip_agent_env_cmd(), "Enter"],
+        check=True, capture_output=True,
+    )
+    # 🪆 CMX-190: stamp the pane as a DISPATCHED run (agent or judge). The plugin's Bash hook
+    # (chela/mergegate.py) reads it to deny a nested `claude` launch; a human's own session
+    # and the orchestrator never carry it.
+    subprocess.run(
+        ["tmux", "send-keys", "-t", f"{TMUX_SESSION}:{target_id}",
+         f"export {mergegate.RUN_ENV}={shlex.quote(task_id)} "
+         f"{mergegate.RUN_ROLE_ENV}={shlex.quote(role)}", "Enter"],
         check=True, capture_output=True,
     )
     # Export CHELA_WID first so the worktree agent knows its own window id (self-identity
@@ -7162,6 +8010,8 @@ existing PR updates itself.
 
 **Do NOT touch the tracker file.**
 
+{{standing_rules}}
+
 ⛔ **If you conclude there is NOTHING to push** — the verdict is wrong, already fixed, or
 you cannot fix it — do **NOT** just say so in your final message and stop. `task-finished`
 assumes a new commit landed; calling it (or nothing at all) with no push leaves this run
@@ -7242,6 +8092,7 @@ def _rework_vars(
         "rework_round": rework_round,
         "max_reworks": _rework_cap(row),
         "required_mutations_section": _required_mutations_section(mutations or []),
+        "standing_rules": standing_rules(wf),
     }
 
 
@@ -7287,6 +8138,7 @@ def _escalate(conn: sqlite3.Connection, row: sqlite3.Row, reason: str, *,
         (_now(), text, row["task_id"]),
     )
     conn.commit()
+    _end_agent(None, row)                   # CMX-274: its strays, not its worktree
     log.warning(
         "Task %s → needs_human: %s (branch %s and worktree %s preserved; slot freed)",
         row["task_id"], text, row["branch_name"], row["worktree_path"],
@@ -7346,18 +8198,31 @@ def _rework_failed(conn: sqlite3.Connection, row: sqlite3.Row, error: str) -> No
     #                         exits non-zero) would otherwise retry every tick forever. This
     #                         is what makes the failure path terminate — in `needs_human`,
     #                         where a person sees it.
+    #
+    # 🏗️🔁 CMX-192: either way the death is INFRA, not review — `infra_restarts` counts it,
+    # bounded by its own cap (`max_infra_restarts`), where it escalates with a reason that
+    # names infra. The termination argument above now rests on that cap: the review cap never
+    # sees these rounds. `rework_cause` turns `infra` (the next re-spawn is free on the review
+    # cap) only when the round in flight had actually been spawned — the DB row says
+    # `running`; a re-spawn that died before its own write never charged its verdict, so that
+    # verdict's cause stays as it was and the next re-spawn charges it.
     spent = (row["rework_count"] or 0)
     if row["status"] != "running":
         spent += 1
+    now = conn.execute("SELECT status FROM runs WHERE task_id=?", (task_id,)).fetchone()
+    spawned = now is not None and now["status"] == "running"
     conn.execute(
         "UPDATE runs SET status='changes_requested', rework_count=?, last_error=?, "
-        "window_id=NULL, window_epoch=NULL WHERE task_id=?",
-        (spent, error, task_id),
+        "window_id=NULL, window_epoch=NULL, "
+        "infra_restarts=COALESCE(infra_restarts, 0) + 1, "
+        "rework_cause=CASE WHEN ? THEN ? ELSE rework_cause END WHERE task_id=?",
+        (spent, error, spawned, REWORK_CAUSE_INFRA, task_id),
     )
     conn.commit()
     log.warning(
         "Task %s: rework round %d FAILED (%s) — back to changes_requested, verdict intact "
-        "(cap %d)", task_id, spent, error, _rework_cap(row),
+        "(cap %d, infra restart %d/%d)", task_id, spent, error, _rework_cap(row),
+        infra_restarts(row) + 1, infra_restart_cap(row),
     )
 
 
@@ -7450,6 +8315,8 @@ def _respawn_rework(
                  task_id, worktree, branch)
 
     rework_round = (row["rework_count"] or 0) + 1
+    # 🏗️🔁 CMX-192: only a round a REVIEW verdict caused spends the rework cap.
+    review_round = review_reworks(row) + (1 if rework_cause(row) == REWORK_CAUSE_REVIEW else 0)
     verdict = latest_verdict(dict(row))
     hook_vars = _rework_vars(
         wf, row, worktree, verdict, rework_round, latest_required_mutations(dict(row)), task,
@@ -7465,9 +8332,10 @@ def _respawn_rework(
     conn.execute(
         "UPDATE runs SET status='running', rework_count=?, started_at=?, ended_at=NULL, "
         "last_error=NULL, idle_nudged_at=NULL, window_id=NULL, window_epoch=NULL, "
-        "worktree_path=? "
+        "parked_at=NULL, parked_reason=NULL, parked_until=NULL, parked_by=NULL, "
+        "worktree_path=?, review_reworks=? "
         "WHERE task_id=?",
-        (rework_round, _now(), str(worktree), task_id),
+        (rework_round, _now(), str(worktree), review_round, task_id),
     )
     conn.commit()
 
@@ -7533,7 +8401,7 @@ that SURVIVES **blocks this PR at every risk level** — it is never downgraded 
    statements, fixtures parked on a default, source-constant checks instead of the rendered
    value…). Reaching for one of those shapes first is faster than rediscovering it from
    scratch.
-{{sweep_equivalents}}
+{{sweep_equivalents}}{{prior_round}}
 2. For **each guard/invariant it adds** (each new or changed test, each "must never…"
    comment, each accessibility cue), design ONE **minimal, live, syntactically valid**
    mutation to the **production** code that a real guard MUST catch:
@@ -7544,6 +8412,8 @@ that SURVIVES **blocks this PR at every risk level** — it is never downgraded 
    - **WIRING** (`"kind": "wiring"`): the smallest edit that makes the feature NEVER RUN —
      revert the production call-site. If the suite is still green, the tests never exercise
      what actually runs.
+   - 🏭 **Never mutate a GENERATED file** ({{generated_paths}}): it is rebuilt from source
+     and CI checks it is fresh. chela drops such an experiment unrun — mutate its source.
 3. Write `{{experiments_path}}` — JSON, exactly this shape:
 
 ```json
@@ -7575,7 +8445,7 @@ that SURVIVES **blocks this PR at every risk level** — it is never downgraded 
      survivor still BLOCKS, but the PR comment and the rework prompt only ever say HOW MANY
      held-out guards survived, never which. That is what stops a rework from patching just
      the listed cases instead of fixing the guard. ⛔ Never mention a held-out experiment in
-     `notes` — notes are posted to the PR.
+     `notes` — notes are posted to the PR.{{held_out_note}}
 
 4. Run **`{{judge_cmd}}`** — your last step. `--detach` starts the battery in its own
    process group and returns AT ONCE (it can take far longer than your Bash tool allows);
@@ -7593,13 +8463,17 @@ def judge_prompt_vars(
     branch_name: str, base_branch: str, workspace_path: str, repo_path: str,
     project_key: str, task_number, pr_url: str, head_sha: str, experiments_path: str,
     judge_cmd: str, judge_log: str, test_cmd: str, diff_cmd: str, pr_view_cmd: str,
-    sweep_equivalents: str = "",
+    sweep_equivalents: str = "", tier: str = "", prior_round: str = "",
 ) -> dict:
     """📏 CMX-408. EVERY variable :data:`JUDGE_PROMPT` renders with — the one map both the
     live judge (:func:`_judge_vars`) and the offline eval (``chela.judge_eval.design``)
     build, so the eval can never drift from the prompt the judge actually sees. The
     caller-specific values are keyword-only and required (a caller that forgets one fails
     loudly); what a risk level and the workflow's judge knobs buy is derived HERE, once."""
+    # ⚖️🙈 CMX-395: the held-out quota the judge is asked to meet — 0 on a STANDARD tier
+    # (CMX-288), whose `judge run` clears any held-out tag anyway.
+    pct = 0 if tier == risktier.STANDARD else round(
+        (judge.judge_held_out_fraction(wf) if wf is not None else judge.HELD_OUT_FRACTION) * 100)
     return {
         # ⚖️🎚️ CMX-405: the run's risk level (from the tracker, via the run row) and what
         # it buys — the experiment cap `chela judge run` enforces, and how to spend it.
@@ -7624,21 +8498,29 @@ def judge_prompt_vars(
         "judge_cmd": judge_cmd,
         "judge_log": judge_log,
         "test_cmd": test_cmd,
-        # ⚖️🙈 CMX-395: the held-out quota the judge is asked to meet.
-        "held_out_pct": round((judge.judge_held_out_fraction(wf) if wf is not None
-                               else judge.HELD_OUT_FRACTION) * 100),
+        "held_out_pct": pct,
         "held_out_min": judge.HELD_OUT_MIN_EXPERIMENTS,
+        # ⚖️🪜 CMX-288: a STANDARD-tier PR holds nothing out; "" on every other tier.
+        "held_out_note": (
+            "\n     ⛔ **This PR's risk tier is `standard`: hold NOTHING out.** Every experiment"
+            " is visible;\n     `chela judge run` runs any `\"held_out\"` tag as visible anyway."
+            if tier == risktier.STANDARD else ""),
         "diff_cmd": diff_cmd,
         "pr_view_cmd": pr_view_cmd,
         # ⚖️🧹 CMX-88: the agent's `--sweep-equivalent` claims — survivors of its own
         # mechanical sweep it says no outcome can change under. Agent-authored, so shown
         # as claims to TEST, never as findings. "" ⇒ none (the line renders empty).
         "sweep_equivalents": sweep_equivalents,
+        # ⚖️🔀 CMX-289: the prior round chela re-runs itself — "" on a first judgement.
+        "prior_round": prior_round,
+        # 🏭 CMX-284: the paths `chela judge run` drops experiments on.
+        "generated_paths": ", ".join(f"`{p}`" for p in generated.PATTERNS),
     }
 
 
 def _judge_vars(
     wf: WorkflowDef, row: sqlite3.Row, worktree: Path, sha: str, task: Task | None = None,
+    tier: str = "",
 ) -> dict:
     number = _pr_number(row["pr_url"])
     base = wf.get("workspace", "base_branch", default="master")
@@ -7666,6 +8548,10 @@ def _judge_vars(
         pr_view_cmd=(f"gh pr view {number} --comments" if number
                      else "gh pr view --comments   # no PR url on the run row"),
         sweep_equivalents=_judge_sweep_equivalents(row) + _judge_size_gate(row),
+        tier=tier,
+        prior_round=verdictcarry.prompt_note(
+            verdictcarry.load(row["task_id"], row["pr_url"]), sha,
+            judge_max_experiments(_row_risk(row))),
     )
 
 
@@ -7674,7 +8560,9 @@ def _judge_size_gate(row) -> str:
     the self-check experiments the agent's budget never ran (the judge's to cover)."""
     notes = []
     for col, render in (("size_gate", sizegate.render),
-                        ("self_check_partial", judge.render_self_check_partial)):
+                        ("self_check_partial", judge.render_self_check_partial),
+                        ("base_sync", basesync.render),
+                        ("review_gate", reviewgate.render)):
         try:
             note = render(json.loads(row[col] or "{}"))
         except (IndexError, KeyError, ValueError, TypeError):
@@ -7859,24 +8747,36 @@ def _spawn_judge(
     # CMX-15 came back cannot_verify four times. Park it ONCE for a human instead; ⛔ it is
     # still not mergeable without a clean judge or `chela merge --override`. Only a definite
     # True parks: an unknown (`None`) is judged normally, as a code+docs PR is.
-    if judge.docs_only_diff(worktree, base) is True:
+    # ⚖️🪜 CMX-208: a PROSE-only PR (`chela.risktier`) skips the judge round outright and is
+    # merge-ready like `clean` on this head. Checked first; an unknown file list is not prose.
+    # CMX-296: so does a STANDARD-tier one; an unknown file list is CORE, never standard.
+    files = judge._changed_files(worktree, base)
+    tier = risktier.classify(files, risktier.always_human(wf), risktier.core(wf))[0]
+    skip = _stamp_tier_verdict(task_id, tier, sha)
+    if not skip and judge.docs_only_diff(worktree, base) is True:
+        skip = True
         park_final_unknown(task_id, judge.DOCS_ONLY_PARK_REASON, conn=conn)
         log.warning("judge: %s: docs-only PR on %s — parked for a human, no judge spawned",
                     task_id, sha[:12])
+    if skip:
         try:
             remove_worktree(wf.path.parent, worktree, resolve_workspace_root(wf))
         except Exception as e:  # noqa: BLE001 — a leftover dir costs disk, never the verdict
             log.warning("judge: %s: could not remove %s: %s", task_id, worktree, e)
         return False
 
+    # 🔁⚖️ CMX-263: from here to the clear below, a dead launcher means an interrupted launch.
+    conn.execute("UPDATE runs SET judge_launch_owner=?, risk_tier=? WHERE task_id=?",
+                 (json.dumps(judge.owner_identity(os.getpid())), tier, task_id))
+    conn.commit()
     try:
         prompt = render_prompt(
             wf.get("agent", "judge_prompt", default=None) or JUDGE_PROMPT,
-            _judge_vars(wf, row, worktree, sha, task),
+            _judge_vars(wf, row, worktree, sha, task, tier),
         )
         _launch_agent(
             wf, task_id, judge.judge_window_name(branch), worktree, prompt, conn,
-            hook_vars=_judge_vars(wf, row, worktree, sha, task),
+            hook_vars=_judge_vars(wf, row, worktree, sha, task, tier),
             fresh_worktree=created,
             # 🤫 CMX-97 (race closed CMX-136). The judge is NOT this run's agent — `window_id`
             # is the run's own window (the Feed keys its lane on it, the inbox addresses
@@ -7894,10 +8794,104 @@ def _spawn_judge(
             role="judge",
         )
     except Exception as e:
+        if shutting_down():
+            # 🔁⚖️ CMX-263: the restart killed the launch (its hook took the same signal), not
+            # the PR. The marker stays, so the next daemon relaunches this round — no unknown.
+            log.warning("judge: %s: launch interrupted by daemon shutdown (%s) — the next "
+                        "daemon relaunches it", task_id, e)
+            return False
         log.exception("judge: %s: the judge agent failed to launch", task_id)
         set_judge_state(task_id, judge.J_CANNOT_VERIFY, f"the judge agent failed to launch: {e}")
         return False
+    conn.execute("UPDATE runs SET judge_launch_owner=NULL WHERE task_id=?", (task_id,))
+    conn.commit()
     log.info("judge: %s: judging %s on %s in %s", task_id, row["pr_url"] or "?", sha[:12], worktree)
+    return True
+
+
+def _carry_base_only_verdict(wf: WorkflowDef, row: sqlite3.Row,
+                             conn: sqlite3.Connection) -> bool:
+    """⚖️🔀 CMX-289: keep a ``clean`` verdict across a head move that touches none of the PR's
+    own files (a merge from base): re-stamp ``judge_sha`` to the new head, record why, and
+    spawn no judge. ``chela merge``'s ``judge_sha == head`` check then sees the new head.
+    Anything else — another verdict, a PR path that changed, git that cannot say — is
+    judged as before (with the prior round's experiments, :mod:`chela.verdictcarry`)."""
+    judged, head, task_id = row["judge_sha"], row["pr_head_sha"], row["task_id"]
+    if row["judge_state"] != judge.J_CLEAN or not judged or not head or judged == head:
+        return False
+    base = wf.get("workspace", "base_branch", default="master")
+    try:
+        moved = verdictcarry.moved_pr_paths(wf.path.parent, base, judged, head)
+    except (OSError, ValueError) as e:   # git missing, a NUL in a sha: judge it, never abort the tick
+        log.warning("judge: %s: could not compare %s with %s: %s", task_id, judged, head, e)
+        return False
+    if moved is None or moved:
+        return False
+    detail = verdictcarry.carried_detail(judged, head, row["judge_detail"])
+    cur = conn.execute(
+        "UPDATE runs SET judge_sha=?, judge_detail=? WHERE task_id=? AND judge_state=? "
+        "AND judge_sha=? AND pr_head_sha=?",
+        (head, detail[:2000], task_id, judge.J_CLEAN, judged, head),
+    )
+    conn.commit()
+    if cur.rowcount == 0:
+        return False
+    event_log.append(
+        "judge.carried", f"{task_id}: clean verdict carried {judged[:12]} → {head[:12]} — "
+                         "the head move touched none of the PR's files",
+        payload={"task_id": task_id, "judged_sha": judged, "head_sha": head,
+                 "reason": verdictcarry.CARRIED},
+    )
+    log.info("judge: %s: %s (%s → %s)", task_id, verdictcarry.CARRIED, judged[:12], head[:12])
+    return True
+
+
+def _stamp_prose_only(wf: WorkflowDef, row: sqlite3.Row) -> bool:
+    """⚖️🪜 CMX-265: stamp ``prose_only`` on a PROSE PR's head BEFORE the judge slot gate —
+    and (CMX-296) ``standard_no_judge`` on a STANDARD one.
+
+    Seen 2026-10-19: a docs-only PR sat an hour "queued for the judge" behind two running
+    judges, because the CMX-208 check lived in :func:`_spawn_judge`, past the slot gate and a
+    worktree checkout. It needs neither: the head commit is diffed in the repo itself. An
+    unreadable file list is not prose — the row queues for a judge as before.
+
+    Never on a row whose judge is RUNNING or still alive (CMX-429): that judge's verdict would
+    land over the stamp, and an interrupted launch's worktree is `_spawn_judge`'s to reuse.
+    """
+    sha = row["pr_head_sha"]
+    if not sha or row["judge_state"] == judge.J_RUNNING:
+        return False     # an empty head would diff the dispatcher's own checkout
+    if judge.live_judge_run(row["task_id"], judge.judge_worktree_path(wf, row["task_id"])):
+        return False
+    base = wf.get("workspace", "base_branch", default="master")
+    try:
+        files = judge._changed_files(wf.path.parent, base, sha)
+    except (OSError, ValueError) as e:   # git missing, a NUL in the sha: queue, never abort the tick
+        log.warning("judge: %s: could not read the PR's files: %s", row["task_id"], e)
+        return False
+    tier = risktier.classify(files, risktier.always_human(wf), risktier.core(wf))[0]
+    return _stamp_tier_verdict(row["task_id"], tier, sha)
+
+
+# ⚖️🪜 CMX-208/CMX-296: the tiers that get no judge round — the verdict each is stamped with.
+_NO_JUDGE_VERDICTS = {
+    risktier.PROSE: (judge.J_PROSE_ONLY, judge.PROSE_ONLY_DETAIL),
+    risktier.STANDARD: (judge.J_STANDARD_NO_JUDGE, judge.STANDARD_NO_JUDGE_DETAIL),
+}
+
+
+def _stamp_tier_verdict(task_id: str, tier: str, sha: str) -> bool:
+    """Stamp a PROSE or STANDARD head's no-judge verdict (and the tier) on the run; ``False``
+    for every other tier, which gets a judge round."""
+    if tier not in _NO_JUDGE_VERDICTS:
+        return False
+    state, detail = _NO_JUDGE_VERDICTS[tier]
+    # The tier first: a crash between the two leaves a tier with no verdict, re-stamped next
+    # tick — never a merge-ready verdict carrying another round's tier.
+    with _db() as conn:
+        conn.execute("UPDATE runs SET risk_tier=? WHERE task_id=?", (tier, task_id))
+    set_judge_state(task_id, state, detail, sha=sha)
+    log.info("judge: %s: %s PR on %s — no judge round", task_id, tier, sha[:12])
     return True
 
 
@@ -7912,15 +8906,42 @@ def _judge_candidates(conn: sqlite3.Connection, wf: WorkflowDef) -> list[sqlite3
     return conn.execute(
         "SELECT * FROM runs WHERE workflow_path=? AND status='awaiting_review' "
         "AND pr_state='open' AND pr_head_sha IS NOT NULL "
-        "AND pr_checks IN ({}) AND ("
+        "AND (pr_checks IN ({}) OR (pr_checks=? AND ci_known_flake_sha=pr_head_sha)) AND ("
         "  judge_sha IS NULL OR judge_sha != pr_head_sha"
         "  OR (judge_state=? AND COALESCE(judge_cannot_verify_tries, 0) < ?"
         "      AND COALESCE(judge_unknown_final, 0) = 0)"
+        "  OR (judge_state=? AND judge_launch_owner IS NOT NULL)"
+        "  OR judge_state=?"
         ")"
         .format(",".join("?" * len(JUDGE_TRIGGER_CHECKS))),
-        (str(wf.path), *JUDGE_TRIGGER_CHECKS,
-         judge.J_CANNOT_VERIFY, judge_max_unknown_retries()),
+        (str(wf.path), *JUDGE_TRIGGER_CHECKS, CI_FAILING,
+         judge.J_CANNOT_VERIFY, judge_max_unknown_retries(), judge.J_RUNNING,
+         judge.J_CANCELLED),
     ).fetchall()
+
+
+def _judge_launch_interrupted(row: sqlite3.Row) -> bool:
+    """🔁⚖️ CMX-263: is this ``running`` row a judge LAUNCH whose launcher is gone?
+
+    Measured 2026-10-18: ``pm2 restart chela-daemon`` landed between ``before_run`` and the
+    agent's window, and the new daemon's watchdog wrote "the judge's window disappeared"
+    CANNOT VERIFY. A launcher that is not alive (or is THIS process, which never runs the
+    trigger mid-launch) left an interrupted launch; a live other process is still launching.
+    An unreadable marker is not an interrupted launch — the watchdog handles it as before.
+    """
+    owner = _judge_launch_owner(row)
+    if row["judge_state"] != judge.J_RUNNING or owner is None:
+        return False
+    return owner.get("pid") == os.getpid() or not judge._judge_lock_owner_alive(owner)
+
+
+def _judge_launch_owner(row: sqlite3.Row) -> dict | None:
+    """The parsed ``judge_launch_owner`` marker, or ``None`` when unset or unreadable."""
+    try:
+        owner = json.loads(row["judge_launch_owner"] or "null")
+    except (TypeError, ValueError):
+        return None
+    return owner if isinstance(owner, dict) else None
 
 
 def _judge_backoff_pending(row: sqlite3.Row) -> bool:
@@ -7946,6 +8967,24 @@ def _judge_full_suite_budget(status: dict | None) -> float:
     if baseline is None or baseline <= 0:
         return judge_wall_per_experiment_seconds()
     return baseline * JUDGE_FULL_SUITE_MARGIN
+
+
+def judge_stall_seconds(status: dict | None) -> float:
+    """⏳⚖️ CMX-431/CMX-271: how long a run past its wall may go without progress before it
+    is stuck — the per-experiment budget, or one full-suite run if that is longer.
+
+    ⏳ CMX-271: also never shorter than the run's own ``suite_timeout_seconds`` + grace, in
+    every phase — ``phase`` is not proof no suite runs (``finishing`` is written before the
+    consistency stage re-runs suites). Measured 2026-10-19 on PR #775: a mutation hung a
+    test, and with a ~19 min baseline the 1.5× budget reaped the judge at ~29 min, before
+    its 40-min suite timeout could record the mutation as KILLED. A status without a finite
+    value (a run older than this, or garbage) keeps the budget alone.
+    """
+    stall = max(judge_wall_per_experiment_seconds(), _judge_full_suite_budget(status))
+    suite_timeout = _num((status or {}).get("suite_timeout_seconds"))
+    if suite_timeout is not None and math.isfinite(suite_timeout):
+        stall = max(stall, suite_timeout + JUDGE_SUITE_TIMEOUT_GRACE_SECONDS)
+    return stall
 
 
 def judge_wall_seconds(status: dict | None) -> float:
@@ -7986,7 +9025,7 @@ def judge_overdue(elapsed: float, status: dict | None, now: float) -> str | None
     * Inside its wall (:func:`judge_wall_seconds`) — plus the grace, once every experiment
       is done (:func:`judge_run_completed`) — a run is never reaped.
     * Past it, a run whose progress (``progress_at``) has not advanced for the stall window
-      (the per-experiment budget, or one full-suite run if that is longer) is stuck — and
+      (:func:`judge_stall_seconds`) is stuck — and
       ONLY then is it called "stuck, not thinking". A run with no progress record at all
       (an older run, or one still before its first write) is judged as before: past the
       wall, stuck.
@@ -8010,7 +9049,7 @@ def judge_overdue(elapsed: float, status: dict | None, now: float) -> str | None
     else:
         where = "before its first experiment"
     progress_at = _num(status.get("progress_at"))
-    stall = max(judge_wall_per_experiment_seconds(), _judge_full_suite_budget(status))
+    stall = judge_stall_seconds(status)
     if progress_at is None:
         return f"the judge did not finish in {int(wall) // 60}min — it is stuck, not thinking"
     since = max(0.0, now - progress_at)
@@ -8033,6 +9072,80 @@ def _judge_run_status(task_id: str) -> dict | None:
     return status
 
 
+JUDGE_RETRY_MESSAGE = ("resume: a fleet pause froze you mid-call, so your last model or tool "
+                       "call failed. Retry it once and continue; it is not a verdict.")
+
+
+def _cancel_moot_judges(conn: sqlite3.Connection, wf: WorkflowDef,
+                        live_windows: set[str] | frozenset[str] = frozenset()) -> int:
+    """⏹️⚖️ CMX-286: stop every live judge whose round can no longer produce a usable verdict.
+
+    Seen twice on 10-19/20: CMX-264's conflict handling sent a PR back while its judge kept
+    running on the obsolete head — the watchdog's "still alive — holding" kept one of the
+    judge slots for up to an hour, and the first ended ``cannot_verify … run already moved
+    to running``. A round is moot once its run is in :data:`SENT_BACK_STATUSES`, or is still
+    under review on a head other than the one judged (both shas known), or (CMX-340) has left
+    review for good (:data:`TERMINAL_STATUSES`) and its judge is gone: no live run, and no
+    judge window in ``live_windows`` (an agent not yet at ``--detach``). The row is CAS'd
+    to ``cancelled`` on THIS round first (a verdict that landed meanwhile is left alone),
+    which frees the slot and announces nothing, and its ``judge_window_id`` (and epoch) is
+    cleared: tmux may give that id to another window (CMX-340). Then the round-end reaper the
+    watchdog uses runs:
+    window, detached run (:func:`judge.cancel_judge_run`), worktree. A launch still in flight
+    in another process is left to it — the next tick sees its run. Returns how many."""
+    cancelled = 0
+    for row in conn.execute(
+        "SELECT * FROM runs WHERE workflow_path=? AND judge_state=?",
+        (str(wf.path), judge.J_RUNNING),
+    ).fetchall():
+        task_id, status = row["task_id"], row["status"]
+        judged, head = row["judge_sha"], row["pr_head_sha"]
+        if status in SENT_BACK_STATUSES:
+            reason = f"its run was sent back (now {status!r})"
+        elif (status in TERMINAL_STATUSES
+              and judge.judge_window_name(row["branch_name"] or "") not in live_windows
+              and judge.live_judge_run(task_id, judge.judge_worktree_path(wf, task_id)) is None):
+            # A LIVE judge here is left to finish: on a merged PR it may still record a
+            # CMX-239 blocked-race verdict. A dead one only leaves a stale row behind.
+            reason = f"its run left review (now {status!r}) and its judge is gone"
+        elif status == "awaiting_review" and judged and head and judged != head:
+            reason = f"its PR head moved ({judged[:12]} → {head[:12]})"
+        else:
+            continue
+        if _judge_launch_owner(row) is not None and not _judge_launch_interrupted(row):
+            continue
+        cur = conn.execute(
+            "UPDATE runs SET judge_state=?, judge_detail=?, judge_launch_owner=NULL, "
+            "judge_window_id=NULL, judge_window_epoch=NULL "
+            "WHERE task_id=? AND judge_state=? AND judge_started_at IS ?",
+            (judge.J_CANCELLED, f"judge cancelled: {reason}", task_id, judge.J_RUNNING,
+             row["judge_started_at"]),
+        )
+        conn.commit()
+        if cur.rowcount == 0:
+            continue
+        worktree = judge.judge_worktree_path(wf, task_id)
+        try:
+            _kill_windows_named(judge.judge_window_name(row["branch_name"] or ""))
+            pids = judge.cancel_judge_run(task_id, worktree)
+        except OSError as e:                # the row is already off `running`: never re-read
+            log.error("judge cancel for %s: could not stop the judge: %s", task_id, e)
+            pids = []
+        try:
+            remove_worktree(wf.path.parent, worktree, resolve_workspace_root(wf))
+        except NotAWorktree as e:                      # CMX-320 — never crash the reaper
+            log.error("judge cancel for %s: REFUSED to remove %s", task_id, e)
+        event_log.append(
+            "judge_cancelled", f"{task_id}: judge stopped — {reason}; its slot is free",
+            payload={"task_id": task_id, "reason": reason, "status": status,
+                     "judge_sha": judged, "pr_head_sha": head, "pids": pids},
+        )
+        log.warning("judge: %s: CANCELLED — %s (signalled %d pid(s))", task_id, reason,
+                    len(pids))
+        cancelled += 1
+    return cancelled
+
+
 def _judge_watchdog(conn: sqlite3.Connection, wf: WorkflowDef, live_windows: set[str]) -> int:
     """A judge that stopped without a verdict is CANNOT VERIFY — never a pass, never a fail.
 
@@ -8052,6 +9165,16 @@ def _judge_watchdog(conn: sqlite3.Connection, wf: WorkflowDef, live_windows: set
         "SELECT * FROM runs WHERE workflow_path=? AND judge_state=?",
         (str(wf.path), judge.J_RUNNING),
     ).fetchall():
+        launch_started = _parse_ts(row["judge_started_at"])
+        if _judge_launch_owner(row) is not None and not (
+            launch_started is not None and now is not None
+            and (now - launch_started).total_seconds() >= JUDGE_TIMEOUT_SECONDS
+        ):
+            # 🔁⚖️ CMX-263: a launch that never finished is not a judge that died — it is
+            # still launching elsewhere, or the trigger relaunches it as the same round.
+            # Bounded by the flat wall, so a hung launcher or a relaunch that never comes
+            # (the PR closed, CI went red) is still reaped as before.
+            continue
         window = judge.judge_window_name(row["branch_name"] or "")
         # 👻⚖️ CMX-429: ask the RUN, not the agent's window. Since CMX-411 the agent stops
         # right after `--detach`, so "window gone" is normal while its run is still going —
@@ -8070,15 +9193,34 @@ def _judge_watchdog(conn: sqlite3.Connection, wf: WorkflowDef, live_windows: set
             _epoch_dt(live_run.get("run_started_at")) if live_run else None
         )
         started = run_started or _parse_ts(row["judge_started_at"])
+        # ⏸️⚖️ CMX-214: a frozen judge is left alone (10-18/19: three were reaped as "stuck"),
+        # and once thawed its wall skips the frozen time and its progress clock restarts.
+        freeze = judge.read_freeze(row["task_id"])
+        if not freeze.get("intervals") or freeze.get("round") != row["judge_started_at"]:
+            freeze = {}
+        if freeze and freeze["intervals"][-1][1] is None:
+            log.info("judge watchdog: %s: frozen by a fleet pause — holding", row["task_id"])
+            continue
         # ⏳⚖️ CMX-431: once the run has started, its wall scales with its battery and only a
         # run whose progress STOPPED is reaped past it (see `judge_overdue`). Before that the
         # agent is bounded by the flat JUDGE_TIMEOUT_SECONDS from its spawn, as always.
         timeout_reason = None
         if started is not None and now is not None:
-            elapsed = (now - started).total_seconds()
+            elapsed = (now - started).total_seconds() - judge.frozen_since(
+                row["task_id"], started.timestamp(), rec=freeze)
             if run_started is not None:
-                timeout_reason = judge_overdue(
-                    elapsed, _judge_run_status(row["task_id"]), now.timestamp())
+                status = _judge_run_status(row["task_id"])
+                if status and freeze:
+                    status["progress_at"] = max(_num(status.get("progress_at")) or 0.0,
+                                                freeze["intervals"][-1][1])
+                # 🧠 CMX-119: a run queued for a suite slot is waiting, not stuck — held while
+                # it waits, and its wall skips the time it spent queued.
+                if status and _num(status.get("slot_waiting_since")) is not None:
+                    log.info("judge watchdog: %s: waiting for a suite slot — holding",
+                             row["task_id"])
+                    continue
+                elapsed -= _num((status or {}).get("slot_wait_seconds")) or 0.0
+                timeout_reason = judge_overdue(elapsed, status, now.timestamp())
             elif elapsed >= JUDGE_TIMEOUT_SECONDS:
                 timeout_reason = (f"the judge did not finish in {JUDGE_TIMEOUT_SECONDS // 60}"
                                   "min — it is stuck, not thinking")
@@ -8107,6 +9249,17 @@ def _judge_watchdog(conn: sqlite3.Connection, wf: WorkflowDef, live_windows: set
                 row["task_id"], live_run.get("pid"),
             )
             continue
+        if (alive and not timed_out and not login_expired and freeze.get("retry")
+                and _judge_model_call_failed(wf, row)):
+            # ⏸️⚖️ CMX-214: a model call the freeze cut off is not an outage. ONE is forgiven
+            # per thaw: the token is spent BEFORE the send, so a second failure reaps as
+            # before, and a send that fails falls through to the arms below. Re-read, not
+            # `freeze`: a pause that landed since must keep its open interval.
+            judge.write_freeze(row["task_id"], {**judge.read_freeze(row["task_id"]), "retry": 0})
+            if _send_seed(row["judge_window_id"], JUDGE_RETRY_MESSAGE, row["task_id"]):
+                log.warning("judge watchdog: %s: a model call failed after a fleet pause — "
+                            "told it to retry", row["task_id"])
+                continue
         # ⚖️🌩️ CMX-379: the auto-mode classifier outage is the same kind of never-got-a-
         # chance failure. Measured 2026-09-28 on PR #529: every Bash call failed, the judge
         # stopped after the harness's 10-in-a-row limit and sat idle, holding the only judge
@@ -8148,7 +9301,7 @@ def _judge_watchdog(conn: sqlite3.Connection, wf: WorkflowDef, live_windows: set
         # covers it, since `login_expired` only reaps here while `timed_out` is False.
         conn.execute(
             "UPDATE runs SET judge_state=?, judge_detail=?, judge_no_verdict=?, "
-            "judge_retry_after=? WHERE task_id=?",
+            "judge_retry_after=?, judge_launch_owner=NULL WHERE task_id=?",
             (judge.J_CANNOT_VERIFY, reason, int(not timed_out), retry_after, row["task_id"]),
         )
         conn.commit()
@@ -8333,6 +9486,7 @@ def delete_run(task_id: str) -> dict:
             wf_path = row["workflow_path"] or ""
             repo_dir = Path(wf_path).parent if wf_path else None
             if worktree_path and repo_dir and repo_dir.is_dir():
+                reap_run_worktree(worktree_path, wf_path)   # CMX-151
                 try:
                     wt = subprocess.run(
                         ["git", "worktree", "remove", "--force", worktree_path],
@@ -8412,6 +9566,7 @@ def dry_run(workflow_path: str | Path) -> list[dict]:
             "repo_path": str(repo_path),
             "project_key": project_key,
             "task_number": tn,
+            "standing_rules": standing_rules(wf),
         })
         plans.append({
             "task_id": task.id,

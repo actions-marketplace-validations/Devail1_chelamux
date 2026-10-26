@@ -280,7 +280,10 @@ def test_the_tick_respawns_into_the_existing_worktree_and_branch(tmp_path):
     with dispatcher._db() as conn:
         _row(conn, workflow_path=str(wf.path), status="changes_requested",
              worktree_path=str(original_wt), branch_name="test-1",
-             review_history=json.dumps([{"round": 1, "at": "t", "body": "the wire is loose"}]))
+             review_history=json.dumps([{"round": 1, "at": "t", "body": "the wire is loose"}]),
+             # ⏸️ CMX-318: a park left from the last round must not hold the new one
+             parked_at="2026-10-22T10:00:00+00:00", parked_reason="old", parked_until="2h",
+             parked_by="orchestrator")
 
     with patch.object(dispatcher, "load_workflow_cached", return_value=_status(wf)), \
          patch.object(dispatcher, "get_source", return_value=source), \
@@ -306,6 +309,8 @@ def test_the_tick_respawns_into_the_existing_worktree_and_branch(tmp_path):
     assert run["worktree_path"] == str(original_wt)
     assert run["branch_name"] == "test-1"
     assert run["rework_count"] == 1
+    assert [run[c] for c in ("parked_at", "parked_reason", "parked_until", "parked_by")] == [
+        None] * 4
 
     # The prompt carries the verdict AND tells the agent to read the PR thread itself.
     assert prompts and "the wire is loose" in prompts[0]
@@ -841,21 +846,24 @@ def test_reconcile_done_from_a_review_state_row_that_left_the_tracker(tmp_path):
     """Guard 3 (confirm) — the genuine happy path stays intact. A REVIEW-status row (the
     agent opened a PR; a human struck the tracker line by hand, or the legacy self-strike
     flow removed it) whose task left `open_ids` still reconciles to `done` — the completion-
-    evidence gate added for claimed/running rows must not touch this path.
+    evidence gate added for claimed/running rows must not touch this path. 🗂️⏸️ CMX-308:
+    once its PR has MERGED — the PR here is the transcript's, so phase 0 never saw it and
+    the merge is read by this branch itself (an open one holds the row: see
+    tests/test_reconcile_left_tracker_pr_open.py).
     """
     wf = _wf(tmp_path)
     source = _Source()      # "abc123" has left the tracker
     with dispatcher._db() as conn:
         _row(conn, workflow_path=str(wf.path), status="awaiting_review",
-             window_name="test-1", pr_url="https://github.com/o/r/pull/80", pr_state="open")
+             window_name="test-1", pr_url=None, pr_state=None)
 
     fake = _FakeTmux()
     fake.windows = [("@1", "test-1")]
     with patch.object(dispatcher, "load_workflow_cached", return_value=_status(wf)), \
          patch.object(dispatcher, "get_source", return_value=source), \
          patch.object(dispatcher, "_claim_order", return_value=[]), \
-         patch.object(dispatcher, "_read_pr_url", return_value=None), \
-         patch.object(dispatcher, "_read_pr_status", return_value=("open", "MERGEABLE")), \
+         patch.object(dispatcher, "_read_pr_url", return_value="https://github.com/o/r/pull/80"), \
+         patch.object(dispatcher, "_read_pr_status", return_value=("merged", "MERGEABLE")), \
          patch.object(dispatcher.subprocess, "run", side_effect=fake.run):
         summary = dispatcher.tick(wf.path)
 
@@ -1015,6 +1023,8 @@ def test_a_rework_that_cannot_launch_is_NEVER_re_claimed_as_a_FRESH_task(tmp_pat
     exception handler makes tick 2 re-dispatch it with the fresh prompt.
     """
     monkeypatch.setenv("CHELA_MAX_REWORKS", "2")
+    # 🏗️🔁 CMX-192: a launch that never lands is INFRA — it is bounded by its own cap now.
+    monkeypatch.setenv("CHELA_MAX_INFRA_RESTARTS", "2")
     wf = _wf(tmp_path)
     wt = tmp_path / ".chela" / "wts" / "abc123"
     wt.mkdir(parents=True)
@@ -1047,6 +1057,9 @@ def test_a_rework_that_cannot_launch_is_NEVER_re_claimed_as_a_FRESH_task(tmp_pat
     assert statuses == ["changes_requested", "changes_requested", "needs_human"]
     run = dispatcher.resolve_run("abc123")
     assert run["rework_count"] == 2                # every round accounted for; none bypassed
+    assert run["infra_restarts"] == 2              # ...as infra, not as review (CMX-192)
+    assert "infra restart cap reached (2/2)" in run["last_error"]
+    assert "still fails review" not in run["last_error"]
     assert run["attempt"] == 1                     # it was never re-dispatched as a new task
     assert dispatcher.latest_verdict(dict(run)) == "the wire is loose"   # the verdict SURVIVED
     assert all("fresh dispatch" not in p for p in prompts)

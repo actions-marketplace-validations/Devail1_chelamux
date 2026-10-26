@@ -10,11 +10,12 @@
 // nav.js (renderSidebarAgents into a REAL #sidebar-agents), so the cue is asserted on
 // what RENDERS off the SAME live module state the wall itself uses — not a source grep.
 //
-// Run: node --test tests/sidebar_wall_indicator.test.mjs  (pytest runs it via
+// Run: pnpm exec vitest run tests/sidebar_wall_indicator.test.mjs  (pytest runs it via
 // tests/test_js_suites.py; needs `pnpm install` for jsdom.)
-import { before, test } from 'node:test';
+import { beforeAll, test } from 'vitest';
 import assert from 'node:assert/strict';
 import { JSDOM } from 'jsdom';
+import { mountIslands } from './js_helpers/dashboard_dom.mjs';
 
 const PANEL = `
 <div class="panel" id="panel-terminals">
@@ -23,7 +24,6 @@ const PANEL = `
   <select id="term-agent"></select>
   <span id="term-wall-grid"><span id="term-grid-presets"></span><button id="term-lock-btn"></button></span>
   <button id="term-new-shell"></button>
-  <div id="term-switcher"></div>
   <div id="term-stage"></div>
   <div id="term-min-dock"></div>
   <div id="term-bar" class="kb-collapsed"><button class="kb-toggle" id="kb-toggle"></button><div class="kb-body" id="kb-body"></div></div>
@@ -70,12 +70,11 @@ function fakeGridStack() {
     return { init: () => grid };
 }
 
-let terminals, nav, util;
+let terminals, nav, agentsStore, viewStore, sidebar;
 
-before(async () => {
+beforeAll(async () => {
     const dom = new JSDOM(`<!doctype html><html><body>${PANEL}</body></html>`,
         { url: 'http://localhost:5005/', pretendToBeVisual: true });
-    dom.window.TERMINALS_ENABLED = true;
     for (const k of ['window', 'document', 'localStorage', 'navigator', 'HTMLElement',
         'Element', 'Node', 'Event', 'MouseEvent', 'KeyboardEvent', 'CustomEvent',
         'getComputedStyle', 'requestAnimationFrame', 'cancelAnimationFrame']) {
@@ -97,27 +96,30 @@ before(async () => {
     globalThis.window.chela = globalThis.window.chela || {};
     globalThis.setInterval = () => 0;
 
-    await import('../chela/dashboard/static/js/main.js');
-    util = await import('../chela/dashboard/static/js/util.js');
-    terminals = await import('../chela/dashboard/static/js/terminals.js');
-    nav = await import('../chela/dashboard/static/js/nav.js');
-    util.setCurrentTab('terminals');
+    await mountIslands(dom.window);   // CMX-276: the sidebar island draws #sidebar-agents
+    (await import('../chela/dashboard/frontend/src/boot.ts')).start();
+    ({ agents: agentsStore } = await import('../chela/dashboard/frontend/src/shared/store/agents.ts'));
+    ({ view: viewStore } = await import('../chela/dashboard/frontend/src/shared/store/view.ts'));
+    terminals = await import('../chela/dashboard/frontend/src/features/wall/index.ts');
+    nav = await import('../chela/dashboard/frontend/src/features/shell/index.ts');
+    sidebar = await import('../chela/dashboard/frontend/src/features/sidebar/controller.ts');
+    viewStore.set('terminals');
 
     AGENTS = fleet();   // WORKER opens minimized (walldock's property 1)
-    util.setAgentsCache(AGENTS);
+    agentsStore.set(AGENTS);
     await terminals.renderTerminals();
 });
 
 const rowFor = wid => document.querySelector(`#sidebar-agents .agent-row[data-agent="${wid === HUMAN ? 'orchestrator' : 'cmx-137'}"]`);
 
 test('a pane open on the wall (not docked) gets the on-wall cue', () => {
-    nav.renderSidebarAgents(AGENTS);
+    sidebar.renderSidebarAgents(AGENTS);
     assert.ok(rowFor(HUMAN).classList.contains('on-wall'),
         "the orchestrator's pane is live on the wall — its row must carry the cue");
 });
 
 test('a pane docked to the min-dock (minimized) does NOT get the cue', () => {
-    nav.renderSidebarAgents(AGENTS);
+    sidebar.renderSidebarAgents(AGENTS);
     assert.ok(!rowFor(WORKER).classList.contains('on-wall'),
         'a minimized pane is not "open on the wall" — the cue must not fire for it');
 });
@@ -125,15 +127,15 @@ test('a pane docked to the min-dock (minimized) does NOT get the cue', () => {
 test('popping the dock out flips the cue on — driven by the SAME wall state, live', async () => {
     AGENTS = fleet({ needsHuman: true });   // worker blocks -> pops out of the dock
     await terminals.termTick();
-    nav.renderSidebarAgents(AGENTS);
+    sidebar.renderSidebarAgents(AGENTS);
     assert.ok(rowFor(WORKER).classList.contains('on-wall'),
         'a popped-out (restored) pane must now read as open on the wall');
 });
 
 test('minimizing a wall pane by hand flips the cue back off', () => {
     const tile = document.querySelector(`#term-stage .grid-stack-item[gs-id="${HUMAN}"]`);
-    window.chela.termMinFor(tile.querySelector('.gs-min-btn'));
-    nav.renderSidebarAgents(AGENTS);
+    tile.querySelector('.gs-min-btn').click();   // the header's own control (React, CMX-241)
+    sidebar.renderSidebarAgents(AGENTS);
     assert.ok(!rowFor(HUMAN).classList.contains('on-wall'),
         'a pane just minimized to the dock must lose the on-wall cue immediately');
 });

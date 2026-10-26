@@ -38,7 +38,8 @@ group 9 — then 59, until CMX-435 added `CHELA_SHARE_SANDBOX_SUBSCRIPTION`, gro
 until CMX-26 added `CHELA_INBOX_HELD_ALERT_S` and `CHELA_CLEAN_UNMERGED_ALERT_S`, group 5 — then 65,
 until CMX-86 added the four orchestrator-inbox notice knobs, group 5 — then 66, until CMX-110
 added `CHELA_SELFCHECK_ALERT_S`, group 5 — then 67, until CMX-103 added `CHELA_DASHBOARD_URL`,
-group 7) — every literal `CHELA_*` name a Python module in
+group 7 — then 66, until CMX-266 retired `CHELA_TERMINAL_TIMESTAMPS`, group 8 — then 67, until
+CMX-318 added `CHELA_PARK_MAX_S`, group 5) — every literal `CHELA_*` name a Python module in
 `chela/` reads straight off `os.environ`.
 `tests/test_settings_inventory.py::test_inventory_matches_env_reads` re-runs this scan and
 diffs it against the table below on every `pytest` run, so the count can't go stale the way
@@ -78,13 +79,14 @@ scan, and matter to a redesign precisely because they're invisible to it:
   from any settings surface: it's an actor stamp a launched orchestrator process exports
   into its own window, never a human preference (see `[[feedback_orchestrator...]]`-style
   guidance in `chela/config.py:345-352`).
-- **Six ttyd/terminal-wall knobs read only by `scripts/agent-terminals.sh`** (shell, not
+- **Seven ttyd/terminal-wall knobs read only by `scripts/agent-terminals.sh`** (shell, not
   Python, so the Python-side grep never sees them): `CHELA_TERM_BASE`, `CHELA_TERM_POLL`,
   `CHELA_TERM_MAX_CLIENTS`, `CHELA_TERM_FONT`, `CHELA_TERM_FONTSIZE`,
-  `CHELA_TERM_BACKOFF_MAX`. A "Terminal wall" tab that only covers the Python-side knobs
+  `CHELA_TERM_BACKOFF_MAX`, `CHELA_TERM_RENDERER` (xterm renderer, default `dom` for
+  Hebrew bidi, CMX-302). A "Terminal wall" tab that only covers the Python-side knobs
   (`CHELA_TERMINALS_ENABLED/EXPOSE/TERM_COLS/TERM_ROWS/TERM_THEME/WALL_TILE_DISPATCHED`)
   would still be missing the port range, font, and client cap the supervisor itself reads.
-  (`CHELA_TERM_THEME` was the seventh until CMX-381: the dashboard now reads it too, so
+  (`CHELA_TERM_THEME` was one of them too until CMX-381: the dashboard now reads it too, so
   it is in the table under group 8.)
 
 Neither group is in the 58, and neither should be added to the count above (that count is
@@ -247,6 +249,7 @@ Status section already does for other facts), not a write control.
 | `CHELA_STUCK_AGENT_ALERT_S` | `1200` | `hot` | How long a running agent may go without a commit or transcript activity before one inbox notice (CMX-86) |
 | `CHELA_MARKER_UNREAD_ALERT_S` | `300` | `hot` | How long a task-finished/push-request marker may sit unapplied before one inbox notice (CMX-86) |
 | `CHELA_SELFCHECK_ALERT_S` | `3600` | `hot` | How long a `chela task-finished` / `chela judge sweep` / pytest may run in a running run's worktree (counted as activity, never "stuck") before one "self-check running for …" inbox notice (CMX-110) |
+| `CHELA_PARK_MAX_S` | `21600` | `hot` | How long a run parked with `chela park` stays exempt from the stuck notice before one "parked … past the max" inbox notice (CMX-318) |
 | `CHELA_INBOX_FILE` | `$CHELA_DIR/inbox.json` | `internal-path` | |
 | `CHELA_ORCHESTRATOR_WID` | empty | `identity` | Pins the inbox target window; env pin carries no epoch/session (see `chela/inbox.py`) |
 
@@ -271,7 +274,7 @@ Status section already does for other facts), not a write control.
 host." A dashboard writing its own bind host is a process editing the boundary that makes
 "loopback + no-auth" a safe default in the first place.
 
-### 8. Terminal wall (7 of the 58; +6 shell-only, see above) — mixed
+### 8. Terminal wall (6 of the 58; +6 shell-only, see above) — mixed
 
 | Variable | Default | Class | Notes |
 |---|---|---|---|
@@ -279,7 +282,6 @@ host." A dashboard writing its own bind host is a process editing the boundary t
 | `CHELA_TERMINALS_EXPOSE` | `false` | `trust-boundary` | Serve the writable wall on a non-loopback bind — RCE risk, opt-in |
 | `CHELA_TERM_COLS` | `120` | `hot` | Shared collab grid geometry (columns) |
 | `CHELA_TERM_ROWS` | `30` | `hot` | Shared collab grid geometry (rows) |
-| `CHELA_TERMINAL_TIMESTAMPS` | `false` | `hot` | Prepend a local-time marker inline into each assistant reply via the `MessageDisplay` hook's `displayContent` (CMX-285, superseding CMX-277's separate-line `systemMessage`) — OFF by default (adopter-facing, needs Claude Code 2.1.152+); opt in per-install |
 | `CHELA_WALL_TILE_DISPATCHED` | `false` | `hot` | Give dispatcher-spawned agents a full tile eagerly vs minimized |
 | `CHELA_TERM_THEME` | unset | `restart` | Operator override for the terminals' xterm palette (a JSON ITheme). Read by BOTH `scripts/agent-terminals.sh` (ttyd's launch theme) and the dashboard (`chela/dashboard/term_themes.py`), where it wins over every Settings > Appearance theme's per-theme terminal palette (CMX-381) |
 

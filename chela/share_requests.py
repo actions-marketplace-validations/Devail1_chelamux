@@ -75,8 +75,8 @@ MAX_REASON = 1000
 REQUESTS_NAME = "requests.jsonl"
 EXTRA_ROOT = "/extra"
 
-_SID_RE = re.compile(r"^[0-9a-f]{12}$")
-_DOMAIN_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,62}$")
+_SID_RE = re.compile(r"^[0-9a-f]{12}\Z")
+_DOMAIN_RE = re.compile(r"^(?=.{1,253}\Z)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,62}\Z")
 _NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 # Host paths a mount may never be, sit inside, or contain — whatever a record says.
@@ -485,6 +485,23 @@ def approved_domains(sid: str, now: float | None = None) -> list[str]:
 
 
 # --- the operator's view ----------------------------------------------------------------
+
+def pending() -> list[dict]:
+    """Every PENDING request, oldest first, each with its ``description``, with no cap
+    (CMX-183: the orchestrator's "needs you" band counts them). Unlike :func:`_load`, a
+    store that exists but cannot be read RAISES: a caller counting what waits must never
+    read an unreadable store as "none waiting". No store yet is none."""
+    path = store_path()
+    if not path.exists():
+        return []
+    data = json.loads(path.read_text(encoding="utf-8"))
+    reqs = data.get("requests") if isinstance(data, dict) else None
+    if not isinstance(reqs, dict):
+        raise ValueError(f"{path}: no requests table")
+    out = [{**r, "description": describe(r)} for r in reqs.values()
+           if isinstance(r, dict) and r.get("status") == PENDING]
+    return sorted(out, key=lambda r: r.get("filed_at") or 0)
+
 
 def listing(now: float | None = None, limit: int = 50) -> list[dict]:
     """Pending requests (oldest first), then approvals in force, then the most recent

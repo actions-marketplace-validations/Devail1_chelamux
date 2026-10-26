@@ -14,9 +14,9 @@
 //     no new socket and make no /share-info round trip;
 //   - a share that stops removes its presence (no ghost avatars, socket closed).
 //
-// Run: node --test tests/presence_owner_rotation.test.mjs (pytest runs it via
+// Run: pnpm exec vitest run tests/presence_owner_rotation.test.mjs (pytest runs it via
 // tests/test_js_suites.py; needs `pnpm install` for jsdom).
-import { before, test } from 'node:test';
+import { beforeAll, test } from 'vitest';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -30,7 +30,6 @@ const PANEL = `
   <select id="term-agent"></select>
   <span id="term-wall-grid"><span id="term-grid-presets"></span><button id="term-lock-btn"></button></span>
   <button id="term-new-shell"></button>
-  <div id="term-switcher"></div>
   <div id="term-stage"></div>
   <div id="term-min-dock"></div>
   <div id="term-bar" class="kb-collapsed"><button class="kb-toggle" id="kb-toggle"></button><div class="kb-body" id="kb-body"></div></div>
@@ -75,17 +74,16 @@ function fakeGridStack() {
     return { init: () => grid };
 }
 
-let terminals, util, owner;
+let terminals, agentsStore, viewStore, owner, shareSession;
 const settle = async () => { for (let i = 0; i < 20; i++) await new Promise(r => setTimeout(r, 0)); };
 
-before(async () => {
+beforeAll(async () => {
     // BASE_PATH is the page path; pointing it at chela/dashboard on disk makes the
     // lazy import(BASE_PATH + '/static/collab/presence-owner.js') in terminals.js load
     // the REAL module (the same instance this test imports below).
     const dashDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../chela/dashboard');
     const dom = new JSDOM(`<!doctype html><html><body>${PANEL}</body></html>`,
         { url: 'http://localhost:5005' + dashDir + '/', pretendToBeVisual: true });
-    dom.window.TERMINALS_ENABLED = true;
     for (const k of ['window', 'document', 'localStorage', 'sessionStorage', 'location', 'navigator',
         'HTMLElement', 'Element', 'Node', 'Event', 'MouseEvent', 'KeyboardEvent', 'CustomEvent',
         'getComputedStyle', 'requestAnimationFrame', 'cancelAnimationFrame']) {
@@ -99,12 +97,14 @@ before(async () => {
         addEventListener() {}, removeEventListener() {}, addListener() {}, removeListener() {} });
     globalThis.window.chela = globalThis.window.chela || {};
     globalThis.setInterval = () => 0;   // no heartbeat / prune timers: the test drives it
-    await import('../chela/dashboard/static/js/main.js');
-    util = await import('../chela/dashboard/static/js/util.js');
-    terminals = await import('../chela/dashboard/static/js/terminals.js');
+    (await import('../chela/dashboard/frontend/src/boot.ts')).start();
+    ({ agents: agentsStore } = await import('../chela/dashboard/frontend/src/shared/store/agents.ts'));
+    ({ view: viewStore } = await import('../chela/dashboard/frontend/src/shared/store/view.ts'));
+    terminals = await import('../chela/dashboard/frontend/src/features/wall/index.ts');
     owner = await import(dashDir + '/static/collab/presence-owner.js');
-    util.setCurrentTab('terminals');
-    util.setAgentsCache([{ ...AGENT }]);
+    ({ shareSession } = await import('../chela/dashboard/frontend/src/features/share/index.ts'));
+    viewStore.set('terminals');
+    agentsStore.set([{ ...AGENT }]);
     await terminals.renderTerminals();
     await settle();
 });
@@ -129,9 +129,9 @@ const avatars = () => [...document.querySelectorAll('.gs-presence[data-presence-
 test('a share re-created elsewhere re-keys owner presence; the new guest renders; steady polls do not churn; stop clears it', async () => {
     assert.ok(document.querySelector('.gs-presence[data-presence-for="@1"]'), 'pane header must carry a presence slot');
 
-    // 1) First share, adopted by this page (shareBtnClick reads /share-info).
+    // 1) First share, adopted by this page (shareSession reads /share-info).
     const codeA = await shareFromElsewhere(1);
-    await terminals.shareBtnClick(null, '@1');
+    await shareSession('@1');   // the pane header's Share row
     await settle();
     window.chela.closeSharesSheet && window.chela.closeSharesSheet();
     assert.equal(open().length, 1, 'one owner-presence socket for the share');
@@ -149,7 +149,7 @@ test('a share re-created elsewhere re-keys owner presence; the new guest renders
     assert.equal(shareInfoFetches, fetchesBefore, 'an unchanged share_epoch must not refetch /share-info');
     // Clicking Share on the live share re-adopts it (startOwnerPresence with the SAME
     // code) — that must reuse the session, not reconnect.
-    await terminals.shareBtnClick(null, '@1');
+    await shareSession('@1');   // the pane header's Share row
     await settle();
     window.chela.closeSharesSheet && window.chela.closeSharesSheet();
     assert.equal(sockets.length, socketsBefore, 're-adopting the same share must not reconnect');

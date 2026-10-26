@@ -3,7 +3,7 @@
 Claude Code keeps re-writing a session's ``pr-link`` record after its PR merged, so the
 record's presence alone put "✓ PR ready for review" + ``⚑ #613`` on a dead PR.
 ``chela.pr_status`` resolves open/merged/closed/unknown (+ draft) and ``/api/agents``
-ships it on ``pr``; the client (wallmodel.js, tests/wall_tile.test.mjs) gates the bar on
+ships it on ``pr``; the client (wallmodel.ts, tests/wall_tile.test.mjs) gates the bar on
 a confirmed open, non-draft state.
 """
 from __future__ import annotations
@@ -163,6 +163,8 @@ def _fleet(gh, runs=()):
         patch("chela.inbox.is_done", return_value=False),
         # A tmux read (CMX-62) — stubbed so `gh.calls` counts only gh.
         patch("chela.agent_manager.is_manual_name", return_value=False),
+        # So is a shell pane's cwd (CMX-241: every pane here has no claude pid).
+        patch("chela.dashboard.app._pane_path", return_value=None),
         patch("chela.pr_status.subprocess.run", gh),
     ):
         yield

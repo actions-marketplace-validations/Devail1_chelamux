@@ -34,6 +34,20 @@ into a chela workflow's repo:
   session (``$CHELA_TMUX_SESSION``, else ``chela``), a ``$id``, uses ``-a``, or names no
   target at all (inside a chela pane that is chela's session).
 
+* 🪆 in a DISPATCHED run only (``$CHELA_RUN_ID`` set at spawn, CMX-190), a ``Bash`` command
+  that starts another Claude Code session — ``claude`` as a command word, however wrapped
+  (``tmux new-session "…"``, ``env``/``nohup``/``timeout``, ``bash -c``, ``npx
+  @anthropic-ai/claude-code``), except ``--version``, ``plugin test|validate`` and ``mcp
+  list``. This one fails CLOSED: an unparseable command with a clear ``claude`` word is denied.
+
+* 🔌 an MCP tool that merges or writes to a protected branch (CMX-180) — the same hook also
+  runs on ``mcp__.*``. Matched by an explicit table of tool names (:data:`MCP_TOOLS`), the
+  repo from the call's own ``owner``/``repo``, never the cwd: ``merge_pull_request``, and
+  ``push_files`` / ``create_or_update_file`` / ``delete_file`` whose ``branch`` is protected
+  (no ``branch`` means the repo's default branch, so it is denied too). Any MCP tool not
+  in the table is allowed, and so is ``update_pull_request_branch``: it writes to the PR's
+  head, which the call does not name, so it is logged as undecided.
+
 It never denies read-only ``gh pr view/diff/checks/list``, ``gh pr create``, or a push of a
 ``cmx-*`` feature branch. ``chela merge`` itself is unaffected: its own ``gh``/``git`` calls
 run as subprocesses of chela's Python, never through a Claude ``Bash`` tool, so no hook
@@ -691,6 +705,146 @@ SHARE_REQUEST_DENY = ("🙋 chela: a sandboxed guest's access request is approve
                       "session. Ask the human to decide it.")
 
 
+# --- MCP tools (CMX-180) -----------------------------------------------------------------
+
+# Tool name (the part after the server's ``mcp__<server>__`` prefix) → what it writes.
+# ``merge``: merges a PR. ``branch``: writes commits to ``tool_input["branch"]``.
+# ``head``: writes to the PR's head branch, which the call does not name. Nothing else is
+# gated: an MCP tool missing from this table is allowed, whatever its name looks like.
+MCP_TOOLS = {
+    "merge_pull_request": "merge",
+    "push_files": "branch",
+    "create_or_update_file": "branch",
+    "delete_file": "branch",
+    "update_pull_request_branch": "head",
+}
+
+
+def mcp_tool(tool_name: str) -> str | None:
+    """``mcp__<server>__<tool>`` → ``<tool>`` (server names may hold ``_``), else None."""
+    if not tool_name.startswith("mcp__"):
+        return None
+    server, sep, tool = tool_name[len("mcp__"):].rpartition("__")
+    return tool if sep and server and tool else None
+
+
+def _decide_mcp(tool: str, tool_input: dict, registry: list[dict] | None, env) -> Decision:
+    kind = MCP_TOOLS.get(tool)
+    if kind is None:
+        return ALLOW
+    owner, repo = tool_input.get("owner"), tool_input.get("repo")
+    if not (isinstance(owner, str) and owner and isinstance(repo, str) and repo):
+        return Decision(undecided=f"MCP `{tool}` names no owner/repo")
+    if registry is None:
+        return Decision(undecided=f"no readable registry at {registry_path(env)}")
+    entry = _match_slug(registry, f"{owner}/{repo}")
+    if entry is None:
+        return ALLOW
+    if kind == "merge":
+        return _deny(f"MCP `{tool}` #{tool_input.get('pullNumber', '?')}", entry)
+    if kind == "head":
+        return Decision(undecided=f"MCP `{tool}` writes to a PR head the call does not name")
+    branch = tool_input.get("branch")
+    if not isinstance(branch, str) or not branch.strip():
+        return _deny(f"MCP `{tool}` with no branch (the repo's default branch)", entry)
+    target = _branch_of(branch.strip())
+    if target in protected(entry):
+        return _deny(f"MCP `{tool}` to protected branch {target!r}", entry)
+    return ALLOW
+
+
+# --- nested Claude sessions (CMX-190) ----------------------------------------------------
+
+# Exported by the dispatcher into every pane it spawns for a run (coding agent, rework or
+# judge) — never by a human's session or the orchestrator, which is how this rule binds
+# dispatched runs only. Read from the HOOK's env, so an `env -u` in the command cannot drop it.
+RUN_ENV = "CHELA_RUN_ID"
+RUN_ROLE_ENV = "CHELA_RUN_ROLE"
+NESTED_CLAUDE_DENY = ("🪆 chela: Launching another Claude agent from a dispatched run is not "
+                      "allowed. Don't retry it in another mode or behind a wrapper. Reproduce "
+                      "with a stub process, or hand it to the orchestrator.")
+CLAUDE_PKG = "@anthropic-ai/claude-code"
+# A `claude` word in a command too malformed to parse: the gate fails CLOSED on it.
+# `CLAUDE.md`, `.claude/` and `claude-code` are not matches.
+_CLAUDE_WORD_RE = re.compile(r"(?:^|[\s;&|(`'\"/])claude(?=$|[\s;&|)`'\"])|@anthropic-ai/claude-code")
+_LAUNCHERS = _WRAPPERS | {"setsid", "xargs", "watch", "flock", "ionice", "chrt", "taskset",
+                          "unbuffer", "strace"}
+_DURATION_RE = re.compile(r"^[0-9.]+[smhd]?$")
+_PKG_RUNNERS = frozenset({"npx", "bunx", "pnpx", "node"})
+_PKG_MANAGERS = frozenset({"npm", "pnpm", "yarn", "bun"})
+_TMUX_SPAWNS = ("new-session", "new-window", "split-window", "respawn-pane", "respawn-window",
+                "send-keys")
+_TMUX_SPAWN_ALIASES = frozenset({"new", "neww", "splitw", "respawnp", "respawnw", "send"})
+_TMUX_SPAWN_VALUES = frozenset({"-c", "-e", "-F", "-n", "-s", "-t", "-x", "-y", "-f", "-l",
+                                "-p", "-N"})
+
+
+def _allowed_claude(args: list[str]) -> bool:
+    """The explicit allowlist: subcommands that never start a session."""
+    return args == ["--version"] or args[:2] in (["plugin", "test"], ["plugin", "validate"],
+                                                 ["mcp", "list"])
+
+
+def claude_launch(command: str, depth: int = 0) -> bool:
+    """True when ``command`` starts a Claude Code session or agent, however it is wrapped."""
+    if depth > 4:
+        return bool(_CLAUDE_WORD_RE.search(command))
+    try:
+        segs = segments(command)
+    except ValueError:
+        return bool(_CLAUDE_WORD_RE.search(command))
+    return any(_launches(raw, depth) for raw in segs)
+
+
+def _launches(argv: list[str], depth: int) -> bool:
+    while argv and (_ASSIGN_RE.match(argv[0]) or argv[0] in ("{", "}", "!")):
+        argv = argv[1:]
+    if not argv:
+        return False
+    name = os.path.basename(argv[0])
+    if name == "claude":
+        return not _allowed_claude(argv[1:])
+    if name in _LAUNCHERS:
+        # A wrapper's own flags are not parsed: skip flags, their values and durations up
+        # to the first command word, which is what the wrapper runs.
+        after_flag = False
+        for k in range(1, len(argv)):
+            tok = argv[k]
+            if os.path.basename(tok) == "claude":
+                return _launches(argv[k:], depth)
+            if tok.startswith("-"):
+                after_flag = "=" not in tok
+            elif after_flag or _DURATION_RE.match(tok):
+                after_flag = False
+            else:
+                return _launches(argv[k:], depth)
+        return False
+    if name in _SHELLS or name in ("script", "su"):
+        for j, a in enumerate(argv[1:], start=1):
+            if a.startswith("-") and not a.startswith("--") and "c" in a:
+                return j + 1 < len(argv) and claude_launch(argv[j + 1], depth + 1)
+        return False
+    if name == "eval":
+        return claude_launch(" ".join(argv[1:]), depth + 1)
+    if name == "tmux":
+        i = _tmux_globals(argv[1:])[2]
+        for cmd in _tmux_commands(argv[1 + i:]):
+            word = cmd[0]
+            if word in _TMUX_SPAWN_ALIASES or any(
+                    len(word) >= 5 and full.startswith(word) for full in _TMUX_SPAWNS):
+                pos = [p for p in _positionals(cmd[1:], _TMUX_SPAWN_VALUES)
+                       if p not in ("Enter", "C-m")]
+                if pos and claude_launch(" ".join(pos), depth + 1):
+                    return True
+        return False
+    pkg = next((j for j, a in enumerate(argv[1:], start=1)
+                if a == CLAUDE_PKG or a.startswith((CLAUDE_PKG + "@", CLAUDE_PKG + "/"))), None)
+    if pkg is not None and (name in _PKG_RUNNERS or (
+            name in _PKG_MANAGERS and {"dlx", "exec", "x"} & set(argv[1:pkg]))):
+        return not _allowed_claude(argv[pkg + 1:])
+    return False
+
+
 def _decide_segments(command: str, ctx: _Ctx, depth: int = 0) -> Decision:
     if depth > 4:
         return Decision(undecided="nested shell commands too deep to follow")
@@ -748,12 +902,18 @@ def decide(payload: dict, env=None, registry: list[dict] | None | bool = False) 
     """The verdict for one ``PreToolUse`` payload. Pure apart from reading the registry and
     the repo's ``.git`` files. ``registry=False`` means "load it from ``$CHELA_DIR``"."""
     env = dict(os.environ if env is None else env)
+    tool_input = payload.get("tool_input")
+    tool = mcp_tool(str(payload.get("tool_name") or ""))
+    if tool is not None and isinstance(tool_input, dict):
+        reg = load_registry(env) if registry is False else registry
+        return _decide_mcp(tool, tool_input, reg, env)
     if payload.get("tool_name") != "Bash":
         return ALLOW
-    tool_input = payload.get("tool_input")
     command = tool_input.get("command") if isinstance(tool_input, dict) else None
     if not isinstance(command, str) or not command.strip():
         return ALLOW
+    if env.get(RUN_ENV) and claude_launch(command):
+        return Decision(True, NESTED_CLAUDE_DENY)
     reg = load_registry(env) if registry is False else registry
     cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else ""
     return _decide_segments(command, _Ctx(cwd, env, reg))
@@ -792,7 +952,8 @@ def main(stdin=None, stdout=None, env=None) -> int:
     except Exception as exc:                     # noqa: BLE001 — never wedge a session
         _log(env, {"ts": time.time(), "decision": "allow", "undecided": f"error: {exc!r}"})
         return 0
-    command = str((payload.get("tool_input") or {}).get("command") or "")[:500]
+    command = str((payload.get("tool_input") or {}).get("command")
+                  or payload.get("tool_name") or "")[:500]
     if decision.deny:
         stdout.write(json.dumps(response(decision)) + "\n")
         _log(env, {"ts": time.time(), "decision": "deny", "reason": decision.reason,

@@ -10,7 +10,7 @@
 //
 //   1. 🔴 PHONE: every input/textarea/select in the REAL dashboard — the whole
 //      index.html shell, plus the Settings drawer as nav.js actually renders it,
-//      plus the JS-built controls (pane rename, share dialog, decisions chip) —
+//      plus the JS-built controls (pane rename, share dialog) —
 //      computes to >= 16px. A control with no font-size at all FAILS (the UA
 //      default is ~13.3px, which zooms).
 //   2. 🔴 PHONE: the xterm helper textarea computes >= 16px in every page that
@@ -23,9 +23,9 @@
 //      stops the focus zoom, but kills pinch-zoom (Android too) — an
 //      accessibility regression. Both viewport metas must leave zoom enabled.
 //
-// Run: node --test tests/ios_focus_zoom.test.mjs (pytest runs it via
+// Run: pnpm exec vitest run tests/ios_focus_zoom.test.mjs (pytest runs it via
 // tests/test_js_suites.py; needs `pnpm install` for jsdom).
-import { test, before } from 'node:test';
+import { test, beforeAll } from 'vitest';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -47,17 +47,16 @@ const MIN_PX = 16;
 const CONTROLS = 'input, textarea, select';
 
 // Controls built by JS outside the Settings drawer, in the markup shape the
-// modules emit (terminals.js renamePane / share dialog, decisions.js chip).
+// modules emit (the pane header's rename field, features/panehead). The share dialog, its copy rows and the Active
+// shares sheet are React since CMX-239/240, the Decisions inbox since CMX-228: their inputs
+// are the kit's .s-input, which the drawer's rows already cover. Also the UI kit's dialog
+// fields as the Work view's islands draw them (Init a repo, New task, Add schedule, CMX-231).
 const JS_BUILT = `
 <div class="term-stage"><div class="term-pane"><div class="pane-head">
   <input class="pane-title-edit" value="agent-1"></div></div></div>
-<div class="share-dialog">
-  <label class="sd-opt"><input type="radio" name="sd-mode" value="view" checked></label>
-  <input id="sd-confirm-in" class="tsp-in">
-  <div class="tsp-row"><input class="tsp-in" readonly value="code"></div>
-</div>
-<div class="decisions-chip"><select class="decisions-chip-rereg-select" id="decisions-reregister-wid">
-  <option>@1</option></select></div>`;
+<div class="modal"><div class="field-control"><input class="s-input" type="text" list="init-suggestions"></div>
+  <div class="field-control"><textarea class="s-input s-textarea"></textarea></div>
+  <div class="field-control"><select class="s-select s-multi" multiple><option>CMX-1</option></select></div></div>`;
 
 // Enough of each settings endpoint for renderSettings() to build its rows.
 const TIMING = { knobs: [{ key: 'poll_s', env: 'CHELA_POLL', label: 'Poll', unit: 's',
@@ -86,12 +85,14 @@ function templateBody() {
 }
 
 let win, doc, sheet;
-before(async () => {
+beforeAll(async () => {
     const { dom } = await bootDashboardDom({ body: templateBody() + JS_BUILT, fetchImpl, canvasStub: true });
     win = dom.window;
     doc = win.document;
     win.chela.toggleSettings();
-    for (let i = 0; i < 4; i++) await flush();   // _loadTimingSettings/_loadDispatchSettings are async
+    win.chela.openPalette();   // CMX-221: both React dialogs, open over each other
+    // the Timing and Dispatch knobs load async
+    for (let i = 0; i < 200 && !(doc.querySelector('#timing-rows .s-input') && doc.querySelector('#dispatch-rows .s-input')); i++) await flush();
     sheet = doc.createElement('style');
     doc.head.appendChild(sheet);
 });
@@ -112,13 +113,15 @@ function describe(el) {
 function controls() {
     const all = [...doc.querySelectorAll(CONTROLS)];
     // Vacuity guard: the shell + drawer + JS-built set must actually be here.
-    for (const sel of ['#settings-search', '#palette-input', '#sidebar-jump-input', '#init-path',
-        '#sched-prompt', '#modal-msg-text', '#sched-type', '.s-input', '.s-select',
-        '.s-timing-input', '.s-dispatch-input', '.pane-title-edit', '#sd-confirm-in',
-        '.decisions-chip-rereg-select']) {
+    for (const sel of ['#settings-search', '#palette-input', '#sidebar-jump-input', '[list="init-suggestions"]',
+        '.s-textarea', '.s-multi', '.s-input', '.s-select',
+        '#timing-rows .s-input', '#dispatch-rows .s-input', '.pane-title-edit']) {
         assert.ok(doc.querySelector(sel), `fixture lost ${sel} — the guard would pass vacuously`);
     }
-    assert.ok(all.length >= 25, `only ${all.length} controls mounted — the settings drawer did not render`);
+    // CMX-221: the kit draws Settings' selects and switches as Radix buttons (no <select> or
+    // checkbox, so nothing iOS zooms on). CMX-247 dropped the Wall's hidden #term-agent <select>:
+    // 13 real fields remain with Settings and the palette open.
+    assert.ok(all.length >= 13, `only ${all.length} controls mounted — the settings drawer did not render`);
     return all;
 }
 
@@ -130,7 +133,7 @@ test('phone (coarse pointer): every dashboard input/textarea/select computes >= 
 
 test('desktop (fine pointer): the controls keep their smaller sizes', () => {
     sheet.textContent = cssForViewport(DASH_CSS, DESKTOP);
-    for (const sel of ['#settings-search', '#palette-input', '#sidebar-jump-input', '.s-select', '#sched-prompt']) {
+    for (const sel of ['#settings-search', '#palette-input', '#sidebar-jump-input', '.s-select', '.s-textarea']) {
         const px = fontPx(win, doc.querySelector(sel));
         assert.ok(px < MIN_PX, `${sel} is ${px}px on desktop — the 16px fix leaked out of @media (pointer: coarse)`);
     }

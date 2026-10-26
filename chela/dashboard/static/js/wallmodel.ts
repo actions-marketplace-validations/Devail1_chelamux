@@ -1,0 +1,319 @@
+// ---------------------------------------------------------------------------
+// WALL TILE MODEL — pure status-card math for the Wall redesign's slice 1 (the
+// status-dense tile, docs/wall-redesign.md). No DOM, no fetch, no localStorage:
+// every export here answers "given this /api/agents record (+ /api/agents/
+// context's `cost_usd`), what does the tile say" as a straight function of its
+// input, so it is directly unit-testable (tests/wall_tile.test.mjs) without a
+// DOM fixture — same split decisionsmodel.js draws for the decisions badge.
+// terminals.js (paneHead / _wallTileHTML / _ctxBarHTML / the action-bar
+// renderer) is the only caller: it owns the DOM + the 4s poll, this file only
+// ever answers the presentational question.
+//
+// wantsHuman(a) (util.js) is THE canonical "needs a human" predicate and is
+// reused here rather than reinvented — but not via `import`: util.js reads
+// `window` at module scope (e.g. `TERMINALS_ENABLED`), so it cannot load
+// under a plain Node `--test` run (no DOM), which is exactly what keeps this
+// model file unit-testable without a jsdom fixture. Every function below that
+// needs it takes the caller's already-computed `wants = wantsHuman(agent)` as
+// a parameter instead — terminals.js (the only caller) computes it once from
+// the one real implementation and threads it through, so the predicate itself
+// is never duplicated.
+//
+// CMX-236 (CMX-212 P22): TypeScript, converted in place. The types below describe only
+// the /api/agents fields this file reads.
+// ---------------------------------------------------------------------------
+
+import { batteryState } from '../../frontend/src/features/sidebar/model';
+
+export interface PrLink {
+    url?: string;
+    number?: number | null;
+    repository?: string | null;
+    state?: string;
+    draft?: boolean;
+}
+
+export interface JudgeBattery {
+    state?: string;
+    label?: string;
+}
+
+export interface WallAgent {
+    window_id?: string;
+    session_status?: string;
+    claude_running?: boolean;
+    status_source?: string | null;
+    recap?: string | null;
+    recap_ts?: string | null;
+    pr?: PrLink | null;
+    judge_battery?: JudgeBattery | null;
+}
+
+type MaybeAgent = WallAgent | null | undefined;
+
+// A tile's state: the word and the class carry it (CMX-393 moved the shape to `.gs-dot`, so
+// the old per-state glyph was never drawn; CMX-236 dropped it with its emoji).
+export interface TileState { word: string; cls: string }
+export interface ActionBar { kind: 'answer' | 'approve' | 'review'; label: string }
+export interface PrChip {
+    label: string; url: string; repository: string; state: string; flag: boolean; dim: boolean;
+}
+export interface Cell { x: number; y: number; w: number; h: number }
+
+// ---- state pill -------------------------------------------------------
+//
+// A genuine per-agent progress/phase signal does not exist (docs/wall-
+// redesign.md: "v1 uses used_pct+session_status+recap proxies... deferred").
+// The tile spec's "finished/done signal" is one of those proxies: a window
+// that is not busy, not blocked on a human, and carries an open PR reads as
+// "finished — PR up, awaiting review" (the same PR the meta row's chip shows,
+// see prChip below).
+//
+// CMX-41: "open" must be CONFIRMED. Claude Code keeps re-writing a session's
+// pr-link record long after that PR merged, so the record's presence alone
+// advertised dead PRs as reviewable. /api/agents now resolves `pr.state`
+// (open/merged/closed/unknown, chela/pr_status.py); only a confirmed open,
+// non-draft PR counts. A missing or "unknown" state is NOT open — fail closed.
+export function prReviewable(pr: PrLink | null | undefined): boolean {
+    return !!(pr && pr.url && pr.state === 'open' && !pr.draft);
+}
+
+export function isFinished(agent: MaybeAgent, wants: boolean): boolean {
+    if (!agent) return false;
+    if (wants) return false;
+    if (agent.session_status === 'busy') return false;
+    return prReviewable(agent.pr);
+}
+
+// The word ALWAYS carries the state — colour is decoration on top (Liav is
+// red-weak). `cls` maps to the Okabe-Ito tokens in style.css (.gs-state-*).
+//
+// Precedence is load-bearing, in this exact order:
+//   1. wants (wantsHuman)  — OUTRANKS session_status. A dispatched worker
+//      sitting at a Bash/Edit permission gate still reports session_status
+//      "busy" to `claude agents --json` (app.py::_needs_human's docstring) —
+//      checking busy first would misread a gated pane as "working".
+//   2. session_status === 'busy' → working.
+//   3. isFinished → PR open. (CMX-53: the wall's word was "done", which collided with
+//      the sidebar's done/finished — a session with an answered turn — though the two
+//      mean different things. On the wall it means exactly "a reviewable PR is up".)
+//   4. claude_running but session_status could not be resolved → unknown
+//      (docs/AGENT_IDENTITY.md slice 1: a pane chela cannot read a status for
+//      is NOT the same fact as one it confirmed is idle — collapsing the two
+//      is exactly the "confidently wrong answer" the doc calls out. `idle` is
+//      a real value `claude agents --json` reports; `session_status` being
+//      absent/null is chela failing to resolve it, not claude reporting calm).
+//   5. else → idle (never ran claude in this pane, or genuinely idle).
+export function tileState(agent: MaybeAgent, wants: boolean): TileState {
+    if (wants) return { word: 'needs you', cls: 'needs-you' };
+    if (agent && agent.session_status === 'busy') return { word: 'working', cls: 'working' };
+    const battery = batteryState(agent);
+    if (battery) return battery;
+    if (isFinished(agent, wants)) return { word: 'PR open', cls: 'pr-open' };
+    if (agent && agent.claude_running && !agent.session_status) {
+        return { word: 'unknown', cls: 'unknown' };
+    }
+    return { word: 'idle', cls: 'idle' };
+}
+
+// ⚖️ CMX-40: a judge window's DETACHED mutation battery (app.py `judge_battery`,
+// read from the run's own status json — judge.battery_for_window). The judge
+// agent goes idle by design once it launches the run, and Claude Code does not
+// list a run it did not start, so without this the pane read "idle" for the
+// whole battery. It sits under wants/busy (the agent's own state is more
+// specific when it has one) and OVER PR open/unknown/idle. A run whose pid died
+// before a verdict reads "died", never idle or done. Null when there is none.
+// CMX-236: one implementation, shared with the sidebar row (CMX-35), which owns it.
+export { batteryState };
+
+// The state's tooltip. A sandboxed session's working/idle is derived from its
+// credential proxy's traffic (app.py `status_source: "sandbox-proxy"`, CMX-436),
+// not Claude's own report — say so, so a reader knows what the pill rests on.
+export function stateTitle(agent: MaybeAgent, s: TileState): string {
+    const word = s.word.charAt(0).toUpperCase() + s.word.slice(1);
+    return agent && agent.status_source === 'sandbox-proxy' ? word + ' (from the sandbox proxy)' : word;
+}
+
+// ---- action-bar verb ----------------------------------------------------
+//
+// Which verb a wantsHuman pane's action bar shows, with NO new backend field:
+// app.py::_needs_human ORs two sources — `session_status === "waiting"`
+// (Claude's own view: it is waiting on a reply, i.e. a QUESTION) or, for a
+// dispatched window only, a tmux-pane permission-gate probe (Claude's own
+// view stays "busy" for that case — the gate lives only as pixels, per the
+// same docstring). So the two fields the client already has tell us which
+// case fired: `waiting` → Answer a question; `needs_human` true while NOT
+// `waiting` → Approve the pane-probed permission gate.
+export function actionVerb(agent: WallAgent, wants: boolean): 'Answer' | 'Approve' | null {
+    if (!wants) return null;
+    return agent.session_status === 'waiting' ? 'Answer' : 'Approve';
+}
+
+// The action-bar's full shape: { kind, label } for a wantsHuman or finished
+// pane, or null when the pane needs no action bar at all.
+export function actionBarKind(agent: WallAgent, wants: boolean): ActionBar | null {
+    const verb = actionVerb(agent, wants);
+    if (verb) return { kind: verb === 'Answer' ? 'answer' : 'approve', label: verb };
+    if (isFinished(agent, wants)) return { kind: 'review', label: 'Review' };
+    return null;
+}
+
+// ---- context bar level -----------------------------------------------------
+//
+// Matches the design doc's thresholds EXACTLY (docs/wall-redesign.md: "warn >
+// 60 -> --ok-orange, danger > 80 -> --ok-vermillion") and the pre-existing
+// _applyTermContext sev computation this replaces — `>`, not `>=`: the
+// boundary values themselves (60, 80) read as 'ok'/'warn', not the next tier.
+export function ctxLevel(usedPct: number | null | undefined): 'ok' | 'warn' | 'bad' {
+    if (usedPct == null) return 'ok';
+    if (usedPct > 80) return 'bad';
+    if (usedPct > 60) return 'warn';
+    return 'ok';
+}
+
+// ---- null-field -> hidden-sentinel helpers ---------------------------------
+//
+// "Degrade quietly: a missing field (recap, pr, cost_usd null) hides that
+// element, never blanks the tile" (docs/wall-redesign.md). Each helper
+// returns exactly `null` (never "null"/"undefined" text, never a
+// falsy-but-rendered value) when the field is absent, so the caller's
+// `if (x) ...` hides the element cleanly.
+
+// recap_ts rides along verbatim (an ISO string or null) — formatting/age math
+// is the caller's job (ageStr/shortTime already live in util.js); this only
+// decides presence.
+export function recapView(agent: MaybeAgent): { text: string; tsTitle: string } | null {
+    if (!agent || !agent.recap) return null;
+    return { text: agent.recap, tsTitle: agent.recap_ts || '' };
+}
+
+// The PR payload /api/agents emits is `{url, number, repository, ts, state,
+// draft}` (chela/transcripts.py PRLink.to_dict + chela/pr_status.py). The chip
+// is `#<number>` (or bare "PR" if number is absent); `flag` (the ⚑) is earned
+// only by a confirmed open, non-draft PR (CMX-41). A merged/closed/draft PR
+// says so in the label and reads dim; an unknown state is a neutral `#N` link
+// — no flag, no state word it cannot back up. `repository` rides along for
+// the caller's tooltip.
+export function prChip(pr: PrLink | null | undefined): PrChip | null {
+    if (!pr || !pr.url) return null;
+    const num = pr.number != null ? ('#' + pr.number) : 'PR';
+    const state = ['open', 'merged', 'closed'].includes(pr.state as string) ? pr.state as string : 'unknown';
+    const flag = prReviewable(pr);
+    let label = num;
+    if (state === 'merged' || state === 'closed') label = num + ' ' + state;
+    else if (state === 'open' && pr.draft) label = num + ' draft';
+    return { label, url: pr.url, repository: pr.repository || '', state, flag,
+             dim: state === 'merged' || state === 'closed' || (state === 'open' && !!pr.draft) };
+}
+
+// cost_usd of exactly 0 is a REAL value, not "missing" — only `== null` hides
+// it. A naive `if (!costUsd)` would wrongly hide a genuine $0.00, and this is
+// the guard that catches that mistake.
+export function costView(costUsd: number | string | null | undefined): string | null {
+    if (costUsd == null) return null;
+    return '$' + Number(costUsd).toFixed(2);
+}
+
+// ---- attention rank (slice 2: auto-arrange) --------------------------------
+//
+// Which numeric TIER a pane belongs to for auto-arrange ordering — needs-you
+// (0) -> busy/working (1) -> idle (2) -> done (3). Deliberately mirrors
+// tileState's precedence exactly (same header comment applies: wants
+// OUTRANKS session_status, so a dispatched pane sitting at a permission gate
+// while claude still reports "busy" ranks with needs-you, not working;
+// isFinished only applies once busy/blocked are both ruled out) rather than
+// inventing a second ordering — the tile's pill and the wall's sort must
+// always agree on what a pane "is".
+function _rankTier(agent: MaybeAgent, wants: boolean): number {
+    if (wants) return 0;
+    if (agent && agent.session_status === 'busy') return 1;
+    if (isFinished(agent, wants)) return 3;
+    return 2;
+}
+
+// Order a fleet's window_ids by attention: needs-you first, then working,
+// then idle, then done — STABLE within a rank (two same-tier panes keep
+// their relative order from `agents`, they are never re-sorted by wid or any
+// other secondary key). This is the auto-arrange toggle's entire ordering
+// contract (docs/wall-redesign.md slice 2): manual layout is sacred, so the
+// caller (terminals.js) only ever READS this order to compute a GridStack
+// fill — it must never feed back into `pc_wall_layout`.
+//
+// `wantsByWid` is the caller's precomputed {wid: boolean} map (wantsHuman(a)
+// per agent) for the same DOM-free reason as every other function here (see
+// the file header) — this function never calls wantsHuman itself.
+export function rankOrder(
+    agents: MaybeAgent[] | null | undefined, wantsByWid: Record<string, boolean> | null | undefined,
+): string[] {
+    const list = agents || [];
+    return list
+        .map((a, i) => ({
+            wid: a && a.window_id,
+            rank: _rankTier(a, !!(wantsByWid && a && wantsByWid[String(a.window_id)])),
+            i,
+        }))
+        .filter((x): x is { wid: string; rank: number; i: number } => x.wid != null)
+        // Primary key is the rank tier; the `i` tiebreak is what makes ties
+        // STABLE explicitly (rather than relying on the host engine's sort
+        // stability) — this is the exact line a "swap tiers" or
+        // "non-stable sort" corruption would break.
+        .sort((a, b) => (a.rank - b.rank) || (a.i - b.i))
+        .map(x => x.wid);
+}
+
+// ---- Focus layout (Wall redesign — Focus layout toggle) --------------------
+//
+// One pane large (the "focus" pane), the rest a compact right-side vertical
+// strip — a 12-column grid, PURE function of its inputs (no DOM/GridStack):
+// given `orderedWids` (who's on the wall, in the order the strip should stack
+// — the caller reuses rankOrder() for this, needs-you first, same ordering
+// contract auto-arrange already established) and `focusWid` (who's large),
+// return `{wid: {x,y,w,h}}` in integer grid cells. `totalRows` is the caller's
+// already-computed viewport row count (same total _wallFill()/_fillNodesByOrder
+// thinks in) — this function never measures anything itself.
+//
+// Geometry (fixed, not preset-driven — Focus is its own layout, not a column
+// count):
+//   - The focus pane: x:0, y:0, w:8, h:totalRows (full height).
+//   - Every OTHER wid (in the given order): a right-side strip, x:8, w:4,
+//     stacked top-to-bottom — y increases by each pane's share of the height,
+//     which splits evenly with the LAST strip pane eating the rounding
+//     remainder (mirrors _fillNodesByOrder's column-fill math exactly, so the
+//     strip always reaches the bottom with no gap).
+//   - No strip at all (the focus pane is the only wid) → it fills all 12
+//     columns, not just 8 — there's nothing to reserve the right rail for.
+//   - `focusWid` absent from `orderedWids` → the first wid becomes focus
+//     (never throws, never returns an empty layout for a non-empty wall).
+export function focusLayout(
+    orderedWids: (string | null | undefined)[] | null | undefined, focusWid: string | null | undefined,
+    totalRows: number,
+): Record<string, Cell> {
+    const wids = (orderedWids || []).filter((w): w is string => w != null);
+    const layout: Record<string, Cell> = {};
+    if (!wids.length) return layout;
+    const rows = Math.max(1, Math.floor(totalRows) || 1);
+    const focus = wids.includes(focusWid as string) ? focusWid as string : wids[0] as string;
+    const strip = wids.filter(w => w !== focus);
+    layout[focus] = { x: 0, y: 0, w: strip.length ? 8 : 12, h: rows };
+    if (!strip.length) return layout;
+    const n = strip.length;
+    const hEach = Math.max(1, Math.floor(rows / n));
+    let y = 0;
+    strip.forEach((wid, i) => {
+        const h = (i === n - 1) ? Math.max(1, rows - y) : hEach;   // last eats the remainder
+        layout[wid] = { x: 8, y, w: 4, h };
+        y += h;
+    });
+    return layout;
+}
+
+// CMX-397: does the Wall's layout toolbar REST collapsed (one glyph + chevron)?
+// `stored` is the raw pc_wall_grid_collapsed value — the user's explicit
+// expand/collapse choice, '1' or '0' — and wins whenever it is set. With no
+// choice on record the row follows the view: collapsed while Focus is on (the
+// presets are noise there), expanded otherwise.
+export function gridRowCollapsed(stored: string | null | undefined, focusOn: unknown): boolean {
+    if (stored === '1') return true;
+    if (stored === '0') return false;
+    return !!focusOn;
+}

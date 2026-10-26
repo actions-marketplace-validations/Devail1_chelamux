@@ -9,9 +9,9 @@
 // off <body> for the theme under test. `:hover` can't be triggered in jsdom, so the hover pair
 // is read straight off the parsed CSSOM rule and resolved the same way.
 //
-// Run: node --test tests/btn_danger_css.test.mjs (tests/test_js_suites.py runs every
+// Run: pnpm exec vitest run tests/btn_danger_css.test.mjs (tests/test_js_suites.py runs every
 // .test.mjs inside pytest; needs `pnpm install` for jsdom).
-import { test } from 'node:test';
+import { test } from 'vitest';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -21,10 +21,10 @@ import { JSDOM } from 'jsdom';   // needs `pnpm install` — tests/test_js_suite
 const here = path.dirname(fileURLToPath(import.meta.url));
 const staticDir = path.join(here, '..', 'chela', 'dashboard', 'static');
 const styleCss = fs.readFileSync(path.join(staticDir, 'style.css'), 'utf8');
-const navJs = fs.readFileSync(path.join(staticDir, 'js', 'nav.js'), 'utf8');
+const settingsModel = fs.readFileSync(path.join(staticDir, '..', 'frontend', 'src', 'features', 'settings', 'model.ts'), 'utf8');
 
 // The Settings picker's theme list — the same source tests/test_on_accent_contrast.py reads.
-const THEMES = [...navJs.match(/const THEME_LABELS = \{([\s\S]*?)\};/)[1].matchAll(/(\w+):\s*'/g)]
+const THEMES = [...settingsModel.match(/const THEME_LABELS(?::[^=]*)? = \{([\s\S]*?)\};/)[1].matchAll(/(\w+):\s*'/g)]
     .map(m => m[1]);
 
 const AA = 4.5;

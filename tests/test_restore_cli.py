@@ -25,6 +25,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import sqlite3
 import sys
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -2075,3 +2076,74 @@ def test_every_mutating_tmux_subcommand_is_pinned_in_the_membership_set(subcmd):
     from conftest import _tmux_violation
 
     assert _tmux_violation(["tmux", subcmd, "-t", "@1"], None) is not None
+
+
+# CMX-156: `chela restore` never prints a relaunch line for a session whose run the
+# dispatcher will relaunch itself; a closed run's session keeps its line.
+@pytest.mark.parametrize("status,shown", [
+    ("failed", "not offered: the dispatcher will relaunch run CMX-137 itself"),
+    ("closed", f"cd {CWD_FIVE} && CHELA_WID=@N claude --resume {SID_DEAD}"),
+])
+def test_chela_restore_does_not_offer_a_session_the_dispatcher_will_relaunch(
+        live_stores, capsys, status, shown):
+    from chela import dispatcher
+    live_stores.setattr(dispatcher, "list_runs", lambda *a, **k: [{
+        "task_id": "CMX-137", "status": status, "attempt": 0, "worktree_path": CWD_FIVE}])
+    with pytest.raises(SystemExit):
+        _drive(["restore"])
+    assert _line_with(capsys.readouterr().out, "[session-ids] @5  MANUAL", shown)
+
+
+def test_chela_restore_offers_nothing_when_the_runs_table_is_unreadable(live_stores, capsys):
+    from chela import dispatcher
+
+    def boom(*a, **k):
+        raise sqlite3.OperationalError("database is locked")
+    live_stores.setattr(dispatcher, "list_runs", boom)
+    with pytest.raises(SystemExit):
+        _drive(["restore"])
+    assert _line_with(capsys.readouterr().out, "[session-ids] @5  MANUAL",
+                      "not offered: the dispatcher's runs table is unreadable")
+
+
+# --- CMX-275: a session the user closed before the crash is named, never resumed --------
+
+SID_CLOSED = "e4c15b05-1111-2222-3333-444444444444"
+
+
+def _close_in_roster(chela_dir, sid, wid, name):
+    roster_file = chela_dir / "roster.json"
+    data = json.loads(roster_file.read_text())
+    data["epochs"][OLD]["closed"] = {sid: {"wid": wid, "name": name, "cwd": "/home/liav/site",
+                                           "closed_at": 1000.0}}
+    data["epochs"][OLD]["last_seen"] = 2000.0       # the server outlived the close
+    roster_file.write_text(json.dumps(data))
+
+
+def test_chela_restore_names_a_session_skipped_because_the_user_closed_it(
+        live_stores, tmp_path, capsys, monkeypatch):
+    import time
+    monkeypatch.setattr(restore_mod.time, "localtime", time.gmtime)
+    _close_in_roster(tmp_path / "chela", SID_CLOSED, "@32", "site")
+
+    with pytest.raises(SystemExit):
+        _drive(["restore"])
+
+    out = capsys.readouterr().out
+    assert "1 session(s) skipped because the user closed them before the crash" in out
+    assert _line_with(out, SID_CLOSED) == (
+        f"  site  {SID_CLOSED}  closed by the user at 1970-01-01 00:16 (was @32)")
+
+
+def test_chela_restore_resume_never_relaunches_a_closed_session(
+        resume_enabled, tmp_path, capsys):
+    """The roster join still offers SID_DEAD (@5) a relaunch command; the closed record wins."""
+    spawned, _ = resume_enabled
+    _close_in_roster(tmp_path / "chela", SID_DEAD, "@5", "agent-5")
+
+    with pytest.raises(SystemExit):
+        _drive(["restore", "--resume"])
+
+    assert not any(SID_DEAD in (cmd or "") for _cwd, cmd in spawned)
+    line = _line_with(capsys.readouterr().out, "[session-ids]", "@5", "MANUAL")
+    assert "not offered: closed by the user at " in line and "=> skipped" in line

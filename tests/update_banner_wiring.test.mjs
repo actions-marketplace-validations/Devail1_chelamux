@@ -3,10 +3,11 @@
 // banner logic; this proves the real page runs it — drop the checkForUpdate() call from
 // refresh() and the banner never appears here. Harness copied from decisions_seed.test.mjs.
 //
-// Run: node --test tests/update_banner_wiring.test.mjs (tests/test_js_suites.py runs it).
-import { before, test } from 'node:test';
+// Run: pnpm exec vitest run tests/update_banner_wiring.test.mjs (tests/test_js_suites.py runs it).
+import { beforeAll, test } from 'vitest';
 import assert from 'node:assert/strict';
 import { JSDOM } from 'jsdom';   // needs `pnpm install` — tests/test_js_suites.py enforces it
+import { bootBlock, exposeDomConstructors, mountIslands } from './js_helpers/dashboard_dom.mjs';
 
 const PAGE_VERSION = 'aaaaaaaaaaaa';     // what index.html was rendered with
 const SERVER_VERSION = 'bbbbbbbbbbbb';   // what the restarted dashboard now reports
@@ -18,7 +19,6 @@ const PANEL = `
   <select id="term-agent"></select>
   <span id="term-wall-grid"><span id="term-grid-presets"></span><button id="term-lock-btn"></button></span>
   <button id="term-new-shell"></button>
-  <div id="term-switcher"></div>
   <div id="term-stage"></div>
   <div id="term-min-dock"></div>
   <div id="term-bar" class="kb-collapsed"><button class="kb-toggle" id="kb-toggle"></button><div class="kb-body" id="kb-body"></div></div>
@@ -27,7 +27,8 @@ const PANEL = `
 <section class="side-section" id="side-decisions">
   <div id="decisions-chip"></div>
   <div class="decisions-list" id="decisions-list"></div>
-</section>`;
+</section>
+<div id="overlays-island"></div>`;
 
 const AGENTS = [
     { name: 'shell', window_id: '@1', online: true },
@@ -71,11 +72,9 @@ class FakeEventSource {
     close() {}
 }
 
-before(async () => {
-    const dom = new JSDOM(`<!doctype html><html><body>${PANEL}</body></html>`,
+beforeAll(async () => {
+    const dom = new JSDOM(`<!doctype html><html><body>${bootBlock({ assetVersion: PAGE_VERSION })}${PANEL}</body></html>`,
         { url: 'http://localhost:5005/', pretendToBeVisual: true });
-    dom.window.TERMINALS_ENABLED = true;
-    dom.window.CHELA_ASSET_VERSION = PAGE_VERSION;
     for (const k of ['window', 'document', 'localStorage', 'navigator', 'HTMLElement',
         'Element', 'Node', 'Event', 'MouseEvent', 'KeyboardEvent', 'CustomEvent',
         'getComputedStyle', 'requestAnimationFrame', 'cancelAnimationFrame']) {
@@ -95,7 +94,10 @@ before(async () => {
     globalThis.window.chela = globalThis.window.chela || {};
     globalThis.setInterval = () => 0;
 
-    await import('../chela/dashboard/static/js/main.js');
+    // CMX-219: the banner is the update island's (features/update), mounted as the page does
+    exposeDomConstructors(dom.window);
+    await mountIslands(dom.window);
+    (await import('../chela/dashboard/frontend/src/boot.ts')).start();
     // refresh() awaits a chain of polls before the version check; let them all settle.
     for (let i = 0; i < 20 && !document.getElementById('update-banner'); i++) {
         await new Promise(resolve => setTimeout(resolve, 5));

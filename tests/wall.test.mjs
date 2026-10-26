@@ -26,10 +26,10 @@
 //      the class leaks, and every terminal on the wall stops taking clicks, with no
 //      self-heal (`buildWall` only runs when the fleet changes).
 //
-// Run: node --test tests/wall.test.mjs  (pytest runs it via tests/test_js_suites.py;
+// Run: pnpm exec vitest run tests/wall.test.mjs  (pytest runs it via tests/test_js_suites.py;
 // it needs `pnpm install` for jsdom — CI does that, and CHELA_REQUIRE_JS_TESTS makes a
 // missing jsdom a FAILURE, never a silent pass.)
-import { before, beforeEach, test } from 'node:test';
+import { beforeAll, beforeEach, test } from 'vitest';
 import assert from 'node:assert/strict';
 import { JSDOM } from 'jsdom';   // needs `pnpm install` — tests/test_js_suites.py enforces it
 
@@ -41,7 +41,6 @@ const PANEL = `
   <select id="term-agent"></select>
   <span id="term-wall-grid"><span id="term-grid-presets"></span><button id="term-lock-btn"></button></span>
   <button id="term-new-shell"></button>
-  <div id="term-switcher"></div>
   <div id="term-stage"></div>
   <div id="term-min-dock"></div>
   <div id="term-bar" class="kb-collapsed"><button class="kb-toggle" id="kb-toggle"></button><div class="kb-body" id="kb-body"></div></div>
@@ -84,14 +83,13 @@ function fakeGridStack() {
     return { init: () => grid };
 }
 
-let terminals, util, wire;
+let terminals, agentsStore, viewStore, wire;
 
-before(async () => {
+beforeAll(async () => {
     const dom = new JSDOM(`<!doctype html><html><body>${PANEL}</body></html>`,
         { url: 'http://localhost:5005/', pretendToBeVisual: true });
     // Set the globals BEFORE importing: terminals.js reads localStorage and
-    // window.TERMINALS_ENABLED at module scope, exactly as the browser does.
-    dom.window.TERMINALS_ENABLED = true;
+    // the boot config at module scope, exactly as the browser does.
     for (const k of ['window', 'document', 'localStorage', 'navigator', 'HTMLElement',
         'Element', 'Node', 'Event', 'MouseEvent', 'KeyboardEvent', 'CustomEvent',
         'getComputedStyle', 'requestAnimationFrame', 'cancelAnimationFrame']) {
@@ -105,6 +103,9 @@ before(async () => {
     }
     globalThis.GridStack = fakeGridStack();
     globalThis.fetch = fakeFetch;
+    // The pane header's ⋯ menu is Radix's: its popper measures with ResizeObserver.
+    globalThis.ResizeObserver = class { observe() {} unobserve() {} disconnect() {} };
+    globalThis.MutationObserver = dom.window.MutationObserver;
     dom.window.document.elementFromPoint = elementFromPoint;
     // jsdom has no matchMedia (the phone/desktop split reads it).
     dom.window.matchMedia = q => ({
@@ -119,12 +120,13 @@ before(async () => {
     // their TDZ when main's bootstrap runs — a browser-faithful import, not a mock.
     // main.js also arms the app's poll timers, which a test has no use for.
     globalThis.setInterval = () => 0;
-    await import('../chela/dashboard/static/js/main.js');
-    util = await import('../chela/dashboard/static/js/util.js');
-    wire = await import('../chela/dashboard/static/js/wire.js');
-    terminals = await import('../chela/dashboard/static/js/terminals.js');
-    util.setCurrentTab('terminals');
-    util.setAgentsCache(AGENTS);
+    (await import('../chela/dashboard/frontend/src/boot.ts')).start();
+    ({ agents: agentsStore } = await import('../chela/dashboard/frontend/src/shared/store/agents.ts'));
+    ({ view: viewStore } = await import('../chela/dashboard/frontend/src/shared/store/view.ts'));
+    wire = await import('../chela/dashboard/static/js/wire.ts');
+    terminals = await import('../chela/dashboard/frontend/src/features/wall/index.ts');
+    viewStore.set('terminals');
+    agentsStore.set(AGENTS);
     await terminals.renderTerminals();   // ONE wall, built once — as in a live session
 });
 
@@ -162,11 +164,12 @@ const roomed = (room, wids) => ({
 
 // --- 0. the harness itself is not a mock ---------------------------------------
 
-test('the REAL buildWall put REAL iframes on the stage', () => {
+test('the REAL buildWall put REAL iframes on the stage', async () => {
     assert.equal(iframes().length, 2, 'two live agents -> two live terminals');
     assert.equal(frameFor('@1').tagName, 'IFRAME');
     assert.match(frameFor('@1').getAttribute('src'), /\/term\/%401\//);
-    assert.ok(port('@1'), 'and each tile has the wire port the gesture starts from');
+    assert.ok(await port('@1'), 'and each tile has the wire port the gesture starts from');
+    await closeMenu();
 });
 
 // --- 1. 🔴 a room change reloads no terminal ------------------------------------
@@ -186,7 +189,7 @@ test('a room change is identity-preserving — the live iframes are NOT recreate
     for (const wid of ['@1', '@2']) {
         const content = document.querySelector(`.grid-stack-item[gs-id="${wid}"] .grid-stack-item-content`);
         assert.ok(content.classList.contains('in-room'), `${wid} was painted into the room`);
-        assert.match(content.querySelector('.gs-room').textContent, /🔌 wire-shell-shell-ab12cd/);
+        assert.equal(content.querySelector('.gs-room .gs-room-name').textContent, 'wire-shell-shell-ab12cd');
     }
     // …and it reloaded nothing: same NODES, same src, no src ASSIGNMENT, same grid.
     assert.equal(grid(), gridEl, 'the stage was not re-innerHTML-ed');
@@ -216,12 +219,13 @@ test('a third agent joining, and everyone leaving, still reloads nothing', async
     after.forEach((f, i) => assert.equal(f, before[i], 'the SAME iframe node, never rebuilt'));
     const c2 = document.querySelector('.grid-stack-item[gs-id="@2"] .grid-stack-item-content');
     assert.equal(c2.classList.contains('in-room'), false, 'the accent really did clear');
+    assert.equal(c2.style.getPropertyValue('--room-accent'), '', 'and so did its colour');
     assert.equal(c2.querySelector('.gs-room').hidden, true);
 });
 
 // --- 1b. what the accent SAYS (it is read by a red-weak user) --------------------
 
-test('the accent is never hue-only: the badge carries the room NAME and a glyph', async () => {
+test('the accent is never hue-only: the badge carries the room NAME and a plug icon', async () => {
     ROOMS = roomed('ops', ['@1', '@2']);
     await terminals.termTick();
     const contents = ['@1', '@2'].map(w =>
@@ -229,13 +233,55 @@ test('the accent is never hue-only: the badge carries the room NAME and a glyph'
     for (const content of contents) {
         const badge = content.querySelector('.gs-room');
         assert.equal(badge.hidden, false);
-        assert.match(badge.textContent, /🔌 ops/);                      // the NON-HUE cue
+        assert.equal(badge.querySelector('.gs-room-name').textContent, 'ops');   // the NON-HUE cue
+        // ...beside the plug icon (CMX-236: Lucide, not the 🔌 emoji), which a room update
+        // leaves in place: the patch writes the name, never the badge's whole content.
+        const plug = badge.querySelector(':scope > svg');
+        assert.ok(plug && plug.innerHTML.includes('M12 22v-5'), 'the badge lost its plug icon');
         assert.equal(badge.getAttribute('data-room'), 'ops');
         assert.ok(content.style.getPropertyValue('--room-accent'), 'colour is the SECOND signal');
     }
     // Both tiles wear the same accent — that is what "wired together" looks like.
     assert.equal(contents[0].style.getPropertyValue('--room-accent'),
         contents[1].style.getPropertyValue('--room-accent'));
+});
+
+test('a tile in two rooms names the first and counts the rest; leaving clears the name', async () => {
+    ROOMS = {
+        rooms: {
+            ops: { created: 1, members: { '@1': { name: '@1' }, '@2': { name: '@2' } } },
+            alpha: { created: 2, members: { '@1': { name: '@1' } } },
+        },
+        pending: [],
+    };
+    await terminals.termTick();
+    const badge = wid => document.querySelector(`.grid-stack-item[gs-id="${wid}"] .gs-room`);
+    // Rooms sort by name, so @1's first room is alpha; @2 is in one room, so no count.
+    assert.equal(badge('@1').querySelector('.gs-room-name').textContent, 'alpha +1');
+    assert.equal(badge('@1').getAttribute('data-room'), 'alpha');
+    assert.equal(badge('@1').getAttribute('title'), 'In room alpha, ops, click to leave alpha');
+    assert.equal(badge('@2').querySelector('.gs-room-name').textContent, 'ops');
+
+    ROOMS = { rooms: {}, pending: [] };
+    await terminals.termTick();
+    assert.equal(badge('@1').querySelector('.gs-room-name').textContent, '', 'a left room keeps no name');
+    assert.equal(badge('@1').hasAttribute('data-room'), false, 'nor a room a click would leave');
+    assert.ok(badge('@1').querySelector(':scope > svg'), 'the plug icon is markup, never cleared');
+});
+
+test('a tile with no badge, or a badge with no name slot, is accented without a crash', () => {
+    // Single-pane mode draws a header with no badge (features/panehead PaneHead), so the patch
+    // must accent what it finds and skip the rest, never throw half-way through the stage.
+    const stage = document.createElement('div');
+    stage.innerHTML = '<div class="grid-stack-item" gs-id="@1"><div class="grid-stack-item-content"></div></div>'
+        + '<div class="grid-stack-item" gs-id="@2"><div class="grid-stack-item-content">'
+        + '<button class="gs-room" hidden></button></div></div>';
+    assert.equal(wire.applyRoomAccents(stage, roomed('ops', ['@1', '@2'])), 2);
+    for (const wid of ['@1', '@2']) {
+        const c = stage.querySelector(`[gs-id="${wid}"] .grid-stack-item-content`);
+        assert.ok(c.classList.contains('in-room'), `${wid} is accented`);
+    }
+    assert.equal(stage.querySelector('.gs-room').hidden, true, 'a badge it cannot name stays hidden');
 });
 
 test('a member whose window is GONE is simply not painted — no tile, no crash', async () => {
@@ -351,25 +397,39 @@ test('relabelling a session updates the pane title in place — it does NOT rebu
 // (style.css). If it survives the gesture, EVERY terminal on the wall is dead to
 // clicks and nothing rebuilds the wall to heal it.
 
-const port = wid => document.querySelector(`.grid-stack-item[gs-id="${wid}"] .gs-port`);
-const startWire = wid => {
-    // The production binding: the tile's port has onmousedown="chela.wireDragStart(...)".
-    window.chela.wireDragStart(new window.MouseEvent('mousedown', {
-        bubbles: true, clientX: 10, clientY: 10, buttons: 1,
-    }), port(wid), wid);
+const tick = () => new Promise(resolve => setTimeout(resolve, 0));
+// The "Wire to…" row lives in the pane header's ⋯ menu (features/panehead), portaled to
+// <body> while the menu is open: open the tile's own menu (Enter on its trigger, as the
+// keyboard does) and return the row.
+const port = async wid => {
+    const trigger = document.querySelector(`.grid-stack-item[gs-id="${wid}"] .gs-menu-btn`);
+    trigger.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    await tick();
+    return document.querySelector('.pane-overflow-menu .gs-port');
 };
+const closeMenu = async () => {
+    const menu = document.querySelector('.pane-overflow-menu');
+    if (menu) menu.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    await tick();
+};
+const press = row => row.dispatchEvent(new window.MouseEvent('mousedown', {
+    bubbles: true, clientX: 10, clientY: 10, buttons: 1,
+}));
+// The production binding: pressing the row starts the drag (PaneHead's onMouseDown -> the
+// host's wireDragStart).
+const startWire = async wid => press(await port(wid));
 const dragging = () => grid().classList.contains('gs-dragging');
 
-test('a wire drag drops pointer-events on the iframes — that is what makes it work', () => {
-    startWire('@1');
+test('a wire drag drops pointer-events on the iframes — that is what makes it work', async () => {
+    await startWire('@1');
     assert.ok(dragging(), 'the iframes must stop eating the mouse mid-wire');
     assert.ok(document.querySelector('#term-stage').classList.contains('wire-live'));
     document.dispatchEvent(new window.MouseEvent('mouseup', { clientX: 10, clientY: 10 }));
     assert.equal(dragging(), false, 'and a normal release gives the wall back');
 });
 
-test('a release OUTSIDE the window does not leave the whole wall dead to clicks', () => {
-    startWire('@1');
+test('a release OUTSIDE the window does not leave the whole wall dead to clicks', async () => {
+    await startWire('@1');
     assert.ok(dragging());
     window.dispatchEvent(new window.Event('blur'));   // drag off the window, release there
     assert.equal(dragging(), false,
@@ -377,14 +437,14 @@ test('a release OUTSIDE the window does not leave the whole wall dead to clicks'
     assert.equal(document.querySelector('#term-stage').classList.contains('wire-live'), false);
 });
 
-test('a cancelled pointer (touch stolen, devtools opened) also gives the wall back', () => {
-    startWire('@1');
+test('a cancelled pointer (touch stolen, devtools opened) also gives the wall back', async () => {
+    await startWire('@1');
     document.dispatchEvent(new window.Event('pointercancel'));
     assert.equal(dragging(), false);
 });
 
-test('a mousemove with no button held cancels the wire — the release happened off-window', () => {
-    startWire('@1');
+test('a mousemove with no button held cancels the wire — the release happened off-window', async () => {
+    await startWire('@1');
     // The mouse comes back over the page with nothing pressed: the gesture is over,
     // and it ended somewhere we never saw. Cancel — never a room the user didn't drop.
     document.dispatchEvent(new window.MouseEvent('mousemove', {
@@ -394,8 +454,8 @@ test('a mousemove with no button held cancels the wire — the release happened 
     assert.equal(document.querySelector('.wire-overlay'), null, 'and its overlay is gone');
 });
 
-test('Escape cancels a wire in flight', () => {
-    startWire('@1');
+test('Escape cancels a wire in flight', async () => {
+    await startWire('@1');
     document.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Escape' }));
     assert.equal(dragging(), false);
 });
@@ -403,16 +463,16 @@ test('Escape cancels a wire in flight', () => {
 // --- 3. 🔴 the wire must emanate from the PANE, not the fixed-position menu row ----
 //
 // `port('@1')` — the "Wire to…" row the gesture starts from — lives inside the
-// `⋮` overflow popover, which `togglePaneOverflow` anchors with inline
-// `position: fixed` top/left (CMX-117/119). Anchoring the wire's origin to THAT
+// `⋮` overflow menu, which floats wherever its popper places it (CMX-117/119; the
+// kit's Menu since CMX-241). Anchoring the wire's origin to THAT
 // row's rect makes the cable start wherever the popover happens to be floating,
 // not at the pane it is wiring from. Give the button and the pane deliberately
 // disjoint rects and prove the drawn path starts at the pane's top-center.
 
-test('the wire origin is the source PANE\'s top-center, not the "Wire to…" row', () => {
+test('the wire origin is the source PANE\'s top-center, not the "Wire to…" row', async () => {
     const pane = document.querySelector('.grid-stack-item[gs-id="@1"]');
     const stageEl = document.querySelector('#term-stage');
-    const btn = port('@1');
+    const btn = await port('@1');
     const restore = [];
     const stub = (el, rect) => {
         const orig = el.getBoundingClientRect;
@@ -424,7 +484,7 @@ test('the wire origin is the source PANE\'s top-center, not the "Wire to…" row
     // Deliberately far away — a popover row floating elsewhere on the screen.
     stub(btn, { left: 900, top: 700, right: 940, bottom: 720, width: 40, height: 20 });
     try {
-        startWire('@1');
+        press(btn);
         const d = document.querySelector('.wire-overlay path').getAttribute('d');
         assert.match(d, /^M 250 50 C /,
             `wire must start at the pane's top-center (250, 50), not the button's — got: ${d}`);

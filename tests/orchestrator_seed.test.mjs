@@ -1,4 +1,4 @@
-// main.js's INITIAL SEED of orchestrator state — the other half of "the pane
+// The boot's INITIAL SEED of orchestrator state (shared/orchestrator's lane, CMX-228) — the other half of "the pane
 // buttons reflect the real owner without waiting on a tab-open or an SSE delta."
 //
 // orchestrator_ui.test.mjs proves the SSE-delta repaint path (a frame arrives ->
@@ -14,9 +14,9 @@
 // itself — the only thing that can paint pane @2's button "on" is main.js's own
 // unconditional seed call. Drop that call and this test is the one that goes red.
 //
-// Run: node --test tests/orchestrator_seed.test.mjs (tests/test_js_suites.py runs
+// Run: pnpm exec vitest run tests/orchestrator_seed.test.mjs (tests/test_js_suites.py runs
 // every .test.mjs inside pytest; needs `pnpm install` for jsdom).
-import { before, test } from 'node:test';
+import { beforeAll, test } from 'vitest';
 import assert from 'node:assert/strict';
 import { JSDOM } from 'jsdom';   // needs `pnpm install` — tests/test_js_suites.py enforces it
 
@@ -27,7 +27,6 @@ const PANEL = `
   <select id="term-agent"></select>
   <span id="term-wall-grid"><span id="term-grid-presets"></span><button id="term-lock-btn"></button></span>
   <button id="term-new-shell"></button>
-  <div id="term-switcher"></div>
   <div id="term-stage"></div>
   <div id="term-min-dock"></div>
   <div id="term-bar" class="kb-collapsed"><button class="kb-toggle" id="kb-toggle"></button><div class="kb-body" id="kb-body"></div></div>
@@ -72,10 +71,9 @@ class FakeEventSource {
 
 let orchestrator;
 
-before(async () => {
+beforeAll(async () => {
     const dom = new JSDOM(`<!doctype html><html><body>${PANEL}</body></html>`,
         { url: 'http://localhost:5005/', pretendToBeVisual: true });
-    dom.window.TERMINALS_ENABLED = true;
     for (const k of ['window', 'document', 'localStorage', 'navigator', 'HTMLElement',
         'Element', 'Node', 'Event', 'MouseEvent', 'KeyboardEvent', 'CustomEvent',
         'getComputedStyle', 'requestAnimationFrame', 'cancelAnimationFrame']) {
@@ -101,10 +99,11 @@ before(async () => {
     // it has not resolved yet), and main.js's own trailing refreshOrchestratorStatus()
     // call is what must repaint it afterward, with nothing else in this test
     // triggering a second read.
-    await import('../chela/dashboard/static/js/main.js');
-    const util = await import('../chela/dashboard/static/js/util.js');
-    orchestrator = await import('../chela/dashboard/static/js/orchestrator.js');
-    util.setAgentsCache(AGENTS);
+    (await import('../chela/dashboard/frontend/src/boot.ts')).start();
+    const { agents: agentsStore } = await import('../chela/dashboard/frontend/src/shared/store/agents.ts');
+    const { view: viewStore } = await import('../chela/dashboard/frontend/src/shared/store/view.ts');
+    orchestrator = await import('../chela/dashboard/frontend/src/shared/orchestrator/index.ts');
+    agentsStore.set(AGENTS);
 
     // Flush the seed fetch's microtask chain (fetch -> res.json() -> _apply ->
     // listeners) without dispatching any SSE frame or opening any tab.
@@ -112,7 +111,7 @@ before(async () => {
     await new Promise(resolve => setTimeout(resolve, 0));
 });
 
-test('main.js seeds orchestrator state on load, with no tab-open and no SSE frame', () => {
+test('the boot seeds orchestrator state on load, with no tab-open and no SSE frame', () => {
     assert.equal(orchestrator.orchestratorState().wid, '@2',
         'the page loaded with @2 already the live owner, but shared orchestrator ' +
         'state was never seeded — refreshOrchestratorStatus() on main.js\'s load ' +

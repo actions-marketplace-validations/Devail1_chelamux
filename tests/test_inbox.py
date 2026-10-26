@@ -944,7 +944,46 @@ def _clean_run(**over):
 JUDGE_KINDS = [
     pytest.param(judge.J_CLEAN, "run_judge_clean", id="clean"),
     pytest.param(judge.J_CANNOT_VERIFY, "run_judge_cannot_verify", id="cannot_verify"),
+    pytest.param(judge.J_PROSE_ONLY, "run_judge_clean", id="prose_only"),   # CMX-208
+    pytest.param(judge.J_STANDARD_NO_JUDGE, "run_judge_clean", id="standard_no_judge"),  # CMX-296
 ]
+
+@pytest.mark.parametrize("judge_state, says", [
+    (judge.J_STANDARD_NO_JUDGE, "🪜 "),                                   # CMX-296
+    (judge.J_PROSE_ONLY, "📄 "),
+])
+def test_a_no_judge_verdict_names_its_own_tier(judge_state, says, store_file, windows,
+                                               monkeypatch):
+    _statuses(monkeypatch, {ORCH: inbox.BUSY})
+    store = inbox.load()
+    store["orchestrator"] = ORCH
+    inbox.save(store)
+    inbox.tick({}, runs=[_verdict_run(judge_state)])
+    summary = inbox.load()["queue"][0]["summary"]
+    tier = "standard tier, merge-ready on green CI no judge round" \
+        if judge_state == judge.J_STANDARD_NO_JUDGE \
+        else "prose-only, no judge round needed — merge-ready on green CI"
+    assert summary.startswith(says) and tier in summary
+    assert "every guard held" not in summary
+
+
+@pytest.mark.parametrize("judge_state", [judge.J_PROSE_ONLY, judge.J_STANDARD_NO_JUDGE])
+def test_a_stamped_but_unmerged_no_judge_verdict_never_reads_as_merged(
+        judge_state, store_file, windows, monkeypatch):
+    # CMX-272: the notice fires when the verdict is STAMPED, while the PR is still OPEN —
+    # it lands only on `chela merge`. "merged" here told the orchestrator a pending PR was
+    # done (adopt-779). It must say merge-ready and name the command that lands it.
+    _statuses(monkeypatch, {ORCH: inbox.BUSY})
+    store = inbox.load()
+    store["orchestrator"] = ORCH
+    inbox.save(store)
+    inbox.tick({}, runs=[_verdict_run(judge_state)])
+    summary = inbox.load()["queue"][0]["summary"]
+    assert "merged" not in summary.lower(), summary
+    assert "merge-ready" in summary
+    if judge_state == judge.J_PROSE_ONLY:
+        assert "chela merge T1" in summary
+
 
 @pytest.mark.parametrize("judge_state,kind", JUDGE_KINDS)
 def test_a_judge_verdicts_payload_carries_the_judged_sha(
