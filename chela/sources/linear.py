@@ -325,6 +325,28 @@ mutation SetState($id: String!, $stateId: String!) {
 }
 """
 
+COMMENT_MUTATION = """
+mutation Comment($input: CommentCreateInput!) {
+  commentCreate(input: $input) { success }
+}
+"""
+
+# 🧵 CMX-287 — `chela task show`: one issue's current text and comments, plus the key's own
+# user (`viewer`) — the trust filter's anchor. Read-only; there is no write behind it.
+COMMENT_PAGE_SIZE = 100
+ISSUE_THREAD_QUERY = """
+query IssueThread($id: String!) {
+  viewer { id }
+  issue(id: $id) {
+    identifier title description url
+    comments(last: %d, orderBy: createdAt) {
+      nodes { body createdAt user { id name displayName email } botActor { id } }
+      pageInfo { hasPreviousPage }
+    }
+  }
+}
+""" % COMMENT_PAGE_SIZE
+
 ARCHIVE_MUTATION = """
 mutation Archive($id: String!) {
   issueArchive(id: $id) { success }
@@ -968,6 +990,61 @@ class LinearSource:
         log.info("linear: %s → %s (requeued)", task_id, target.get("name"))
         return "set"
 
+    def comment(self, task_id: str, body: str) -> str:
+        """CMX-347 — add a comment to one issue of this team. ``set`` when Linear took it,
+        ``skipped`` for an id of another team or an empty body, ``missing`` for no such
+        issue, ``failed`` otherwise. Never
+        raises: the caller (``chela keeper``) reports each write's outcome."""
+        if self._number_of(task_id) is None or not str(body or "").strip():
+            return "skipped"
+        found = self._nodes_by_id([task_id])
+        if found is None:
+            return "failed"
+        node = next((n for n in found if isinstance(n, dict) and n.get("id")
+                     and str(n.get("identifier") or "").upper() == str(task_id).upper()), None)
+        if node is None:
+            return "missing"
+        try:
+            data = self._call(COMMENT_MUTATION, {"input": {"issueId": node["id"], "body": body}},
+                              cache=False)
+        except LinearError as e:
+            log.warning("linear: could not comment on %s: %s", task_id, e)
+            return "failed"
+        return "set" if (data.get("commentCreate") or {}).get("success") else "failed"
+
+    def issue_thread(self, task_id: str, trusted: frozenset[str] = frozenset()) -> dict:
+        """🧵 CMX-287 — one issue of this team, read FRESH: ``{"identifier", "title",
+        "description", "url", "comments", "dropped", "truncated"}``. ``comments`` holds only
+        those written by the key's own user (``viewer``) or a user ``trusted`` names (user
+        id or email, any case — never a name, which any member can change), oldest first;
+        never one a bot or integration posted. ``dropped`` counts the rest. The page is the
+        NEWEST comments (``last``), so a truncated read loses the oldest, never the latest
+        steer; ``truncated`` is True when it came back full.
+        Raises :class:`LinearError` on any failed read or a missing issue — unknown never reads as an empty thread."""
+        if self._number_of(task_id) is None:
+            raise LinearError("config", f"{task_id!r} is not an issue of team {self.team}")
+        data = self._call(ISSUE_THREAD_QUERY, {"id": str(task_id).strip().upper()}, cache=False)
+        node, viewer = data.get("issue"), (data.get("viewer") or {}).get("id")
+        if not isinstance(node, dict) or not viewer:
+            raise LinearError("malformed", f"no issue {task_id} (or no viewer) in the response")
+        conn = node.get("comments") or {}
+        raw = conn.get("nodes") if isinstance(conn.get("nodes"), list) else []
+        allowed = {str(t).strip().lower() for t in trusted if str(t).strip()}
+        kept = []
+        for c in raw:
+            user = c.get("user") if isinstance(c, dict) else None
+            if not isinstance(user, dict) or c.get("botActor"):
+                continue
+            names = {str(user.get(k) or "").lower() for k in ("id", "email")}
+            if user.get("id") == viewer or names & allowed:
+                kept.append(c)
+        kept.sort(key=lambda c: str(c.get("createdAt") or ""))
+        return {"identifier": node.get("identifier") or task_id, "title": node.get("title") or "",
+                "description": node.get("description") or "", "url": node.get("url") or "",
+                "comments": kept, "dropped": len(raw) - len(kept),
+                "truncated": bool((conn.get("pageInfo") or {}).get("hasPreviousPage"))
+                or len(raw) >= COMMENT_PAGE_SIZE}
+
     def superseding_issue(self, reason: str, own_id: str) -> str | None:
         """The identifier of this team's issue a close ``reason`` says supersedes ``own_id``
         — only when the reason also says so (:data:`_SUPERSEDED_RE`); else None."""
@@ -1100,7 +1177,8 @@ class LinearSource:
         return archived
 
     def create_issue(self, title: str, description: str = "", priority: int = 0,
-                     blocked_by=(), parent: str | None = None, labels=()) -> dict:
+                     blocked_by=(), parent: str | None = None, labels=(),
+                     state_names=None) -> dict:
         """📐 CMX-6 — create one issue in this team, in its first configured READY state,
         and a ``blocks`` relation from each of ``blocked_by`` (identifiers of this team).
         🗂️ CMX-326: a project-scoped workflow puts it in its project, and its blockers and
@@ -1113,7 +1191,9 @@ class LinearSource:
         📏 CMX-126: ``parent`` (an identifier of this team) makes it a sub-issue of that
         issue, inheriting its labels (so its risk) — a size-gate split's slice.
         🧹 CMX-305: ``labels`` are label NAMES, added to a parent's inherited ones; one that
-        can be neither found nor created is a warning, never a lost issue."""
+        can be neither found nor created is a warning, never a lost issue.
+        CMX-347: ``state_names`` (first match wins) replaces the READY states — chela
+        keeper files its new issues in Backlog, where the dispatcher does not claim them."""
         title = (title or "").strip()
         if not title:
             raise LinearError("input", "a title is required")
@@ -1143,11 +1223,11 @@ class LinearSource:
             raise LinearError("network", f"could not read team {self.team}")
         team_id, states = team
         ready = {str(s.get("name", "")).lower(): s["id"] for s in states}
-        state_id = next((ready[n.lower()] for n in self.ready_states if n.lower() in ready),
-                        None)
+        wanted = tuple(state_names or self.ready_states)
+        state_id = next((ready[n.lower()] for n in wanted if n.lower() in ready), None)
         if state_id is None:
             raise LinearError("config", f"team {self.team} has no state named "
-                                        f"{' / '.join(self.ready_states)}")
+                                        f"{' / '.join(wanted)}")
         fields = {"teamId": team_id, "title": title, "description": description or "",
                   "priority": priority, "stateId": state_id}
         project_id = self._project_id()
