@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import signal
 import sys
 import threading
@@ -41,8 +42,10 @@ from chela import (
     hooks,
     inbox,
     judge,
+    judge_timing,
     keeper,
     keeper_run,
+    keeper_schedule,
     launcher,
     malloc_arenas,
     messenger,
@@ -267,6 +270,7 @@ def cmd_run(args) -> None:
     ops_child = None
     nightly_child = None      # CMX-303: the nightly sweep — one detached child at a time
     gc_child = None           # CMX-357: the daily worktree GC — same shape
+    keeper_sched = keeper_schedule.Scheduler()   # CMX-348: `chela keeper run` per keeper workflow
     # Held in memory, exactly like `waiting_seen`: it is the PREVIOUS status snapshot
     # the inbox edge-triggers against. Starting empty means a fresh daemon baselines
     # silently on its first tick instead of announcing every already-idle agent. (A
@@ -456,6 +460,13 @@ def cmd_run(args) -> None:
                 nightly_child = sweep_nightly.daemon_tick(DISPATCH_WORKFLOWS, nightly_child)
             except Exception:
                 log.exception("Nightly sweep spawn failed")
+
+            # 🗂️ CMX-348: keeper runs, each workflow at its `keeper.every` — detached, never
+            # waited on; skipped while held, while one is in flight, or with no activity.
+            try:
+                keeper_sched.tick(DISPATCH_WORKFLOWS)
+            except Exception:
+                log.exception("Keeper schedule failed")
 
             # Self-update: informs by default (CMX-142 part 1) — `chela update` is a
             # human-run act, and `update.check_and_notify` never pulls. `CHELA_AUTO_UPDATE`
@@ -1682,6 +1693,15 @@ def cmd_knowledge_export(args) -> None:
         print(f"  (runs filtered since {summary['since']})")
 
 
+def statusline_script() -> Path:
+    """The statusLine hook to wire in: the copy packaged inside an installed wheel
+    (``chela/scripts/``, pyproject's ``force-include``), else the checkout's ``scripts/``."""
+    packaged = Path(__file__).resolve().parent / "scripts" / "cache-statusline.sh"
+    if packaged.is_file():
+        return packaged
+    return Path(__file__).resolve().parent.parent / "scripts" / "cache-statusline.sh"
+
+
 def cmd_install_statusline(args) -> None:
     """Print (or write) the Claude Code statusLine hook that feeds the context bar.
 
@@ -1693,7 +1713,16 @@ def cmd_install_statusline(args) -> None:
     """
     import json as _json
 
-    script = Path(__file__).resolve().parent.parent / "scripts" / "cache-statusline.sh"
+    script = statusline_script()
+    if args.write and script.parent == Path(__file__).resolve().parent / "scripts":
+        # The packaged copy lives in the install, and a `uvx` install is a uv CACHE entry
+        # that `uv cache prune` deletes; a settings.json pointing there goes dead without a
+        # word. Wire a copy under $CHELA_DIR instead (re-running this refreshes it).
+        stable = config.CHELA_DIR / "cache-statusline.sh"
+        stable.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(script, stable)
+        stable.chmod(0o755)
+        script = stable
     snippet = {"type": "command", "command": str(script)}
     settings_path = Path(args.settings).expanduser() if args.settings else Path.home() / ".claude" / "settings.json"
 
@@ -2262,17 +2291,18 @@ def cmd_telegram(args) -> None:
 
 
 def cmd_dashboard(args) -> None:
-    """Launch the optional web dashboard (requires the 'dashboard' extra).
+    """Launch the web dashboard.
 
-    Imported lazily so the core CLI never depends on Flask: a plain
-    `chelamux` install runs status/run/dispatch/msg without it.
+    Imported lazily, so a command that never opens the dashboard never pays for Flask's
+    import. Flask is a core dependency since CMX-363 (`uvx chelamux dashboard`), so the
+    ImportError below means an environment built without it, e.g. an old checkout's venv.
     """
     try:
         from chela.dashboard import app as dashboard_app
     except ImportError as e:
-        print("The dashboard is an optional component and needs Flask.")
-        print("Install the extra:  uv sync --extra dashboard")
-        print("              (or:  pip install 'chelamux[dashboard]')")
+        print("The dashboard needs Flask, and this environment does not have it.")
+        print("Re-sync it:  uv sync")
+        print("      (or:  uv tool install --force chelamux)")
         print(f"  import error: {e}")
         sys.exit(1)
     # The env (i.e. $CHELA_DIR/chela.env) is the source of truth for the bind; these
@@ -3254,6 +3284,8 @@ def cmd_judge_show(args) -> None:
               f"{vis.get('total', 0)} survived · held-out {held.get('survived', 0)}/"
               f"{held.get('total', 0)} (quota {held.get('quota', 0)}) · flips "
               f"{cons.get('flipped', 0)}/{cons.get('sampled', 0)}")
+        for line in judge_timing.round_lines(rec.get("timings")):
+            print(f"           {line}")
         for path in rec.get("suite_logs") or []:
             print(f"           📄 suite output: {path}")
         for flip in cons.get("flips") or []:
@@ -3325,6 +3357,21 @@ def cmd_keeper_run(args) -> None:
         print(f"  {i}. {p['action']} {p['issue'] or p.get('title')}")
 
 
+def cmd_keeper_stats(args) -> None:
+    """CMX-348: the trial's kill metric — proposals made, accepted, rejected and dropped,
+    the acceptance rate and a by-action breakdown. Exit 1 when the log cannot be read."""
+    try:
+        since = keeper.parse_since(args.since) if args.since else None
+    except ValueError as e:
+        print(f"keeper stats: {e}", file=sys.stderr)
+        sys.exit(2)
+    out = keeper_run.stats(since)
+    if out.get("error"):
+        print(f"keeper stats: {out['error']}", file=sys.stderr)
+        sys.exit(1)
+    print(json.dumps(out, indent=2) if args.json else keeper_run.render_stats(out).rstrip())
+
+
 def cmd_keeper_decide(args) -> None:
     """CMX-347: approve (all, or `--only 1,3`) or dismiss a pending keeper batch."""
     try:
@@ -3340,6 +3387,22 @@ def cmd_keeper_decide(args) -> None:
         sys.exit(1)
     for i, result in enumerate(out["results"], 1):
         print(f"  {i}. {result}")
+
+
+def cmd_judge_timings(args) -> None:
+    """⏱️ CMX-196: median / p90 per judge phase across every task's private round records —
+    the table the next judge-speed optimisation is chosen from."""
+    try:
+        since = keeper.parse_since(args.since) if args.since else None
+    except ValueError as e:
+        print(f"judge timings: {e}", file=sys.stderr)
+        sys.exit(2)
+    summary = judge_timing.summarize(judge.load_all_private(), since)
+    if args.json:
+        print(json.dumps(summary, indent=2))
+        return
+    label = f"over the last {args.since}" if args.since else "over all recorded rounds"
+    print("\n".join(judge_timing.summary_lines(summary, label)))
 
 
 def cmd_judge_ack_blocked_race(args) -> None:
@@ -4381,6 +4444,15 @@ def main() -> None:
         help="Also print every held-out experiment in full (operator-only — never paste "
              "this into a PR or a rework prompt)",
     )
+    p_jtimings = judge_sub.add_parser(
+        "timings",
+        help="⏱️ Median / p90 wall-clock per judge phase (setup, baseline, experiments, "
+             "consistency, slot wait…) across every task's recorded rounds",
+    )
+    p_jtimings.add_argument("--since", metavar="DURATION",
+                            help="Only rounds recorded in the last DURATION (7d, 24h); "
+                                 "default: all time")
+    p_jtimings.add_argument("--json", action="store_true", help="Machine-readable output")
     p_ops = sub.add_parser("ops", help="🔎 Fleet operations checks")
     ops_sub = p_ops.add_subparsers(dest="ops_cmd", required=True)
     p_oscan = ops_sub.add_parser(
@@ -4418,6 +4490,12 @@ def main() -> None:
     p_krun.add_argument("--since", metavar="DURATION", help="As for `keeper digest`")
     p_krun.add_argument("--model", help="Model for the proposal call "
                                         "(default: the workflow's keeper.model, else sonnet)")
+    p_kstats = keeper_sub.add_parser(
+        "stats", help="The trial's numbers: proposals made, accepted, rejected and dropped, "
+                      "the acceptance rate (under 70%% ⇒ kill) and a by-action breakdown")
+    p_kstats.add_argument("--since", metavar="DURATION",
+                          help="Only the last DURATION (7d, 24h); default: all time")
+    p_kstats.add_argument("--json", action="store_true", help="Machine-readable output")
     for verb, text in (("approve", "Apply a pending batch's proposals to the tracker"),
                        ("dismiss", "Drop a pending batch; nothing is written")):
         p_kdecide = keeper_sub.add_parser(verb, help=text)
@@ -4671,8 +4749,8 @@ def main() -> None:
              "exit — e.g. --sandbox-relay @7=off. Does not start the bridge.",
     )
 
-    # dashboard (optional component)
-    p_dash = sub.add_parser("dashboard", help="Launch the optional web dashboard (needs the 'dashboard' extra)")
+    # dashboard
+    p_dash = sub.add_parser("dashboard", help="Launch the web dashboard (the agent wall)")
     p_dash.add_argument("--host", default=None,
                         help="Bind host (default: $CHELA_DASH_HOST, else 127.0.0.1)")
     p_dash.add_argument("--port", type=int, default=None,
@@ -4946,6 +5024,8 @@ def main() -> None:
             judge_eval_cli.main(args)
         elif args.judge_cmd == "show":
             cmd_judge_show(args)
+        elif args.judge_cmd == "timings":
+            cmd_judge_timings(args)
         else:
             p_judge.print_help()
     elif args.command == "ops":
@@ -4954,7 +5034,7 @@ def main() -> None:
         else:
             cmd_ops_scan(args)
     elif args.command == "keeper":
-        {"digest": cmd_keeper_digest, "run": cmd_keeper_run}.get(
+        {"digest": cmd_keeper_digest, "run": cmd_keeper_run, "stats": cmd_keeper_stats}.get(
             args.keeper_cmd, cmd_keeper_decide)(args)
     elif args.command == "adopt":
         cmd_adopt(args)
